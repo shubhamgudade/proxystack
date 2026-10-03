@@ -1762,3 +1762,6 @@ def root():
         # fallback inline — replaced by index.html later
         return HTMLResponse("<h2>ProxyStack — Jett Dashboard</h2><p>dashboard.html not found in /static/</p>")
     return {"role": ROLE, "status": "running"}
+
+
+#chatgpt
