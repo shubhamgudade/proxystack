@@ -9,82 +9,210 @@
 <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400..700&family=Outfit:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
 :root{
-  --bg:#F6F7F9; --surface:#FFFFFF; --text:#14161A; --muted:#70757E; --line:#E8EAEE;
-  --accent:#5B5BD6; --soft:#F1F2F6;
-  --ok:#1E9E6A; --idle:#8A8F98; --warn:#C77700; --bad:#D14343;
-  --r:16px; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --bg:#0D0E11;
+  --surface:#13151A;
+  --surface2:#1A1D24;
+  --text:#E8EAF0;
+  --muted:#6B7280;
+  --line:#1F2229;
+  --accent:#7C7CF8;
+  --accent-soft:rgba(124,124,248,.12);
+  --soft:#1A1D24;
+  --ok:#22C87A;
+  --ok-soft:rgba(34,200,122,.12);
+  --idle:#4B5263;
+  --warn:#E59A2F;
+  --bad:#F05454;
+  --bad-soft:rgba(240,84,84,.12);
+  --r:14px;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
 }
-*{box-sizing:border-box}
-html,body{margin:0}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
 body{
-  font-family:'Google Sans','Outfit',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
-  background:var(--bg); color:var(--text); font-size:14px; line-height:1.45;
-  -webkit-font-smoothing:antialiased; padding:34px 30px 56px; max-width:1320px; margin:0 auto;
+  font-family:'Google Sans','Outfit',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  background:var(--bg);
+  color:var(--text);
+  font-size:14px;
+  line-height:1.5;
+  -webkit-font-smoothing:antialiased;
+  padding:32px 28px 64px;
+  max-width:1380px;
+  margin:0 auto;
 }
-h1,h2{margin:0;font-weight:500}
-h1{font-size:20px;letter-spacing:-.2px}
-h2{font-size:14px;letter-spacing:.1px}
+h1,h2{font-weight:500}
+h1{font-size:19px;letter-spacing:-.3px}
+h2{font-size:13px;letter-spacing:.05px;color:var(--text)}
 .muted{color:var(--muted)}
 
-/* header */
-.top{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-bottom:26px;flex-wrap:wrap}
-.brand{display:flex;align-items:center;gap:13px}
-.logo{width:36px;height:36px;border-radius:11px;background:linear-gradient(135deg,#5B5BD6,#8B7BF0);
-      box-shadow:0 4px 16px rgba(91,91,214,.32);flex:0 0 auto}
-.sub{font-size:12.5px;color:var(--muted);margin:1px 0 0}
-.top-right{display:flex;align-items:center;gap:18px;font-size:12.5px}
+/* ── header ── */
+.top{
+  display:flex;align-items:center;justify-content:space-between;
+  gap:16px;margin-bottom:28px;flex-wrap:wrap;
+}
+.brand{display:flex;align-items:center;gap:12px}
+.logo{
+  width:36px;height:36px;border-radius:10px;flex:0 0 auto;
+  background:linear-gradient(135deg,#5B5BD6,#9E7BF0);
+  box-shadow:0 4px 18px rgba(91,91,214,.35);
+}
+.sub{font-size:12px;color:var(--muted);margin-top:2px}
+.top-right{display:flex;align-items:center;gap:20px;font-size:12.5px}
 .live{display:inline-flex;align-items:center;gap:7px;color:var(--muted)}
-.live i{width:8px;height:8px;border-radius:50%;background:var(--idle);transition:background .2s}
-.live.on  i{background:var(--ok);box-shadow:0 0 0 4px rgba(30,158,106,.14)}
-.live.off i{background:var(--bad)}
-.clock{color:var(--muted);font-variant-numeric:tabular-nums}
+.live i{
+  width:8px;height:8px;border-radius:50%;
+  background:var(--idle);transition:background .3s;
+}
+.live.on  i{background:var(--ok);box-shadow:0 0 0 4px var(--ok-soft)}
+.live.off i{background:var(--bad);box-shadow:0 0 0 4px var(--bad-soft)}
+.clock{color:var(--muted);font-variant-numeric:tabular-nums;font-family:var(--mono);font-size:12px}
 
-/* cards */
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));gap:14px;margin-bottom:18px}
-.card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:16px 18px}
-.card .k{font-size:12px;color:var(--muted);margin-bottom:9px;white-space:nowrap}
-.card .v{font-size:27px;font-weight:500;letter-spacing:-.6px;font-variant-numeric:tabular-nums;line-height:1.1}
-.card .v small{font-size:13px;color:var(--muted);font-weight:400;margin-left:2px;letter-spacing:0}
+/* ── summary cards ── */
+.cards{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+  gap:12px;margin-bottom:20px;
+}
+.card{
+  background:var(--surface);
+  border:1px solid var(--line);
+  border-radius:var(--r);
+  padding:16px 18px;
+  transition:border-color .2s;
+}
+.card:hover{border-color:#2A2D36}
+.card .k{font-size:11.5px;color:var(--muted);margin-bottom:8px;white-space:nowrap;text-transform:uppercase;letter-spacing:.4px}
+.card .v{
+  font-size:26px;font-weight:500;letter-spacing:-.8px;
+  font-variant-numeric:tabular-nums;line-height:1.1;
+}
+.card .v small{font-size:13px;color:var(--muted);font-weight:400;margin-left:3px;letter-spacing:0}
+.card.accent-card .v{color:var(--accent)}
+.card.ok-card    .v{color:var(--ok)}
 
-/* layout */
-.grid{display:grid;grid-template-columns:minmax(0,1.95fr) minmax(0,1fr);gap:16px;align-items:start}
-@media(max-width:960px){.grid{grid-template-columns:1fr}}
-.panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);
-       padding:16px 18px;margin-bottom:16px;overflow:hidden}
-.panel-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:12px}
-.panel-head .meta{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+/* ── main grid ── */
+.grid{
+  display:grid;
+  grid-template-columns:minmax(0,2fr) minmax(0,1fr);
+  gap:14px;align-items:start;
+}
+@media(max-width:980px){.grid{grid-template-columns:1fr}}
 
-/* table */
-table{width:100%;border-collapse:collapse;font-size:13px}
-th{text-align:left;font-weight:500;color:var(--muted);font-size:11px;text-transform:uppercase;
-   letter-spacing:.5px;padding:0 12px 9px 0;white-space:nowrap}
-td{padding:9px 12px 9px 0;border-top:1px solid var(--line);font-variant-numeric:tabular-nums;white-space:nowrap}
+/* ── panels ── */
+.panel{
+  background:var(--surface);
+  border:1px solid var(--line);
+  border-radius:var(--r);
+  padding:18px 20px;
+  margin-bottom:14px;
+  overflow:hidden;
+}
+.panel-head{
+  display:flex;align-items:center;justify-content:space-between;
+  gap:12px;margin-bottom:14px;
+}
+.panel-head .meta{font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+
+/* ── table ── */
+.tbl-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{
+  text-align:left;font-weight:500;color:var(--muted);
+  font-size:10.5px;text-transform:uppercase;letter-spacing:.55px;
+  padding:0 14px 10px 0;white-space:nowrap;
+}
+td{
+  padding:10px 14px 10px 0;
+  border-top:1px solid var(--line);
+  font-variant-numeric:tabular-nums;
+  white-space:nowrap;
+}
 th:last-child,td:last-child{padding-right:0;text-align:right}
-.role{font-family:var(--mono);font-size:12.5px}
-.st{display:inline-flex;align-items:center;gap:7px}
-.dot{width:8px;height:8px;border-radius:50%;flex:0 0 auto;background:var(--idle)}
-tr.running  .dot{background:var(--ok)}
-tr.idle     .dot{background:var(--idle)}
-tr.offline  .dot{background:var(--bad)}
-tr.running td:first-child{font-weight:500}
-.zero{color:#C3C7CE}
+.role{font-family:var(--mono);font-size:12px;color:var(--text)}
 
-/* feed */
-.feed{max-height:460px;overflow:auto;margin:-4px 0}
-.row{display:grid;grid-template-columns:64px 92px minmax(0,1fr);gap:10px;
-     padding:8px 0;border-top:1px solid var(--line);font-size:12.5px}
+/* ── status ── */
+.st{display:inline-flex;align-items:center;gap:7px}
+.dot{width:7px;height:7px;border-radius:50%;flex:0 0 auto;background:var(--idle)}
+tr.running .dot{background:var(--ok);box-shadow:0 0 0 3px var(--ok-soft)}
+tr.idle    .dot{background:var(--idle)}
+tr.offline .dot{background:var(--bad)}
+tr.running td:first-child{color:var(--text);font-weight:500}
+tr.idle    td{color:var(--muted)}
+tr.offline td{color:#3A3D45}
+tr.offline .role{color:#3A3D45}
+.zero{color:#2E3140}
+
+/* ── counters diff flash ── */
+@keyframes flashCell{0%{color:var(--accent)}100%{color:inherit}}
+.flash-val{animation:flashCell .6s ease-out}
+
+/* ── labels ── */
+.pill{
+  display:inline-block;padding:2px 9px;border-radius:999px;
+  font-size:11px;font-weight:500;letter-spacing:.1px;
+}
+.pill.flash  {background:rgba(34,200,122,.14);color:#22C87A}
+.pill.panther{background:rgba(124,124,248,.14);color:#9090F8}
+.pill.lantern{background:rgba(229,154,47,.14);color:#E59A2F}
+.pill.deadass{background:rgba(107,114,128,.14);color:#8892A0}
+.bar{height:4px;border-radius:2px;background:var(--line);overflow:hidden;margin-top:7px}
+.bar i{display:block;height:100%;background:var(--accent);width:0;transition:width .35s}
+.pill.flash   + .bar i{background:var(--ok)}
+.pill.panther + .bar i{background:var(--accent)}
+.pill.lantern + .bar i{background:var(--warn)}
+.pill.deadass + .bar i{background:var(--idle)}
+
+/* ── activity feed ── */
+.feed{max-height:500px;overflow-y:auto;margin:-2px 0;scrollbar-width:thin;scrollbar-color:var(--line) transparent}
+.feed::-webkit-scrollbar{width:4px}
+.feed::-webkit-scrollbar-track{background:transparent}
+.feed::-webkit-scrollbar-thumb{background:var(--line);border-radius:2px}
+.row{
+  display:grid;
+  grid-template-columns:58px 110px minmax(0,1fr);
+  gap:10px;
+  padding:8px 0;
+  border-top:1px solid var(--line);
+  font-size:12px;
+  align-items:start;
+}
 .row:first-child{border-top:0}
-.row .t{color:var(--muted);font-variant-numeric:tabular-nums}
-.row .e{color:var(--accent);font-weight:500;overflow:hidden;text-overflow:ellipsis}
-.row .d{color:var(--muted);overflow:hidden;text-overflow:ellipsis}
-.empty{color:var(--muted);font-size:13px;padding:14px 0}
-.pill{display:inline-block;padding:2px 9px;border-radius:999px;background:var(--soft);color:var(--muted);font-size:11.5px}
-.pill.flash{background:#E9F7F1;color:#14754E}
-.pill.panther{background:#EFEFFC;color:#4B4BC4}
-.pill.lantern{background:#FDF3E3;color:#9A5E00}
-.pill.deadass{background:#F4F5F7;color:#70757E}
-.bar{height:5px;border-radius:3px;background:var(--soft);overflow:hidden;margin-top:6px}
-.bar i{display:block;height:100%;background:var(--accent);width:0;transition:width .3s}
+.row .t{color:var(--muted);font-family:var(--mono);font-size:11px;padding-top:1px}
+.row .e{
+  font-weight:500;overflow:hidden;text-overflow:ellipsis;
+  color:var(--accent);font-size:11.5px;padding-top:1px;
+}
+.row .d{color:var(--muted);overflow:hidden;text-overflow:ellipsis;font-size:11.5px}
+.row.ev-t1_pass    .e{color:var(--ok)}
+.row.ev-t2_pass    .e{color:#9090F8}
+.row.ev-evicted    .e{color:var(--bad)}
+.row.ev-pick_served .e{color:var(--warn)}
+.row.ev-startup    .e{color:var(--muted)}
+.empty{color:var(--muted);font-size:13px;padding:18px 0;text-align:center}
+
+/* ── raw counters panel ── */
+.counters-grid{
+  display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));
+  gap:8px;margin-top:2px;
+}
+.ctr{
+  background:var(--surface2);border:1px solid var(--line);
+  border-radius:10px;padding:10px 12px;
+}
+.ctr .ck{font-size:10.5px;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:.4px}
+.ctr .cv{font-size:20px;font-weight:500;font-variant-numeric:tabular-nums;letter-spacing:-.5px}
+
+/* ── node selector ── */
+.node-tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
+.ntab{
+  padding:4px 11px;border-radius:6px;font-size:11.5px;cursor:pointer;
+  border:1px solid var(--line);background:transparent;color:var(--muted);
+  font-family:var(--mono);transition:all .15s;
+}
+.ntab:hover{border-color:#2E3240;color:var(--text)}
+.ntab.active{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+.ntab.st-running{border-color:rgba(34,200,122,.3)}
+.ntab.st-offline{opacity:.4}
 </style>
 </head>
 <body>
@@ -103,21 +231,31 @@ tr.running td:first-child{font-weight:500}
   </div>
 </div>
 
+<!-- summary cards -->
 <div class="cards" id="cards"></div>
 
 <div class="grid">
+  <!-- left column -->
   <div>
+    <!-- agents table -->
     <div class="panel">
       <div class="panel-head">
         <h2>Agents</h2>
         <span class="meta" id="agentsMeta">waiting…</span>
       </div>
-      <div style="overflow-x:auto">
+      <div class="tbl-wrap">
         <table>
           <thead>
             <tr>
-              <th>Agent</th><th>Status</th><th>Live</th><th>Fresh ≤30s</th>
-              <th>Flash</th><th>Panther</th><th>Pass/s</th><th>Evict</th>
+              <th>Agent</th>
+              <th>Status</th>
+              <th>Live</th>
+              <th>Fresh ≤30s</th>
+              <th>Flash</th>
+              <th>Panther</th>
+              <th>Raw</th>
+              <th>Pass/s</th>
+              <th>Evict</th>
             </tr>
           </thead>
           <tbody id="agents"></tbody>
@@ -125,6 +263,7 @@ tr.running td:first-child{font-weight:500}
       </div>
     </div>
 
+    <!-- pool labels -->
     <div class="panel">
       <div class="panel-head">
         <h2>Pool by label</h2>
@@ -132,13 +271,26 @@ tr.running td:first-child{font-weight:500}
       </div>
       <table>
         <thead>
-          <tr><th>Label</th><th>Count</th><th>Meaning</th><th style="width:34%">Share</th></tr>
+          <tr>
+            <th>Label</th><th>Count</th><th>Latency</th><th style="width:38%">Share</th>
+          </tr>
         </thead>
         <tbody id="labels"></tbody>
       </table>
     </div>
+
+    <!-- per-node counters drill-down -->
+    <div class="panel">
+      <div class="panel-head">
+        <h2>Node counters</h2>
+        <span class="meta" id="ctrMeta"></span>
+      </div>
+      <div class="node-tabs" id="nodeTabs"></div>
+      <div class="counters-grid" id="ctrGrid"></div>
+    </div>
   </div>
 
+  <!-- right column -->
   <div>
     <div class="panel">
       <div class="panel-head">
@@ -153,45 +305,60 @@ tr.running td:first-child{font-weight:500}
 <script>
 "use strict";
 
-const $  = (s) => document.querySelector(s);
+const $ = (s) => document.querySelector(s);
+
 const ROLES = [
   "fetcher_a","fetcher_b",
   "t1_a","t1_b","t1_c","t1_d","t1_e",
   "t2_a","t2_b","t2_c",
   "pool","dashboard","vps"
 ];
+
 const LABEL_INFO = [
-  ["flash",   "< 3s"],
-  ["panther", "3–5s"],
-  ["lantern", "5–7s"],
-  ["deadass", "7–10s"]
+  ["flash",   "< 3 s"],
+  ["panther", "3 – 5 s"],
+  ["lantern", "5 – 7 s"],
+  ["deadass", "7 – 10 s"]
 ];
 
-let prev       = {};   // role -> {sig, t, pass, counters}
-let lastChange = {};   // role -> ts of last counter change
-let connected  = false;
+const COUNTER_LABELS = {
+  raw_fetched:      "Raw fetched",
+  t1_tcp_fail:      "T1 TCP fail",
+  t1_pass:          "T1 pass",
+  t1_fail:          "T1 fail",
+  t2_pass_flash:    "T2 flash",
+  t2_pass_panther:  "T2 panther",
+  t2_pass_lantern:  "T2 lantern",
+  t2_pass_deadass:  "T2 deadass",
+  t2_rejected:      "T2 rejected",
+  t2_fail:          "T2 fail",
+  promoted:         "Promoted",
+  evicted:          "Evicted",
+  picks_served:     "Picks served",
+  health_pings:     "Health pings",
+};
 
-function num(v){
-  return (v === null || v === undefined || Number.isNaN(v)) ? null : v;
-}
-function show(v){
-  const n = num(v);
-  return n === null ? "—" : n;
-}
+let prev        = {};
+let lastChange  = {};
+let selectedNode = "pool";
+let latestNodes  = {};
+
+function num(v){ return (v === null || v === undefined || Number.isNaN(+v)) ? null : +v; }
+function show(v){ const n = num(v); return n === null ? "—" : n; }
 function cell(v){
   const n = num(v);
   if(n === null) return '<span class="zero">—</span>';
-  return n === 0 ? '<span class="zero">0</span>' : String(n);
+  return n === 0  ? '<span class="zero">0</span>' : String(n);
 }
 function passTotal(c){
-  return (c.t1_pass              || 0)
-       + (c.t2_pass_flash        || 0)
-       + (c.t2_pass_panther      || 0)
-       + (c.t2_pass_lantern      || 0)
-       + (c.t2_pass_deadass      || 0);
+  return (c.t1_pass           || 0)
+       + (c.t2_pass_flash     || 0)
+       + (c.t2_pass_panther   || 0)
+       + (c.t2_pass_lantern   || 0)
+       + (c.t2_pass_deadass   || 0);
 }
 function hhmmss(ts){
-  return new Date(ts * 1000).toTimeString().slice(0, 8);
+  return new Date(ts * 1000).toTimeString().slice(0,8);
 }
 function statusOf(role, n, now){
   if(!n || n.error) return "offline";
@@ -199,13 +366,61 @@ function statusOf(role, n, now){
   if(ch === undefined) return "idle";
   return (now - ch) <= 15 ? "running" : "idle";
 }
+function evClass(ev){
+  const m = (ev||"").replace(/[^a-z0-9_]/gi,"_");
+  return "ev-" + m;
+}
 
+// ── node tabs ────────────────────────────────────────────────────────────────
+function renderNodeTabs(nodes, now){
+  const wrap = $("#nodeTabs");
+  const existing = new Set([...wrap.querySelectorAll(".ntab")].map(b => b.dataset.role));
+  const incoming = new Set(ROLES.filter(r => r in nodes));
+
+  // add new
+  for(const role of ROLES){
+    if(!(role in nodes)) continue;
+    if(!existing.has(role)){
+      const b = document.createElement("button");
+      b.className = "ntab";
+      b.dataset.role = role;
+      b.textContent = role;
+      b.onclick = () => { selectedNode = role; renderCtrGrid(latestNodes); };
+      wrap.appendChild(b);
+    }
+    const b = wrap.querySelector(`[data-role="${role}"]`);
+    if(b){
+      const st = statusOf(role, nodes[role], now);
+      b.className = "ntab st-" + st + (selectedNode === role ? " active" : "");
+    }
+  }
+}
+
+function renderCtrGrid(nodes){
+  const n = nodes[selectedNode];
+  const c = (n && !n.error && n.counters) || {};
+  const keys = Object.keys(COUNTER_LABELS);
+  $("#ctrMeta").textContent = selectedNode;
+  $("#ctrGrid").innerHTML = keys.map(k => {
+    const v = num(c[k]);
+    return `<div class="ctr">
+      <div class="ck">${COUNTER_LABELS[k]}</div>
+      <div class="cv">${v === null ? '<span class="zero">—</span>' : v === 0 ? '<span class="zero">0</span>' : v}</div>
+    </div>`;
+  }).join("");
+}
+
+// ── main render ───────────────────────────────────────────────────────────────
 function render(data){
   const nodes = data.nodes || {};
   const now   = Date.now() / 1000;
+  latestNodes = nodes;
 
-  const agg = { live:0, f30:0, f120:0, online:0, total:0,
-                flash:0, panther:0, lantern:0, deadass:0, passRate:0, evicted:0 };
+  const agg = {
+    live:0, f30:0, f120:0, online:0, total:0,
+    flash:0, panther:0, lantern:0, deadass:0,
+    passRate:0, evicted:0, raw:0,
+  };
   const activities = [];
   const rows = [];
 
@@ -223,7 +438,6 @@ function render(data){
       agg.online++;
       const sig = JSON.stringify(c);
       const p   = prev[role];
-
       if(!p || p.sig !== sig) lastChange[role] = now;
 
       if(p && now > p.t){
@@ -231,18 +445,20 @@ function render(data){
         const dt = now - p.t;
         if(d > 0 && dt > 0) rate = d / dt;
       }
-      prev[role] = { sig, t: now, pass: passTotal(c) };
+      prev[role] = { sig, t: now, pass: passTotal(c), counters: c };
+
       agg.passRate += rate;
-      agg.evicted  += (c.evicted || 0);
+      agg.evicted  += (c.evicted  || 0);
+      agg.raw      += (c.raw_fetched || 0);
 
       if(role === "pool"){
-        agg.live    = f.live     || 0;
+        agg.live    = f.live       || 0;
         agg.f30     = f.fresh_30s  || 0;
         agg.f120    = f.fresh_120s || 0;
-        agg.flash   = f.flash    || 0;
-        agg.panther = f.panther  || 0;
-        agg.lantern = f.lantern  || 0;
-        agg.deadass = f.deadass  || 0;
+        agg.flash   = f.flash      || 0;
+        agg.panther = f.panther    || 0;
+        agg.lantern = f.lantern    || 0;
+        agg.deadass = f.deadass    || 0;
       }
       if(Array.isArray(n.activity)){
         for(const a of n.activity){
@@ -253,111 +469,122 @@ function render(data){
 
     const st = statusOf(role, n, now);
     rows.push(
-      '<tr class="' + st + '">' +
-        '<td class="role">' + role + '</td>' +
-        '<td><span class="st"><span class="dot"></span>' + st + '</span></td>' +
-        '<td>' + cell(f.live) + '</td>' +
-        '<td>' + cell(f.fresh_30s) + '</td>' +
-        '<td>' + cell(f.flash) + '</td>' +
-        '<td>' + cell(f.panther) + '</td>' +
-        '<td>' + (rate > 0 ? rate.toFixed(1) : '<span class="zero">0</span>') + '</td>' +
-        '<td>' + cell(c.evicted) + '</td>' +
-      '</tr>'
+      `<tr class="${st}">
+        <td class="role">${role}</td>
+        <td><span class="st"><span class="dot"></span>${st}</span></td>
+        <td>${cell(f.live)}</td>
+        <td>${cell(f.fresh_30s)}</td>
+        <td>${cell(f.flash)}</td>
+        <td>${cell(f.panther)}</td>
+        <td>${cell(c.raw_fetched)}</td>
+        <td>${rate > 0 ? rate.toFixed(1) : '<span class="zero">0</span>'}</td>
+        <td>${cell(c.evicted)}</td>
+      </tr>`
     );
   }
 
-  // connection + clock
-  connected = agg.online > 0;
-  $("#conn").className = "live " + (connected ? "on" : "off");
-  $("#conn").lastElementChild.textContent = connected
-    ? "connected · " + agg.online + "/" + agg.total
+  // ── connection indicator ──
+  const online = agg.online > 0;
+  $("#conn").className = "live " + (online ? "on" : "off");
+  $("#conn").lastElementChild.textContent = online
+    ? `connected · ${agg.online}/${agg.total}`
     : "disconnected";
-  $("#clock").textContent = new Date().toTimeString().slice(0, 8);
 
-  // cards
-  const cards = [
-    ["Live proxies",  agg.live],
-    ["Fresh ≤30s",    agg.f30],
-    ["Fresh ≤120s",   agg.f120],
-    ["Online nodes",  agg.online + "/" + agg.total],
-    ["Flash",         agg.flash],
-    ["Panther",       agg.panther]
+  // ── summary cards ──
+  const CARDS = [
+    { k:"Live proxies", v:agg.live,    cls:"ok-card" },
+    { k:"Fresh ≤30s",   v:agg.f30,     cls:"" },
+    { k:"Fresh ≤120s",  v:agg.f120,    cls:"" },
+    { k:"Online nodes", v:`${agg.online}<small>/${agg.total}</small>`, cls:"" },
+    { k:"Flash",        v:agg.flash,   cls:"accent-card" },
+    { k:"Panther",      v:agg.panther, cls:"" },
+    { k:"Raw fetched",  v:agg.raw,     cls:"" },
+    { k:"Pass/s",       v:agg.passRate > 0 ? agg.passRate.toFixed(1) : "0", cls:"" },
   ];
-  $("#cards").innerHTML = cards.map(function(c){
-    return '<div class="card"><div class="k">' + c[0] + '</div>' +
-           '<div class="v">' + show(c[1]) + '</div></div>';
-  }).join("");
+  $("#cards").innerHTML = CARDS.map(c =>
+    `<div class="card ${c.cls}">
+      <div class="k">${c.k}</div>
+      <div class="v">${c.v}</div>
+    </div>`
+  ).join("");
 
-  // agents table
+  // ── agents table ──
   $("#agents").innerHTML = rows.length
     ? rows.join("")
-    : '<tr><td colspan="8" class="empty">no nodes reachable yet…</td></tr>';
+    : '<tr><td colspan="9" class="empty">no nodes reachable yet…</td></tr>';
+  $("#agentsMeta").textContent = agg.passRate > 0
+    ? `${agg.passRate.toFixed(1)} pass/s fleet-wide`
+    : "idle";
 
-  $("#agentsMeta").textContent =
-    agg.passRate > 0 ? agg.passRate.toFixed(1) + " pass/s fleet-wide" : "idle";
-
-  // labels
-  const labelCount = {
-    flash: agg.flash, panther: agg.panther,
-    lantern: agg.lantern, deadass: agg.deadass
-  };
-  const maxLab = Math.max(1, agg.flash, agg.panther, agg.lantern, agg.deadass);
-  $("#labels").innerHTML = LABEL_INFO.map(function(l){
-    const k = l[0];
-    const v = labelCount[k] || 0;
-    const w = Math.round((v / maxLab) * 100);
-    return '<tr>' +
-      '<td><span class="pill ' + k + '">' + k + '</span></td>' +
-      '<td>' + cell(v) + '</td>' +
-      '<td class="muted">' + l[1] + '</td>' +
-      '<td><div class="bar"><i style="width:' + w + '%"></i></div></td>' +
-    '</tr>';
+  // ── labels ──
+  const lc  = { flash:agg.flash, panther:agg.panther, lantern:agg.lantern, deadass:agg.deadass };
+  const max = Math.max(1, agg.flash, agg.panther, agg.lantern, agg.deadass);
+  $("#labels").innerHTML = LABEL_INFO.map(([k, meaning]) => {
+    const v = lc[k] || 0;
+    const w = Math.round((v / max) * 100);
+    return `<tr>
+      <td><span class="pill ${k}">${k}</span></td>
+      <td>${cell(v)}</td>
+      <td class="muted">${meaning}</td>
+      <td>
+        <div class="bar" style="position:relative">
+          <i style="width:${w}%"></i>
+        </div>
+      </td>
+    </tr>`;
   }).join("");
-  $("#poolMeta").textContent = agg.live ? agg.live + " total" : "";
+  $("#poolMeta").textContent = agg.live ? `${agg.live} total` : "";
 
-  // activity feed (merged across nodes, newest first)
-  activities.sort(function(a, b){ return (b.ts || 0) - (a.ts || 0); });
-  const top = activities.slice(0, 80);
+  // ── node tabs + counters ──
+  renderNodeTabs(nodes, now);
+  renderCtrGrid(nodes);
+
+  // ── activity feed ──
+  activities.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  const top = activities.slice(0, 100);
   $("#feed").innerHTML = top.length
-    ? top.map(function(a){
-        return '<div class="row">' +
-          '<span class="t">' + hhmmss(a.ts || 0) + '</span>' +
-          '<span class="e">' + (a.event || "") + '</span>' +
-          '<span class="d">' + (a.role ? a.role + " · " : "") + (a.detail || "") + '</span>' +
-        '</div>';
-      }).join("")
+    ? top.map(a =>
+        `<div class="row ${evClass(a.event)}">
+          <span class="t">${hhmmss(a.ts || 0)}</span>
+          <span class="e">${a.event || ""}</span>
+          <span class="d">${a.role ? a.role + " · " : ""}${a.detail || ""}</span>
+        </div>`
+      ).join("")
     : '<div class="empty">no recent activity</div>';
-  $("#feedMeta").textContent = top.length ? top.length + " events" : "";
+  $("#feedMeta").textContent = top.length ? `${top.length} events` : "";
 }
 
+// ── SSE connection — hits /stream/stats on the dashboard role ─────────────────
 let es = null;
 
 function connect(){
-  if(es){ try { es.close(); } catch(_){} }
+  if(es){ try{ es.close(); }catch(_){} }
   es = new EventSource("/stream/stats");
 
-  es.onopen = function(){
-    connected = true;
+  es.onopen = () => {
     $("#conn").className = "live on";
   };
-  es.onerror = function(){
-    connected = false;
+  es.onerror = () => {
     $("#conn").className = "live off";
     $("#conn").lastElementChild.textContent = "reconnecting…";
   };
-  es.onmessage = function(e){
+  es.onmessage = (e) => {
     let data;
-    try { data = JSON.parse(e.data); } catch(_) { return; }
+    try{ data = JSON.parse(e.data); }catch(_){ return; }
     if(data && data.nodes) render(data);
   };
 }
 
 connect();
-setInterval(function(){
+
+// reconnect if SSE dies
+setInterval(() => {
   if(!es || es.readyState === EventSource.CLOSED) connect();
 }, 5000);
-setInterval(function(){
-  $("#clock").textContent = new Date().toTimeString().slice(0, 8);
+
+// clock tick
+setInterval(() => {
+  $("#clock").textContent = new Date().toTimeString().slice(0,8);
 }, 1000);
 </script>
 </body>
