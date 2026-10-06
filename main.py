@@ -657,10 +657,6 @@ def _register(proxies: list[str], label: str):
     if not proxies:
         return
     with _src_raw_lock:
-        total = sum(len(v) for v in _src_raw.values())
-        if total >= SRC_RAW_CAP:
-            return
-        _src_raw[label].extend(proxies)
 
 def _fetch_github(owner: str, repo: str, path: str) -> tuple[list[str], str]:
     key   = f"{owner}/{repo}/{path}"
