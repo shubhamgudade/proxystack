@@ -554,10 +554,10 @@ def _load_free():
             for addr, r in rows:
                 _proxies[addr] = {
                     "received_at":   now,
-                    "last_checked":  r.get("last_checked", 0),   # may be stale → not served until rechecked
+                    "last_checked":  r.get("last_checked", 0),
                     "latency_ms":    r.get("latency_ms", 0),
                     "label":         r.get("label"),
-                    "next_check_at": now,                        # recheck immediately
+                    "next_check_at": now,
                 }
                 _live.add(addr)
         print(f"[persist] loaded {len(_proxies)} free proxies", flush=True)
