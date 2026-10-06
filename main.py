@@ -972,7 +972,7 @@ async def _local_pipeline_main():
         tasks = (
             [asyncio.create_task(_t1_worker(t1_sess)) for _ in range(LOCAL_T1_BATCH)]
             + [asyncio.create_task(_t2_worker(t2_sess)) for _ in range(LOCAL_T2_CONC)]
-            + [asyncio.create_task(_feeder()),
+            + [asyncio.create_task(_distributor()),
                asyncio.create_task(_stats_printer())]
         )
         await asyncio.gather(*tasks)
