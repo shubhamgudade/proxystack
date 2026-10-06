@@ -379,7 +379,7 @@ def _log_activity(event: str, detail: str = "", count: int = 0):
 
 # Ingest outbound buffer
 _outbuf_lock = threading.Lock()
-_outbuf: list[tuple[str, str, float]] = []
+_outbuf: list[tuple[str, str, float, str]] = []
 
 _persist_event = threading.Event()
 
