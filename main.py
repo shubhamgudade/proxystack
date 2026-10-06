@@ -327,8 +327,8 @@ _src_raw: dict[str, list] = defaultdict(list)
 
 # ─── Live pool (pool role) — labels, not category sets ───────────────────────
 _proxies_lock = threading.Lock()
-_proxies: dict[str, dict] = {}   # addr -> {received_at,last_checked,latency_ms,label,next_check_at}
-_live: set[str] = set()          # mirror of _proxies keys (legacy stats/persist reads)
+_proxies: dict[str, dict] = {}
+_live: set[str] = set()
 
 _used_lock = threading.Lock()
 _last_used: dict[str, float] = {}
@@ -336,10 +336,14 @@ _last_used: dict[str, float] = {}
 _snap_lock     = threading.Lock()
 _snap_fresh30:  list[str] = []
 _snap_fresh120: list[str] = []
-_snap_fast:     list[str] = []   # fresh120 & label in (flash, panther)
+_snap_fast:     list[str] = []
 
 _t1_times: dict[str, float] = {}
 _t1_lock = threading.Lock()
+
+# Sticky leases (VPS role, FOD chain)
+_sticky_lock = threading.Lock()
+_sticky: dict[str, tuple] = {}
 
 # Paid (VPS role)
 _paid_lock = threading.Lock()
@@ -347,10 +351,6 @@ _paid_proxies: dict[str, dict] = {}
 
 _keys_lock = threading.Lock()
 _keys: list[dict] = []
-
-# Sticky leases (VPS role, FOD chain)
-_sticky_lock = threading.Lock()
-_sticky: dict[str, tuple] = {}   # key -> (addr, expires_at)
 
 # GitHub ETags
 _sha_lock = threading.Lock()
