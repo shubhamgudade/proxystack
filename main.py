@@ -614,9 +614,9 @@ def _persist_worker():
 # ═══════════════════════════════════════════════════════════════════════════════
 # OUTBOUND INGEST SENDER
 # ═══════════════════════════════════════════════════════════════════════════════
-def _push_downstream(addr: str, next_role: str, t1_elapsed: float = 5.0):
+def _push_downstream(addr: str, next_role: str, t1_elapsed: float = 5.0, stage: str = "t1"):
     with _outbuf_lock:
-        _outbuf.append((addr, next_role, t1_elapsed))
+        _outbuf.append((addr, next_role, t1_elapsed, stage))
 
 def _outbuf_sender():
     while True:
