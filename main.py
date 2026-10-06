@@ -428,7 +428,8 @@ def _promote(addr: str, latency_s: float):
         rec["last_checked"]  = now
         rec["latency_ms"]    = int(latency_s * 1000)
         rec["label"]         = _assign_cat(latency_s)
-        rec["next_check_at"] = now + RECHECK_WARM_S
+        hot                  = addr in _last_used
+        rec["next_check_at"] = now + (RECHECK_HOT_S if hot else RECHECK_WARM_S)
     _live.add(addr)
     _inc("promoted")
     _persist_event.set()
@@ -528,9 +529,14 @@ def _budget_room(now: float) -> int:
         _dispatch_times.popleft()
     return FETCH_MAX_PER_NODE - len(_dispatch_times)
 
-def _push_to_local_t2(addr: str, t1_elapsed: float):
+def _push_to_local_t2(addr: str, t1_elapsed: float = 5.0):
+    if _seen_dup("t2", addr):
+        return
     if _local_t2_queue and _local_loop and not _local_loop.is_closed():
-        asyncio.run_coroutine_threadsafe(_local_t2_queue.put((addr, t1_elapsed)), _local_loop)
+        try:
+            asyncio.run_coroutine_threadsafe(_local_t2_queue.put_nowait((addr, t1_elapsed)), _local_loop)
+        except (asyncio.QueueFull, RuntimeError):
+            pass
 # ═══════════════════════════════════════════════════════════════════════════════
 # PERSIST
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -657,6 +663,10 @@ def _register(proxies: list[str], label: str):
     if not proxies:
         return
     with _src_raw_lock:
+        bucket = _src_raw[label]
+        bucket.extend(proxies)
+        if len(bucket) > SRC_RAW_CAP:
+            del bucket[:len(bucket) - SRC_RAW_CAP]
 
 def _fetch_github(owner: str, repo: str, path: str) -> tuple[list[str], str]:
     key   = f"{owner}/{repo}/{path}"
@@ -890,9 +900,14 @@ async def _local_pipeline_main():
             if passed:
                 _inc("t1_pass")
                 _log_activity("t1_pass", addr)
+                if _seen_dup("t2", addr):
+                    continue
                 lane = _t2_target(addr)
                 if lane == ROLE:
-                    await _local_t2_queue.put((addr, elapsed))
+                    try:
+                        _local_t2_queue.put_nowait((addr, elapsed))
+                    except asyncio.QueueFull:
+                        pass
                 else:
                     _push_downstream(addr, lane, elapsed, "t2")
             else:
@@ -984,8 +999,13 @@ def _local_pipeline_thread():
     _local_loop.run_until_complete(_local_pipeline_main())
 
 def _push_to_local_t1(addr: str):
+    if _seen_dup("t1", addr):
+        return
     if _local_t1_queue and _local_loop and not _local_loop.is_closed():
-        asyncio.run_coroutine_threadsafe(_local_t1_queue.put(addr), _local_loop)
+        try:
+            asyncio.run_coroutine_threadsafe(_local_t1_queue.put_nowait(addr), _local_loop)
+        except (asyncio.QueueFull, RuntimeError):
+            pass
 
 def _start_fetcher():
     repos     = GITHUB_REPOS_A if ROLE == "fetcher_a" else GITHUB_REPOS_B
@@ -1047,9 +1067,12 @@ async def _t1_checker_main():
             if passed:
                 _inc("t1_pass")
                 _log_activity("t1_pass", addr)
-                target = _weighted_pick(downstream)
-                if target:
-                    _push_downstream(addr, target, elapsed)
+                target = _t2_target(addr)
+                if target and not _seen_dup("t2", addr):
+                    if target == ROLE:
+                        _push_to_local_t2(addr, elapsed)
+                    else:
+                        _push_downstream(addr, target, elapsed, "t2")
             else:
                 _inc("t1_fail")
 
@@ -1076,8 +1099,13 @@ def _t1_checker_thread():
     _t1_loop.run_until_complete(_t1_checker_main())
 
 def _push_to_t1(addr: str):
+    if _seen_dup("t1", addr):
+        return
     if _t1_queue and _t1_loop and not _t1_loop.is_closed():
-        asyncio.run_coroutine_threadsafe(_t1_queue.put(addr), _t1_loop)
+        try:
+            asyncio.run_coroutine_threadsafe(_t1_queue.put_nowait(addr), _t1_loop)
+        except (asyncio.QueueFull, RuntimeError):
+            pass
 
 def _start_t1_checker():
     threading.Thread(target=_t1_checker_thread, daemon=True, name="t1-checker").start()
@@ -1136,9 +1164,7 @@ async def _t2_checker_main():
                     continue
                 _inc(f"t2_pass_{cat}")
                 _log_activity("t2_pass", f"{addr} → {cat} ({avg:.1f}s)")
-                target = _weighted_pick(downstream)
-                if target:
-                    _push_downstream(addr, target, avg)
+                _push_downstream(addr, "pool", avg, "t2")
             else:
                 _inc("t2_fail")
 
@@ -1169,8 +1195,13 @@ def _t2_checker_thread():
     _t2_loop.run_until_complete(_t2_checker_main())
 
 def _push_to_t2(addr: str, t1_elapsed: float = 5.0):
+    if _seen_dup("t2", addr):
+        return
     if _t2_queue and _t2_loop and not _t2_loop.is_closed():
-        asyncio.run_coroutine_threadsafe(_t2_queue.put((addr, t1_elapsed)), _t2_loop)
+        try:
+            asyncio.run_coroutine_threadsafe(_t2_queue.put_nowait((addr, t1_elapsed)), _t2_loop)
+        except (asyncio.QueueFull, RuntimeError):
+            pass
 
 def _start_t2_checker():
     threading.Thread(target=_t2_checker_thread, daemon=True, name="t2-checker").start()
@@ -1236,13 +1267,16 @@ def _snapshot_worker():
         time.sleep(SNAP_INTERVAL_S)
 
 def _refresh_worker():
+    time.sleep(10)
     while True:
         now = time.time()
         with _proxies_lock:
             due = [a for a, r in _proxies.items() if now >= r.get("next_check_at", 0)]
         random.shuffle(due)
         for a in due[:REFRESH_BATCH]:
-            _push_downstream(a, random.choice(T2_ROLES), 5.0)
+            if _seen_dup("recheck", a):
+                continue
+            _push_downstream(a, _t2_target(a), 5.0, "t2")
             with _proxies_lock:
                 r = _proxies.get(a)
                 if r:
@@ -1562,6 +1596,7 @@ async def stream_stats():
 class IngestItem(BaseModel):
     addr:       str
     t1_elapsed: float = 5.0
+    stage:      str   = "t1"
 
 class IngestRequest(BaseModel):
     proxies: list[IngestItem]
@@ -1579,6 +1614,14 @@ async def ingest(req: IngestRequest, x_secret: Optional[str] = Header(None)):
     elif ROLE in ("t2_a", "t2_b", "t2_c"):
         for item in req.proxies:
             _push_to_t2(item.addr, item.t1_elapsed)
+        return {"queued": len(req.proxies)}
+
+    elif ROLE in ("fetcher_a", "fetcher_b"):
+        for item in req.proxies:
+            if item.stage == "t2":
+                _push_to_local_t2(item.addr, item.t1_elapsed)
+            else:
+                _push_to_local_t1(item.addr)
         return {"queued": len(req.proxies)}
 
     elif ROLE == "pool":
@@ -1645,6 +1688,7 @@ async def proxy_request(req: ProxyRequest):
                 s = _sticky.get(skey)
                 if s and s[1] > time.time():
                     prx = {"http": f"http://{s[0]}", "https": f"http://{s[0]}", "addr": s[0]}
+                    _sticky[skey] = (s[0], time.time() + STICKY_TTL_S)   # sliding renew
         if prx is None:
             prx = await loop.run_in_executor(
                 _backend_executor, pick_proxy_vps, req.tier, req.category, purpose
@@ -1679,13 +1723,18 @@ async def proxy_request(req: ProxyRequest):
                 pass
             ct = r.headers.get("content-type", "application/octet-stream")
             return Response(content=raw, status_code=r.status_code, media_type=ct)
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+        except requests.exceptions.ReadTimeout as e:
+            # connection WAS established → proxy is alive; retry, do NOT evict
+            last_err = str(e)
+            print(f"[vps] attempt {attempt+1}/{req.retries} via {proxy_addr} read-timeout: {e}", flush=True)
+        except requests.exceptions.ConnectionError as e:
+            # proxy-level failure: evict, drop the lease, retry on a new proxy
             last_err = str(e)
             await loop.run_in_executor(_backend_executor, _report_dead_to_pool, proxy_addr)
             if skey:
                 with _sticky_lock:
                     _sticky.pop(skey, None)       # drop lease → re-pick fresh proxy
-            print(f"[vps] attempt {attempt+1}/{req.retries} via {proxy_addr}: {e}", flush=True)
+            print(f"[vps] attempt {attempt+1}/{req.retries} via {proxy_addr} connect-fail: {e}", flush=True)
         except Exception as e:                     # non-proxy error — don't blame the proxy
             last_err = str(e)
             print(f"[vps] attempt {attempt+1}/{req.retries} err: {e}", flush=True)
