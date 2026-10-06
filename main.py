@@ -5,25 +5,31 @@ ProxyStack — Distributed Proxy Gateway
 One file. 13 machines. Change ROLE env var, different behavior.
 
 ROLES:
-  fetcher_a  → Brimstone — hybrid: fetch + local T1 + local T2 (batch A sources)
-  fetcher_b  → Viper     — hybrid: fetch + local T1 + local T2 (batch B sources)
-  t1_a       → Sage      — TCP + Httpbin check (overflow from fetchers)
-  t1_b       → Sova      — TCP + Httpbin check (overflow from fetchers)
-  t1_c       → Astra     — TCP + Httpbin check (overflow from fetchers)
-  t1_d       → Harbor    — TCP + Httpbin check (overflow from fetchers)
-  t1_e       → Reyna     — TCP + Httpbin check (overflow from fetchers)
+  fetcher_a  → Brimstone — fetch 5k from sources A, distribute, switch to T1 checker
+  fetcher_b  → Viper     — fetch 5k from sources B, distribute, switch to T1 checker
+  t1_a       → Sage      — TCP + Httpbin check
+  t1_b       → Sova      — TCP + Httpbin check
+  t1_c       → Astra     — TCP + Httpbin check
+  t1_d       → Harbor    — TCP + Httpbin check
+  t1_e       → Reyna     — TCP + Httpbin check
   t2_a       → Raze      — Meesho T2 check
   t2_b       → Killjoy   — Meesho T2 check
   t2_c       → Cypher    — Meesho T2 check
   pool       → Yoru      — Live proxy pool, /pick, /dead, persist
   dashboard  → Jett      — Stats + dashboard UI
-  vps        → Oracle VPS — /request, pinger, paid proxies, main app API
+  vps        → Oracle    — /request, pinger, paid proxies, main app API
 
 Pipeline:
-  Brimstone/Viper → (local T1+T2) → Yoru /ingest
-                  → (overflow raw) → Sage/Sova/Astra/Harbor/Reyna
-  Sage/Sova/Astra/Harbor/Reyna → Raze/Killjoy/Cypher → Yoru /ingest
-  VPS → Yoru /pick
+  Brimstone fetches 5k → distributes to all T1s + self → switches to T1 checker
+  Viper     fetches 5k → distributes to all T1s + self → switches to T1 checker
+  All T1 nodes check → pass → T2 immediately
+  T2 nodes check → pass → Yoru /ingest
+  VPS → Yoru /pick → makes request → returns response
+
+Phase Logic (per fetcher):
+  FETCH → hit 5k or 90s timeout → distribute → CHECK
+  CHECK → time_to_finish <= FETCH_TIMEOUT → flip back to FETCH
+  rate tracked as rolling average of T1 passes/sec over last 30s
 """
 
 import asyncio
@@ -64,6 +70,9 @@ ROLE          = os.getenv("ROLE", "pool").lower()
 SHARED_SECRET = os.getenv("SHARED_SECRET", "changeme")
 PORT          = int(os.getenv("PORT", "8080"))
 
+# GitHub API token -- set on the TWO FETCHER services only (Render -> Environment).
+GITHUB_TOKEN  = os.getenv("GITHUB_TOKEN", "")
+
 # ─── Peer URLs ────────────────────────────────────────────────────────────────
 PEERS = {
     "fetcher_a": os.getenv("PEER_FETCHER_A", "https://ps-brimstone.onrender.com"),
@@ -72,21 +81,22 @@ PEERS = {
     "t1_b":      os.getenv("PEER_T1_B",      "https://ps-sova.onrender.com"),
     "t1_c":      os.getenv("PEER_T1_C",      "https://ps-astra.onrender.com"),
     "t1_d":      os.getenv("PEER_T1_D",      "https://ps-harbor.onrender.com"),
-    "t1_e":      os.getenv("PEER_T1_E",      "https://ps-reyna.onrender.com"),
-    "t2_a":      os.getenv("PEER_T2_A",      "https://ps-raze.onrender.com"),
-    "t2_b":      os.getenv("PEER_T2_B",      "https://ps-killjoy.onrender.com"),
-    "t2_c":      os.getenv("PEER_T2_C",      "https://ps-cypher.onrender.com"),
-    "pool":      os.getenv("PEER_POOL",      "https://ps-yoru.onrender.com"),
-    "dashboard": os.getenv("PEER_DASHBOARD", "https://ps-jett.onrender.com"),
+    "t1_e":      os.getenv("PEER_T1_E",      "https://ps-phoenix.onrender.com"),
+    "t2_a":      os.getenv("PEER_T2_A",      "https://ps-breach.onrender.com"),
+    "t2_b":      os.getenv("PEER_T2_B",      "https://ps-neon.onrender.com"),
+    "t2_c":      os.getenv("PEER_T2_C",      "https://ps-killjoy.onrender.com"),
+    "pool":      os.getenv("PEER_POOL",      "https://ps-omen.onrender.com"),
+    "dashboard": os.getenv("PEER_DASHBOARD", "https://ps-yoru.onrender.com"),
     "vps":       os.getenv("PEER_VPS",       "http://130.210.16.206:8080"),
 }
 
 T1_ROLES = ["t1_a", "t1_b", "t1_c", "t1_d", "t1_e"]
 T2_ROLES = ["t2_a", "t2_b", "t2_c"]
+ALL_T1_NODES = T1_ROLES + ["fetcher_a", "fetcher_b"]  # fetchers also act as T1 in check phase
 
 DOWNSTREAM = {
-    "fetcher_a": [("t1_a", 0.04), ("t1_b", 0.04), ("t1_c", 0.04), ("t1_d", 0.04), ("t1_e", 0.04)],
-    "fetcher_b": [("t1_a", 0.04), ("t1_b", 0.04), ("t1_c", 0.04), ("t1_d", 0.04), ("t1_e", 0.04)],
+    "fetcher_a": [],  # dynamic — fetcher handles its own routing
+    "fetcher_b": [],
     "t1_a":      [("t2_a", 1.0)],
     "t1_b":      [("t2_b", 1.0)],
     "t1_c":      [("t2_c", 1.0)],
@@ -107,13 +117,16 @@ BASE         = Path(__file__).parent
 PERSIST_FREE = BASE / "proxy_live.json"
 PERSIST_PAID = BASE / "paid_live.json"
 KEYS_FILE    = BASE / "keys.json"
-SESSION_FILE = BASE / "session_history.json"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TUNING
 # ═══════════════════════════════════════════════════════════════════════════════
-FEED_TARGET        = 5_000
-SRC_RAW_CAP        = 15_000
+FETCH_TARGET_PER_NODE  = 5_000   # each fetcher targets 5k independently
+FETCH_TIMEOUT_S        = 90      # max seconds in fetch mode before forced switch
+RATE_WINDOW_S          = 30      # rolling window for T1 pass rate calculation
+SWITCH_BACK_LEAD_S     = 5       # extra buffer when calculating switch-back time
+
+SRC_RAW_CAP        = 8_000
 FETCH_WORKERS      = 20
 GITHUB_POLL        = 120
 HTTP_POLL          = 60
@@ -160,17 +173,8 @@ FOD_HUNT_PATHS = (
 )
 STICKY_TTL_S = 90
 
-T1_LANES = ["fetcher_a", "fetcher_b", "t1_a", "t1_b", "t1_c", "t1_d", "t1_e"]
-T2_LANES = ["fetcher_a", "fetcher_b", "t2_a", "t2_b", "t2_c"]
-FETCH_MAX_FLEET    = 5_000
-FETCH_WINDOW_S     = 300
-FETCH_MAX_PER_NODE = FETCH_MAX_FLEET // 2
-SEEN_TTL_S         = 180
-
-# Optimized for Oracle 1 OCPU / 1GB
+SEEN_TTL_S         = 600   # extended to cover full fetch+check cycle
 PING_INTERVAL      = 240
-
-LOCAL_T1_SPILL_THRESH = 0.6
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MEESHO
@@ -206,7 +210,7 @@ def _next_t1():
     return t
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SOURCES
+# SOURCES — split A/B so each fetcher owns specific sources
 # ═══════════════════════════════════════════════════════════════════════════════
 ALL_GITHUB_REPOS = [
     ("monosans",           "proxy-list",          "proxies/http.txt"),
@@ -305,12 +309,13 @@ _IP_PORT = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})\b")
 def _parse(text: str) -> list[str]:
     return [m.group(0) for m in _IP_PORT.finditer(text)]
 
-_raw_lock = threading.Lock()
-_raw: set[str] = set()
+# ── Raw pool (fetchers fill this, deduped at entry) ──────────────────────────
+_raw_pool_lock  = threading.Lock()
+_raw_pool: list[str] = []
+_raw_pool_set:  set[str] = set()   # dedup set for raw pool
+_raw_pool_count = 0                # total added this fetch cycle
 
-_src_raw_lock = threading.Lock()
-_src_raw: dict[str, list] = defaultdict(list)
-
+# ── Proxy live store ──────────────────────────────────────────────────────────
 _proxies_lock = threading.Lock()
 _proxies: dict[str, dict] = {}
 _live: set[str] = set()
@@ -323,66 +328,84 @@ _snap_fresh30:  list[str] = []
 _snap_fresh120: list[str] = []
 _snap_fast:     list[str] = []
 
-_t1_times: dict[str, float] = {}
-_t1_lock = threading.Lock()
-
-_sticky_lock = threading.Lock()
-_sticky: dict[str, tuple] = {}
-
 _paid_lock = threading.Lock()
 _paid_proxies: dict[str, dict] = {}
 
 _keys_lock = threading.Lock()
 _keys: list[dict] = []
 
-_sha_lock = threading.Lock()
+# ── Seen dedup (extended TTL covers full cycle) ───────────────────────────────
+_seen_lock = threading.Lock()
+_seen: dict[tuple, float] = {}
+
+# ── Activity log ─────────────────────────────────────────────────────────────
+_activity_lock = threading.Lock()
+_activity_log: list[dict] = []
+ACTIVITY_MAX = 200
+
+# ── Counters ──────────────────────────────────────────────────────────────────
+_counter_lock = threading.Lock()
+_counters: dict[str, int] = defaultdict(int)
+
+# ── Outbound buffer ───────────────────────────────────────────────────────────
+_outbuf_lock = threading.Lock()
+_outbuf: list[tuple[str, str, float, str]] = []
+
+# ── Persist event ─────────────────────────────────────────────────────────────
+_persist_event = threading.Event()
+
+# ── Async queues / loops ──────────────────────────────────────────────────────
+_t1_queue: asyncio.Queue = None
+_t1_loop:  asyncio.AbstractEventLoop = None
+
+_t2_queue: asyncio.Queue = None
+_t2_loop:  asyncio.AbstractEventLoop = None
+
+_local_t1_queue: asyncio.Queue = None
+_local_t2_queue: asyncio.Queue = None
+_local_loop:     asyncio.AbstractEventLoop = None
+
+# ── Phase state (fetcher nodes only) ─────────────────────────────────────────
+FSTATE_FETCH = "fetch"
+FSTATE_CHECK = "check"
+
+_fstate      = FSTATE_FETCH
+_fstate_lock = threading.Lock()
+_fetch_phase_start = time.time()
+
+# ── T1 pass rate tracker (for time-based switch-back) ────────────────────────
+_rate_lock       = threading.Lock()
+_rate_timestamps: deque = deque()   # timestamps of each T1 pass
+
+# ── SHA / etag caches ────────────────────────────────────────────────────────
+_sha_lock  = threading.Lock()
 _repo_sha: dict[str, str] = {}
 _etag_lock = threading.Lock()
 _http_etag: dict[str, str] = {}
 _http_lmod: dict[str, str] = {}
 
-_activity_lock = threading.Lock()
-_activity_log: list[dict] = []
-ACTIVITY_MAX = 200
+# ── API executors ─────────────────────────────────────────────────────────────
+_api_executor     = ThreadPoolExecutor(max_workers=8,  thread_name_prefix="api")
+_backend_executor = ThreadPoolExecutor(max_workers=24, thread_name_prefix="backend")
+
+# ── Sticky sessions ───────────────────────────────────────────────────────────
+_sticky_lock = threading.Lock()
+_sticky: dict[str, tuple] = {}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+def _inc(key: str, n: int = 1):
+    with _counter_lock:
+        _counters[key] += n
 
 def _log_activity(event: str, detail: str = "", count: int = 0):
-    entry = {
-        "ts":     time.time(),
-        "role":   ROLE,
-        "event":  event,
-        "detail": detail,
-        "count":  count,
-    }
+    entry = {"ts": time.time(), "role": ROLE, "event": event, "detail": detail, "count": count}
     with _activity_lock:
         _activity_log.append(entry)
         if len(_activity_log) > ACTIVITY_MAX:
             del _activity_log[:-ACTIVITY_MAX]
 
-_outbuf_lock = threading.Lock()
-_outbuf: list[tuple[str, str, float, str]] = []
-
-_persist_event = threading.Event()
-
-_t1_queue: asyncio.Queue = None
-_t1_loop: asyncio.AbstractEventLoop = None
-
-_t2_queue: asyncio.Queue = None
-_t2_loop: asyncio.AbstractEventLoop = None
-
-_local_t1_queue: asyncio.Queue = None
-_local_t2_queue: asyncio.Queue = None
-_local_loop: asyncio.AbstractEventLoop = None
-
-_counter_lock = threading.Lock()
-_counters: dict[str, int] = defaultdict(int)
-
-def _inc(key: str, n: int = 1):
-    with _counter_lock:
-        _counters[key] += n
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
 def _assign_cat(avg_sec: float) -> Optional[str]:
     if avg_sec <  CAT_FLASH:   return "flash"
     if avg_sec <  CAT_PANTHER: return "panther"
@@ -463,24 +486,13 @@ async def _tcp_open_async(addr: str) -> bool:
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _tcp_open, addr)
 
-def _weighted_pick(downstream: list[tuple[str, float]]) -> Optional[str]:
-    if not downstream:
-        return None
-    roles   = [r for r, _ in downstream]
-    weights = [w for _, w in downstream]
-    return random.choices(roles, weights=weights, k=1)[0]
-
 def _hash(addr: str) -> int:
-    return int.from_bytes(hashlib.blake2b(addr.encode("utf-8", "ignore"), digest_size=8).digest(), "big")
-
-def _t1_target(addr: str) -> str:
-    return T1_LANES[_hash(addr) % len(T1_LANES)]
+    return int.from_bytes(
+        hashlib.blake2b(addr.encode("utf-8", "ignore"), digest_size=8).digest(), "big"
+    )
 
 def _t2_target(addr: str) -> str:
-    return T2_LANES[_hash(addr) % len(T2_LANES)]
-
-_seen_lock = threading.Lock()
-_seen: dict[tuple, float] = {}
+    return T2_ROLES[_hash(addr) % len(T2_ROLES)]
 
 def _seen_dup(stage: str, addr: str) -> bool:
     now = time.time()
@@ -496,114 +508,96 @@ def _seen_dup(stage: str, addr: str) -> bool:
                     _seen.pop(k, None)
         return False
 
-_dispatch_times: deque = deque()
+def _record_t1_pass():
+    """Record timestamp of a T1 pass for rate calculation."""
+    now = time.time()
+    with _rate_lock:
+        _rate_timestamps.append(now)
+        # prune old entries outside window
+        cutoff = now - RATE_WINDOW_S
+        while _rate_timestamps and _rate_timestamps[0] < cutoff:
+            _rate_timestamps.popleft()
 
-def _budget_room(now: float) -> int:
-    while _dispatch_times and now - _dispatch_times[0] > FETCH_WINDOW_S:
-        _dispatch_times.popleft()
-    return FETCH_MAX_PER_NODE - len(_dispatch_times)
+def _get_t1_pass_rate() -> float:
+    """Returns T1 passes per second over last RATE_WINDOW_S seconds."""
+    now = time.time()
+    with _rate_lock:
+        cutoff = now - RATE_WINDOW_S
+        while _rate_timestamps and _rate_timestamps[0] < cutoff:
+            _rate_timestamps.popleft()
+        count = len(_rate_timestamps)
+    if count == 0:
+        return 0.0
+    return count / RATE_WINDOW_S
 
-def _should_spill_local() -> bool:
-    if _local_t1_queue is None:
-        return True
-    depth = _local_t1_queue.qsize()
-    cap   = _local_t1_queue.maxsize or 30_000
-    return (depth / cap) >= LOCAL_T1_SPILL_THRESH
+def _get_t1_queue_depth_total() -> int:
+    """Sum queue depth across all T1 nodes including fetchers acting as T1."""
+    total = 0
+    for role in ALL_T1_NODES:
+        if role == ROLE:
+            q = _local_t1_queue or _t1_queue
+            total += q.qsize() if q else 0
+        else:
+            url = PEERS.get(role)
+            if not url:
+                continue
+            try:
+                r = requests.get(
+                    f"{url}/qsize",
+                    headers={"X-Secret": SHARED_SECRET},
+                    timeout=3,
+                )
+                total += r.json().get("t1_qsize", 0)
+            except Exception:
+                pass
+    return total
 
-def _overflow_t1() -> str:
-    return random.choice(T1_ROLES)
+def _is_fod_hunt(url: str) -> bool:
+    try:
+        path = urlsplit(url).path
+    except Exception:
+        return False
+    return any(path.startswith(p) for p in FOD_HUNT_PATHS)
 
-def _push_to_local_t2(addr: str, t1_elapsed: float = 5.0):
-    if _seen_dup("t2", addr):
-        return
-    if _local_t2_queue and _local_loop and not _local_loop.is_closed():
-        try:
-            asyncio.run_coroutine_threadsafe(_local_t2_queue.put_nowait((addr, t1_elapsed)), _local_loop)
-        except (asyncio.QueueFull, RuntimeError):
-            pass
+def _sticky_key(headers) -> str:
+    if not headers:
+        return ""
+    low = {str(k).lower(): v for k, v in headers.items()}
+    k = low.get("app-session-id") or low.get("instance-id")
+    return f"fod:{k}" if k else ""
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PERSIST
+# DEDUP — raw pool entry
 # ═══════════════════════════════════════════════════════════════════════════════
-def _save_free():
-    try:
-        with _proxies_lock:
-            data = {a: {"label": r.get("label"), "latency_ms": r.get("latency_ms"),
-                        "last_checked": r.get("last_checked", 0)} for a, r in _proxies.items()}
-        PERSIST_FREE.write_text(json.dumps(data))
-    except Exception as e:
-        print(f"[persist] free save failed: {e}", flush=True)
+def _add_to_raw_pool(proxies: list[str]) -> int:
+    """Add proxies to raw pool with dedup. Returns count actually added."""
+    added = 0
+    with _raw_pool_lock:
+        global _raw_pool_count
+        for addr in proxies:
+            if addr not in _raw_pool_set:
+                _raw_pool_set.add(addr)
+                _raw_pool.append(addr)
+                _raw_pool_count += 1
+                added += 1
+    return added
 
-def _load_free():
-    if not PERSIST_FREE.exists():
-        return
-    try:
-        data = json.loads(PERSIST_FREE.read_text())
-        now  = time.time()
-        rows = data.items() if isinstance(data, dict) else [(a, {}) for a in data]
-        with _proxies_lock:
-            for addr, r in rows:
-                _proxies[addr] = {
-                    "received_at":   now,
-                    "last_checked":  r.get("last_checked", 0),
-                    "latency_ms":    r.get("latency_ms", 0),
-                    "label":         r.get("label"),
-                    "next_check_at": now,
-                }
-                _live.add(addr)
-        print(f"[persist] loaded {len(_proxies)} free proxies", flush=True)
-        _log_activity("startup", f"loaded {len(_proxies)} persisted proxies")
-    except Exception as e:
-        print(f"[persist] free load failed: {e}", flush=True)
+def _drain_raw_pool() -> list[str]:
+    """Take everything from raw pool and clear it."""
+    with _raw_pool_lock:
+        global _raw_pool_count
+        batch = list(_raw_pool)
+        _raw_pool.clear()
+        _raw_pool_set.clear()
+        _raw_pool_count = 0
+    return batch
 
-def _save_paid():
-    try:
-        with _paid_lock:
-            data = {a: dict(p) for a, p in _paid_proxies.items() if p.get("alive")}
-        PERSIST_PAID.write_text(json.dumps(data))
-    except Exception as e:
-        print(f"[persist] paid save failed: {e}", flush=True)
-
-def _load_paid():
-    if not PERSIST_PAID.exists():
-        return
-    try:
-        data = json.loads(PERSIST_PAID.read_text())
-        with _paid_lock:
-            for addr, p in data.items():
-                if addr not in _paid_proxies:
-                    _paid_proxies[addr] = p
-        print(f"[persist] loaded {len(data)} paid proxies", flush=True)
-    except Exception as e:
-        print(f"[persist] paid load failed: {e}", flush=True)
-
-def _save_keys():
-    try:
-        with _keys_lock: keys = list(_keys)
-        KEYS_FILE.write_text(json.dumps(keys, indent=2))
-    except Exception as e:
-        print(f"[persist] keys save failed: {e}", flush=True)
-
-def _load_keys():
-    if not KEYS_FILE.exists():
-        return
-    try:
-        data = json.loads(KEYS_FILE.read_text())
-        with _keys_lock: _keys.extend(data)
-        print(f"[persist] loaded {len(data)} keys", flush=True)
-    except Exception as e:
-        print(f"[persist] keys load failed: {e}", flush=True)
-
-def _persist_worker():
-    while True:
-        _persist_event.wait(timeout=PERSIST_INTERVAL)
-        _persist_event.clear()
-        if ROLE in ("pool", "vps"):
-            _save_free()
-            _save_paid()
+def _raw_pool_size() -> int:
+    with _raw_pool_lock:
+        return _raw_pool_count
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# OUTBOUND INGEST SENDER — drain fast when loaded
+# OUTBOUND INGEST SENDER
 # ═══════════════════════════════════════════════════════════════════════════════
 def _push_downstream(addr: str, next_role: str, t1_elapsed: float = 5.0, stage: str = "t1"):
     with _outbuf_lock:
@@ -645,119 +639,213 @@ def _outbuf_sender():
                         _outbuf.insert(0, (item["addr"], role, item["t1_elapsed"], item["stage"]))
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# FETCHER ROLE
+# DISTRIBUTION — fetcher sends batch to all T1 nodes including self
 # ═══════════════════════════════════════════════════════════════════════════════
-def _register(proxies: list[str], label: str):
-    if not proxies:
+def _distribute_batch_to_t1s(batch: list[str]):
+    """Evenly distribute raw proxies across all T1 nodes + self (fetcher in check mode)."""
+    if not batch:
         return
-    with _src_raw_lock:
-        bucket = _src_raw[label]
-        bucket.extend(proxies)
-        if len(bucket) > SRC_RAW_CAP:
-            del bucket[:len(bucket) - SRC_RAW_CAP]
 
-def _fetch_github(owner: str, repo: str, path: str) -> tuple[list[str], str]:
-    key   = f"{owner}/{repo}/{path}"
-    label = f"{owner}/{repo}"
+    nodes      = list(ALL_T1_NODES)  # 7 nodes total
+    chunk_size = len(batch) // len(nodes)
+    chunks     = [batch[i * chunk_size:(i + 1) * chunk_size] for i in range(len(nodes))]
+
+    # remainder to first node
+    remainder = batch[chunk_size * len(nodes):]
+    if remainder:
+        chunks[0].extend(remainder)
+
+    for role, chunk in zip(nodes, chunks):
+        if not chunk:
+            continue
+        if role == ROLE:
+            # push to own local T1 queue
+            for addr in chunk:
+                _push_to_local_t1_direct(addr)
+            print(f"[{ROLE}] distributed {len(chunk)} to self (local T1)", flush=True)
+        else:
+            url = PEERS.get(role)
+            if not url:
+                continue
+            try:
+                requests.post(
+                    f"{url}/ingest",
+                    json={"proxies": [{"addr": a, "stage": "t1", "t1_elapsed": 0.0} for a in chunk]},
+                    headers={"X-Secret": SHARED_SECRET},
+                    timeout=15,
+                )
+                print(f"[{ROLE}] distributed {len(chunk)} → {role}", flush=True)
+            except Exception as e:
+                print(f"[{ROLE}] dist failed → {role}: {e}", flush=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PERSIST
+# ═══════════════════════════════════════════════════════════════════════════════
+def _save_free():
     try:
-        r      = requests.get(
+        with _proxies_lock:
+            data = {
+                a: {"label": r.get("label"), "latency_ms": r.get("latency_ms"),
+                    "last_checked": r.get("last_checked", 0)}
+                for a, r in _proxies.items()
+            }
+        PERSIST_FREE.write_text(json.dumps(data))
+    except Exception as e:
+        print(f"[persist] free save failed: {e}", flush=True)
+
+def _load_free():
+    if not PERSIST_FREE.exists():
+        return
+    try:
+        data = json.loads(PERSIST_FREE.read_text())
+        now  = time.time()
+        rows = data.items() if isinstance(data, dict) else [(a, {}) for a in data]
+        with _proxies_lock:
+            for addr, r in rows:
+                _proxies[addr] = {
+                    "received_at":   now,
+                    "last_checked":  r.get("last_checked", 0),
+                    "latency_ms":    r.get("latency_ms", 0),
+                    "label":         r.get("label"),
+                    "next_check_at": now,
+                }
+                _live.add(addr)
+        print(f"[persist] loaded {len(_proxies)} free proxies", flush=True)
+    except Exception as e:
+        print(f"[persist] free load failed: {e}", flush=True)
+
+def _save_paid():
+    try:
+        with _paid_lock:
+            data = {a: dict(p) for a, p in _paid_proxies.items() if p.get("alive")}
+        PERSIST_PAID.write_text(json.dumps(data))
+    except Exception as e:
+        print(f"[persist] paid save failed: {e}", flush=True)
+
+def _load_paid():
+    if not PERSIST_PAID.exists():
+        return
+    try:
+        data = json.loads(PERSIST_PAID.read_text())
+        with _paid_lock:
+            for addr, p in data.items():
+                if addr not in _paid_proxies:
+                    _paid_proxies[addr] = p
+        print(f"[persist] loaded {len(data)} paid proxies", flush=True)
+    except Exception as e:
+        print(f"[persist] paid load failed: {e}", flush=True)
+
+def _save_keys():
+    try:
+        with _keys_lock:
+            keys = list(_keys)
+        KEYS_FILE.write_text(json.dumps(keys, indent=2))
+    except Exception as e:
+        print(f"[persist] keys save failed: {e}", flush=True)
+
+def _load_keys():
+    if not KEYS_FILE.exists():
+        return
+    try:
+        data = json.loads(KEYS_FILE.read_text())
+        with _keys_lock:
+            _keys.extend(data)
+        print(f"[persist] loaded {len(data)} keys", flush=True)
+    except Exception as e:
+        print(f"[persist] keys load failed: {e}", flush=True)
+
+def _persist_worker():
+    while True:
+        _persist_event.wait(timeout=PERSIST_INTERVAL)
+        _persist_event.clear()
+        if ROLE in ("pool", "vps"):
+            _save_free()
+            _save_paid()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SOURCE FETCHERS (pure fetch functions, no side effects)
+# ═══════════════════════════════════════════════════════════════════════════════
+def _gh_headers() -> dict:
+    h = {"Accept": "application/vnd.github.v3+json"}
+    if GITHUB_TOKEN:
+        h["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    return h
+
+def _fetch_github(owner: str, repo: str, path: str) -> list[str]:
+    key = f"{owner}/{repo}/{path}"
+    try:
+        r = requests.get(
             f"https://api.github.com/repos/{owner}/{repo}/commits",
             params={"path": path, "per_page": 1},
-            headers={"Accept": "application/vnd.github.v3+json"},
+            headers=_gh_headers(),
             timeout=8,
         )
+        if r.status_code in (403, 429):
+            print(f"[gh] RATE LIMITED {owner}/{repo} HTTP {r.status_code} "
+                  f"token={'yes' if GITHUB_TOKEN else 'NO'}", flush=True)
+            _inc("gh_ratelimited")
+            return []
+        if r.status_code != 200:
+            print(f"[gh] {owner}/{repo} commits HTTP {r.status_code}", flush=True)
+            _inc("gh_error")
+            return []
         commits = r.json()
-        if not commits or not isinstance(commits, list):
-            return [], label
+        if not isinstance(commits, list) or not commits:
+            return []
         sha = commits[0].get("sha", "")
-    except Exception:
-        return [], label
+        if not sha:
+            return []
+    except Exception as e:
+        print(f"[gh] {owner}/{repo} commit check failed: {e}", flush=True)
+        _inc("gh_error")
+        return []
     with _sha_lock:
         if sha == _repo_sha.get(key):
-            return [], label
-        _repo_sha[key] = sha
+            return []
     try:
-        r2      = requests.get(
-            f"https://raw.githubusercontent.com/{owner}/{repo}/main/{path}",
+        r2 = requests.get(
+            f"https://raw.githubusercontent.com/{owner}/{repo}/{sha}/{path}",
+            headers=_gh_headers(),
             timeout=8,
         )
+        if r2.status_code != 200:
+            print(f"[gh] {owner}/{repo} raw HTTP {r2.status_code} sha={sha[:8]}", flush=True)
+            _inc("gh_error")
+            return []
         proxies = _parse(r2.text)
-        if proxies:
-            print(f"[gh] {key} +{len(proxies)}", flush=True)
-            _inc("raw_fetched", len(proxies))
-            _log_activity("fetch_github", f"{label}", len(proxies))
-        return proxies, label
-    except Exception:
-        return [], label
+    except Exception as e:
+        print(f"[gh] {owner}/{repo} raw fetch failed: {e}", flush=True)
+        _inc("gh_error")
+        return []
+    with _sha_lock:
+        _repo_sha[key] = sha
+    return proxies
 
-def _github_loop(repos: list):
-    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
-        while True:
-            futs = {ex.submit(_fetch_github, o, r, p): (o, r, p) for o, r, p in repos}
-            for fut in as_completed(futs):
-                fresh, label = fut.result()
-                if fresh:
-                    with _raw_lock: _raw.update(fresh)
-                    _register(fresh, label)
-            time.sleep(GITHUB_POLL)
-
-def _fetch_http(url: str) -> tuple[list[str], str]:
-    label = url.split("//")[1].split("/")[0].replace("api.", "")
-    hdrs  = {}
+def _fetch_http_url(url: str) -> list[str]:
+    hdrs = {}
     with _etag_lock:
         if url in _http_etag: hdrs["If-None-Match"]     = _http_etag[url]
         if url in _http_lmod: hdrs["If-Modified-Since"] = _http_lmod[url]
     try:
         r = requests.get(url, headers=hdrs, timeout=8)
         if r.status_code == 304:
-            return [], label
+            return []
         with _etag_lock:
             if "ETag"          in r.headers: _http_etag[url] = r.headers["ETag"]
             if "Last-Modified" in r.headers: _http_lmod[url] = r.headers["Last-Modified"]
-        proxies = _parse(r.text)
-        if proxies:
-            print(f"[http] {url[:55]} +{len(proxies)}", flush=True)
-            _inc("raw_fetched", len(proxies))
-            _log_activity("fetch_http", label, len(proxies))
-        return proxies, label
+        return _parse(r.text)
     except Exception:
-        return [], label
+        return []
 
-def _http_loop(sources: list):
-    with ThreadPoolExecutor(max_workers=len(sources) + 1) as ex:
-        while True:
-            futs = {ex.submit(_fetch_http, url): url for url in sources}
-            for fut in as_completed(futs):
-                fresh, label = fut.result()
-                if fresh:
-                    with _raw_lock: _raw.update(fresh)
-                    _register(fresh, label)
-            time.sleep(HTTP_POLL)
-
-def _fetch_geonode(url: str) -> tuple[list[str], str]:
+def _fetch_geonode_page(url: str) -> list[str]:
     try:
-        r       = requests.get(url, timeout=8)
-        data    = r.json()
-        proxies = [f"{p['ip']}:{p['port']}" for p in data.get("data", [])]
-        if proxies:
-            print(f"[geonode] +{len(proxies)}", flush=True)
-            _inc("raw_fetched", len(proxies))
-            _log_activity("fetch_geonode", "geonode.com", len(proxies))
-        return proxies, "geonode"
+        r    = requests.get(url, timeout=8)
+        data = r.json()
+        return [f"{p['ip']}:{p['port']}" for p in data.get("data", [])]
     except Exception:
-        return [], "geonode"
+        return []
 
-def _geonode_loop():
-    while True:
-        for url in GEONODE_PAGES:
-            fresh, label = _fetch_geonode(url)
-            if fresh:
-                with _raw_lock: _raw.update(fresh)
-                _register(fresh, label)
-        time.sleep(HTTP_POLL)
-
-def _fetch_html(url: str) -> tuple[list[str], str]:
-    label = url.split("//")[1].split("/")[0]
+def _fetch_html_page(url: str) -> list[str]:
     try:
         r    = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
         soup = BeautifulSoup(r.text, "html.parser")
@@ -770,50 +858,158 @@ def _fetch_html(url: str) -> tuple[list[str], str]:
                     port = cols[1].get_text(strip=True)
                     if re.match(r"\d{1,3}(?:\.\d{1,3}){3}", ip) and port.isdigit():
                         out.append(f"{ip}:{port}")
-        if out:
-            print(f"[html] {label} +{len(out)}", flush=True)
-            _inc("raw_fetched", len(out))
-            _log_activity("fetch_html", label, len(out))
-        return out, label
+        return out
     except Exception:
-        return [], label
+        return []
 
-def _html_loop():
-    while True:
-        for url in HTML_SOURCES:
-            fresh, label = _fetch_html(url)
-            if fresh:
-                with _raw_lock: _raw.update(fresh)
-                _register(fresh, label)
-        time.sleep(SCRAPER_POLL)
-
-def _fetch_checkerproxy() -> tuple[list[str], str]:
+def _fetch_checkerproxy() -> list[str]:
     try:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         r     = requests.get(f"https://checkerproxy.net/api/archive/{today}", timeout=8)
         data  = r.json()
-        out   = [
+        return [
             p["addr"] for p in data
             if p.get("addr") and re.match(r"\d+\.\d+\.\d+\.\d+:\d+", p["addr"])
         ]
-        if out:
-            print(f"[checkerproxy] +{len(out)}", flush=True)
-            _inc("raw_fetched", len(out))
-            _log_activity("fetch_checkerproxy", "checkerproxy.net", len(out))
-        return out, "checkerproxy.net"
     except Exception:
-        return [], "checkerproxy.net"
-
-def _checkerproxy_loop():
-    while True:
-        fresh, label = _fetch_checkerproxy()
-        if fresh:
-            with _raw_lock: _raw.update(fresh)
-            _register(fresh, label)
-        time.sleep(3600)
+        return []
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# FETCHER HYBRID — Local T1 + T2 pipeline with load-aware spill
+# FETCHER PHASE MANAGER
+# ═══════════════════════════════════════════════════════════════════════════════
+def _run_fetch_cycle(repos: list, http_sources: list) -> int:
+    """
+    Run one full fetch cycle. Returns total proxies added to raw pool.
+    Stops early if FETCH_TARGET_PER_NODE reached.
+    Stops at FETCH_TIMEOUT_S regardless.
+    """
+    global _fetch_phase_start
+    _fetch_phase_start = time.time()
+
+    # clear raw pool for new cycle
+    with _raw_pool_lock:
+        global _raw_pool_count
+        _raw_pool.clear()
+        _raw_pool_set.clear()
+        _raw_pool_count = 0
+
+    _log_activity("fetch_cycle_start", f"target={FETCH_TARGET_PER_NODE}")
+    print(f"[{ROLE}] FETCH cycle started — target {FETCH_TARGET_PER_NODE}", flush=True)
+
+    def _check_done() -> bool:
+        elapsed = time.time() - _fetch_phase_start
+        size    = _raw_pool_size()
+        if size >= FETCH_TARGET_PER_NODE:
+            print(f"[{ROLE}] target hit — {size} proxies in {elapsed:.0f}s", flush=True)
+            return True
+        if elapsed >= FETCH_TIMEOUT_S:
+            print(f"[{ROLE}] timeout — {size} proxies in {elapsed:.0f}s", flush=True)
+            return True
+        return False
+
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
+        # Submit GitHub fetches
+        gh_futs = {ex.submit(_fetch_github, o, r, p): f"{o}/{r}" for o, r, p in repos}
+        # Submit HTTP fetches
+        ht_futs = {ex.submit(_fetch_http_url, url): url for url in http_sources}
+        # Submit supplementary
+        gn_futs = {ex.submit(_fetch_geonode_page, url): url for url in GEONODE_PAGES}
+        hl_futs = {ex.submit(_fetch_html_page,    url): url for url in HTML_SOURCES}
+        cp_fut  = ex.submit(_fetch_checkerproxy)
+
+        all_futs = list(gh_futs) + list(ht_futs) + list(gn_futs) + list(hl_futs) + [cp_fut]
+
+        for fut in as_completed(all_futs):
+            if _check_done():
+                # cancel remaining (best effort)
+                for f in all_futs:
+                    f.cancel()
+                break
+            try:
+                result = fut.result(timeout=0)
+                if result:
+                    added = _add_to_raw_pool(result)
+                    if added:
+                        _inc("raw_fetched", added)
+            except Exception:
+                pass
+
+    final = _raw_pool_size()
+    _log_activity("fetch_cycle_done", f"got {final} proxies")
+    print(f"[{ROLE}] FETCH cycle done — {final} unique proxies collected", flush=True)
+    return final
+
+def _phase_manager(repos: list, http_sources: list):
+    """
+    Main phase loop for fetcher nodes.
+    FETCH → distribute → CHECK → time-based switch back → repeat
+    """
+    global _fstate
+
+    while True:
+        # ── FETCH PHASE ──────────────────────────────────────────────────────
+        with _fstate_lock:
+            _fstate = FSTATE_FETCH
+        _log_activity("phase_switch", "→ FETCH")
+        print(f"[{ROLE}] phase → FETCH", flush=True)
+
+        count = _run_fetch_cycle(repos, http_sources)
+
+        # drain pool and distribute even if count is 0
+        batch = _drain_raw_pool()
+        if batch:
+            print(f"[{ROLE}] distributing {len(batch)} proxies to all T1 nodes", flush=True)
+            _distribute_batch_to_t1s(batch)
+        else:
+            print(f"[{ROLE}] fetch cycle returned 0 proxies — retrying", flush=True)
+            time.sleep(10)
+            continue
+
+        # ── CHECK PHASE ───────────────────────────────────────────────────────
+        with _fstate_lock:
+            _fstate = FSTATE_CHECK
+        _log_activity("phase_switch", "→ CHECK")
+        print(f"[{ROLE}] phase → CHECK — monitoring queue depth + rate", flush=True)
+
+        # Wait until it's time to go back and fetch
+        while True:
+            time.sleep(5)
+
+            # get current queue depth across all T1 nodes
+            remaining = _get_t1_queue_depth_total()
+
+            # get current processing rate
+            rate = _get_t1_pass_rate()   # passes/sec (approximate drain rate)
+
+            if rate > 0:
+                time_to_finish = remaining / rate
+            else:
+                # no rate data yet — use raw queue size as fallback
+                # if remaining is very low just switch back
+                time_to_finish = remaining / 1.0  # assume 1/sec minimum
+
+            print(
+                f"[{ROLE}] CHECK — remaining={remaining} rate={rate:.2f}/s "
+                f"eta={time_to_finish:.0f}s threshold={FETCH_TIMEOUT_S}s",
+                flush=True,
+            )
+
+            # switch back when estimated finish time <= fetch timeout
+            # so fetching completes just as checking finishes
+            if time_to_finish <= (FETCH_TIMEOUT_S + SWITCH_BACK_LEAD_S):
+                print(
+                    f"[{ROLE}] ETA {time_to_finish:.0f}s ≤ threshold — switching back to FETCH",
+                    flush=True,
+                )
+                break
+
+            # safety — if queue is already empty just go
+            if remaining == 0:
+                print(f"[{ROLE}] queue empty — switching back to FETCH immediately", flush=True)
+                break
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LOCAL T1 + T2 PIPELINE (fetcher in check mode / fetcher_a/b acting as T1)
 # ═══════════════════════════════════════════════════════════════════════════════
 async def _local_t1_check(session: aiohttp.ClientSession, addr: str) -> tuple[bool, float]:
     url, keyword = _next_t1()
@@ -828,7 +1024,7 @@ async def _local_t1_check(session: aiohttp.ClientSession, addr: str) -> tuple[bo
             if r.status == 200:
                 text    = await r.text()
                 elapsed = asyncio.get_event_loop().time() - t0
-                if keyword in text:
+                if keyword == "." or keyword in text:
                     return True, elapsed
     except Exception:
         pass
@@ -885,17 +1081,18 @@ async def _local_pipeline_main():
                 passed, elapsed = await _local_t1_check(session, addr)
             if passed:
                 _inc("t1_pass")
+                _record_t1_pass()
                 _log_activity("t1_pass", addr)
-                if _seen_dup("t2", addr):
-                    continue
-                lane = _t2_target(addr)
-                if lane == ROLE:
-                    try:
-                        _local_t2_queue.put_nowait((addr, elapsed))
-                    except asyncio.QueueFull:
-                        pass
-                else:
-                    _push_downstream(addr, lane, elapsed, "t2")
+                # immediate push to T2 — no batching
+                target = _t2_target(addr)
+                if not _seen_dup("t2", addr):
+                    if target == ROLE or ROLE in ("fetcher_a", "fetcher_b"):
+                        try:
+                            _local_t2_queue.put_nowait((addr, elapsed))
+                        except asyncio.QueueFull:
+                            _push_downstream(addr, target, elapsed, "t2")
+                    else:
+                        _push_downstream(addr, target, elapsed, "t2")
             else:
                 _inc("t1_fail")
 
@@ -914,68 +1111,22 @@ async def _local_pipeline_main():
             else:
                 _inc("t2_fail")
 
-    async def _distributor():
-        """Load-aware distributor — spills to dedicated T1s when local queue is hot."""
-        _sleep = 0.05
-        while True:
-            room = _budget_room(time.time())
-            if room <= 0:
-                _sleep = min(_sleep * 1.5, 2.0)
-                await asyncio.sleep(_sleep)
-                continue
-
-            with _src_raw_lock:
-                batch = []
-                for label in list(_src_raw.keys()):
-                    pool = _src_raw[label]
-                    if not pool:
-                        continue
-                    take = pool[:room - len(batch)]
-                    if take:
-                        del pool[:len(take)]
-                        batch.extend(take)
-                    if len(batch) >= room:
-                        break
-
-            if not batch:
-                _sleep = min(_sleep * 1.5, 1.0)
-                await asyncio.sleep(_sleep)
-                continue
-
-            _sleep = 0.05
-            for addr in batch:
-                _dispatch_times.append(time.time())
-                t = _t1_target(addr)
-
-                if t == ROLE and not _should_spill_local():
-                    # local has room — handle here
-                    if not _seen_dup("t1", addr):
-                        try:
-                            _local_t1_queue.put_nowait(addr)
-                        except asyncio.QueueFull:
-                            _push_downstream(addr, _overflow_t1(), 0.0, "t1")
-                else:
-                    # hash says remote OR local saturated — spill out
-                    target = t if t != ROLE else _overflow_t1()
-                    if not _seen_dup("t1", addr):
-                        _push_downstream(addr, target, 0.0, "t1")
-
-            await asyncio.sleep(0.05)
-
     async def _stats_printer():
         while True:
             await asyncio.sleep(15)
             q1 = _local_t1_queue.qsize()
             q2 = _local_t2_queue.qsize()
+            with _fstate_lock:
+                fs = _fstate
             with _counter_lock:
                 cnts = dict(_counters)
+            rate = _get_t1_pass_rate()
             print(
-                f"[{ROLE}] t1_q={q1} t2_q={q2} "
-                f"raw={cnts.get('raw_fetched',0)} "
+                f"[{ROLE}] state={fs} t1_q={q1} t2_q={q2} "
+                f"rate={rate:.2f}/s "
                 f"t1_pass={cnts.get('t1_pass',0)} "
-                f"t2_pass_flash={cnts.get('t2_pass_flash',0)} "
-                f"t2_pass_panther={cnts.get('t2_pass_panther',0)} "
-                f"t2_pass_lantern={cnts.get('t2_pass_lantern',0)}",
+                f"t2_flash={cnts.get('t2_pass_flash',0)} "
+                f"t2_panther={cnts.get('t2_pass_panther',0)}",
                 flush=True,
             )
 
@@ -986,8 +1137,7 @@ async def _local_pipeline_main():
         tasks = (
             [asyncio.create_task(_t1_worker(t1_sess)) for _ in range(LOCAL_T1_BATCH)]
             + [asyncio.create_task(_t2_worker(t2_sess)) for _ in range(LOCAL_T2_CONC)]
-            + [asyncio.create_task(_distributor()),
-               asyncio.create_task(_stats_printer())]
+            + [asyncio.create_task(_stats_printer())]
         )
         await asyncio.gather(*tasks)
 
@@ -997,30 +1147,52 @@ def _local_pipeline_thread():
     asyncio.set_event_loop(_local_loop)
     _local_loop.run_until_complete(_local_pipeline_main())
 
+def _push_to_local_t1_direct(addr: str):
+    """Push without seen_dup check — used during distribution (already deduped at source)."""
+    if _local_t1_queue and _local_loop and not _local_loop.is_closed():
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _local_t1_queue.put(addr), _local_loop
+            )
+        except RuntimeError:
+            pass
+
 def _push_to_local_t1(addr: str):
     if _seen_dup("t1", addr):
         return
-    if _local_t1_queue and _local_loop and not _local_loop.is_closed():
+    _push_to_local_t1_direct(addr)
+
+def _push_to_local_t2(addr: str, t1_elapsed: float = 5.0):
+    if _seen_dup("t2", addr):
+        return
+    if _local_t2_queue and _local_loop and not _local_loop.is_closed():
         try:
-            asyncio.run_coroutine_threadsafe(_local_t1_queue.put_nowait(addr), _local_loop)
-        except (asyncio.QueueFull, RuntimeError):
+            asyncio.run_coroutine_threadsafe(
+                _local_t2_queue.put((addr, t1_elapsed)), _local_loop
+            )
+        except RuntimeError:
             pass
 
 def _start_fetcher():
     repos     = GITHUB_REPOS_A if ROLE == "fetcher_a" else GITHUB_REPOS_B
     http_srcs = HTTP_SOURCES_A if ROLE == "fetcher_a" else HTTP_SOURCES_B
 
-    threading.Thread(target=_github_loop,       args=(repos,),     daemon=True, name="gh").start()
-    threading.Thread(target=_http_loop,         args=(http_srcs,), daemon=True, name="http").start()
-    threading.Thread(target=_geonode_loop,                          daemon=True, name="geonode").start()
-    threading.Thread(target=_html_loop,                             daemon=True, name="html").start()
-    threading.Thread(target=_checkerproxy_loop,                     daemon=True, name="checkerproxy").start()
-    threading.Thread(target=_local_pipeline_thread,                 daemon=True, name="local-pipeline").start()
-    threading.Thread(target=_outbuf_sender,                         daemon=True, name="outbuf").start()
-    print(f"[{ROLE}] hybrid fetcher started", flush=True)
+    # local pipeline handles T1+T2 when in check mode
+    threading.Thread(target=_local_pipeline_thread, daemon=True, name="local-pipeline").start()
+    threading.Thread(target=_outbuf_sender,         daemon=True, name="outbuf").start()
+
+    # phase manager drives the fetch/check cycle
+    threading.Thread(
+        target=_phase_manager,
+        args=(repos, http_srcs),
+        daemon=True,
+        name="phase-manager",
+    ).start()
+
+    print(f"[{ROLE}] fetcher started — sources A={ROLE=='fetcher_a'}", flush=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# T1 CHECKER ROLE
+# T1 CHECKER ROLE (dedicated nodes — always checking)
 # ═══════════════════════════════════════════════════════════════════════════════
 async def _t1_check(session: aiohttp.ClientSession, addr: str) -> tuple[bool, float]:
     url, keyword = _next_t1()
@@ -1035,7 +1207,7 @@ async def _t1_check(session: aiohttp.ClientSession, addr: str) -> tuple[bool, fl
             if r.status == 200:
                 text    = await r.text()
                 elapsed = asyncio.get_event_loop().time() - t0
-                if keyword in text:
+                if keyword == "." or keyword in text:
                     return True, elapsed
     except Exception:
         pass
@@ -1064,31 +1236,31 @@ async def _t1_checker_main():
                 passed, elapsed = await _t1_check(session, addr)
             if passed:
                 _inc("t1_pass")
+                _record_t1_pass()
                 _log_activity("t1_pass", addr)
+                # immediate push to T2
                 target = _t2_target(addr)
-                if target and not _seen_dup("t2", addr):
-                    if target == ROLE:
-                        _push_to_local_t2(addr, elapsed)
-                    else:
-                        _push_downstream(addr, target, elapsed, "t2")
+                if not _seen_dup("t2", addr):
+                    _push_downstream(addr, target, elapsed, "t2")
             else:
                 _inc("t1_fail")
 
+    async def _stats_printer():
+        while True:
+            await asyncio.sleep(15)
+            q = _t1_queue.qsize() if _t1_queue else 0
+            with _counter_lock: cnts = dict(_counters)
+            rate = _get_t1_pass_rate()
+            print(
+                f"[{ROLE}] t1_q={q} rate={rate:.2f}/s "
+                f"pass={cnts.get('t1_pass',0)} fail={cnts.get('t1_fail',0)}",
+                flush=True,
+            )
+
     async with aiohttp.ClientSession(connector=connector) as session:
         workers    = [asyncio.create_task(_worker(session)) for _ in range(T1_BATCH_SIZE)]
-        stats_task = asyncio.create_task(_t1_stats_printer())
+        stats_task = asyncio.create_task(_stats_printer())
         await asyncio.gather(*workers, stats_task)
-
-async def _t1_stats_printer():
-    while True:
-        await asyncio.sleep(15)
-        q = _t1_queue.qsize() if _t1_queue else 0
-        with _counter_lock: cnts = dict(_counters)
-        print(
-            f"[{ROLE}] t1_q={q} "
-            f"pass={cnts.get('t1_pass',0)} fail={cnts.get('t1_fail',0)}",
-            flush=True,
-        )
 
 def _t1_checker_thread():
     global _t1_loop
@@ -1101,8 +1273,8 @@ def _push_to_t1(addr: str):
         return
     if _t1_queue and _t1_loop and not _t1_loop.is_closed():
         try:
-            asyncio.run_coroutine_threadsafe(_t1_queue.put_nowait(addr), _t1_loop)
-        except (asyncio.QueueFull, RuntimeError):
+            asyncio.run_coroutine_threadsafe(_t1_queue.put(addr), _t1_loop)
+        except RuntimeError:
             pass
 
 def _start_t1_checker():
@@ -1111,7 +1283,7 @@ def _start_t1_checker():
     print(f"[{ROLE}] T1 checker started", flush=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# T2 CHECKER ROLE
+# T2 CHECKER ROLE (dedicated nodes — always checking, gets a break when empty)
 # ═══════════════════════════════════════════════════════════════════════════════
 async def _t2_check(session: aiohttp.ClientSession, addr: str) -> tuple[bool, float]:
     hdr = _meesho_headers()
@@ -1151,6 +1323,7 @@ async def _t2_checker_main():
 
     async def _worker(session):
         while True:
+            # blocks when empty — T2 gets a break naturally
             addr, t1_elapsed = await _t2_queue.get()
             async with t2_sem:
                 passed, t2_elapsed = await _t2_check(session, addr)
@@ -1162,29 +1335,29 @@ async def _t2_checker_main():
                     continue
                 _inc(f"t2_pass_{cat}")
                 _log_activity("t2_pass", f"{addr} → {cat} ({avg:.1f}s)")
+                # immediate push to pool
                 _push_downstream(addr, "pool", avg, "t2")
             else:
                 _inc("t2_fail")
 
+    async def _stats_printer():
+        while True:
+            await asyncio.sleep(15)
+            q = _t2_queue.qsize() if _t2_queue else 0
+            with _counter_lock: cnts = dict(_counters)
+            print(
+                f"[{ROLE}] t2_q={q} "
+                f"flash={cnts.get('t2_pass_flash',0)} "
+                f"panther={cnts.get('t2_pass_panther',0)} "
+                f"lantern={cnts.get('t2_pass_lantern',0)} "
+                f"fail={cnts.get('t2_fail',0)}",
+                flush=True,
+            )
+
     async with aiohttp.ClientSession(connector=connector) as session:
         workers    = [asyncio.create_task(_worker(session)) for _ in range(T2_WORKERS)]
-        stats_task = asyncio.create_task(_t2_stats_printer())
+        stats_task = asyncio.create_task(_stats_printer())
         await asyncio.gather(*workers, stats_task)
-
-async def _t2_stats_printer():
-    while True:
-        await asyncio.sleep(15)
-        q = _t2_queue.qsize() if _t2_queue else 0
-        with _counter_lock: cnts = dict(_counters)
-        print(
-            f"[{ROLE}] t2_q={q} "
-            f"flash={cnts.get('t2_pass_flash',0)} "
-            f"panther={cnts.get('t2_pass_panther',0)} "
-            f"lantern={cnts.get('t2_pass_lantern',0)} "
-            f"deadass={cnts.get('t2_pass_deadass',0)} "
-            f"fail={cnts.get('t2_fail',0)}",
-            flush=True,
-        )
 
 def _t2_checker_thread():
     global _t2_loop
@@ -1197,8 +1370,8 @@ def _push_to_t2(addr: str, t1_elapsed: float = 5.0):
         return
     if _t2_queue and _t2_loop and not _t2_loop.is_closed():
         try:
-            asyncio.run_coroutine_threadsafe(_t2_queue.put_nowait((addr, t1_elapsed)), _t2_loop)
-        except (asyncio.QueueFull, RuntimeError):
+            asyncio.run_coroutine_threadsafe(_t2_queue.put((addr, t1_elapsed)), _t2_loop)
+        except RuntimeError:
             pass
 
 def _start_t2_checker():
@@ -1290,25 +1463,8 @@ def _start_pool():
     print(f"[{ROLE}] pool (Yoru) started — {len(_live)} proxies loaded", flush=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# VPS ROLE — Oracle AMD 1 OCPU optimized
+# VPS ROLE
 # ═══════════════════════════════════════════════════════════════════════════════
-_api_executor     = ThreadPoolExecutor(max_workers=8,  thread_name_prefix="api")
-_backend_executor = ThreadPoolExecutor(max_workers=24, thread_name_prefix="backend")
-
-def _is_fod_hunt(url: str) -> bool:
-    try:
-        path = urlsplit(url).path
-    except Exception:
-        return False
-    return any(path.startswith(p) for p in FOD_HUNT_PATHS)
-
-def _sticky_key(headers) -> str:
-    if not headers:
-        return ""
-    low = {str(k).lower(): v for k, v in headers.items()}
-    k = low.get("app-session-id") or low.get("instance-id")
-    return f"fod:{k}" if k else ""
-
 def _get_proxy_from_pool(cat: str = "any", purpose: str = "backend") -> dict:
     pool_url = PEERS.get("pool", "")
     if not pool_url:
@@ -1434,7 +1590,6 @@ def _paid_worker():
         threading.Thread(target=_check, daemon=True, name=f"paid-{entry['label']}").start()
 
 def _pinger():
-    """Staggered pinger — T2s first (most critical), fetchers last."""
     ping_order = [
         "t2_a", "t2_b", "t2_c",
         "t1_a", "t1_b", "t1_c", "t1_d", "t1_e",
@@ -1476,26 +1631,37 @@ def _get_stats() -> dict:
     for _, r in items:
         if r.get("label"):
             labs[r["label"]] += 1
-    with _raw_lock:  rn = len(_raw)
+    with _raw_pool_lock: rn = _raw_pool_count
     with _paid_lock:
         p_total = len(_paid_proxies)
         p_alive = sum(1 for p in _paid_proxies.values() if p.get("alive"))
-    with _outbuf_lock: obuf = len(_outbuf)
+    with _outbuf_lock:  obuf = len(_outbuf)
     with _counter_lock: cnts = dict(_counters)
     with _activity_lock: acts = list(reversed(_activity_log))
+    with _fstate_lock:  fs = _fstate
+
+    t1_q = 0
+    if _local_t1_queue: t1_q = _local_t1_queue.qsize()
+    elif _t1_queue:     t1_q = _t1_queue.qsize()
+
+    t2_q = 0
+    if _local_t2_queue: t2_q = _local_t2_queue.qsize()
+    elif _t2_queue:     t2_q = _t2_queue.qsize()
 
     return {
-        "role":     ROLE,
-        "counters": cnts,
-        "activity": acts[:50],
+        "role":       ROLE,
+        "phase":      fs,
+        "t1_pass_rate": _get_t1_pass_rate(),
+        "counters":   cnts,
+        "activity":   acts[:50],
+        "queues":     {"t1": t1_q, "t2": t2_q, "outbuf": obuf, "raw_pool": rn},
         "free": {
-            "live": live, "raw": rn, "outbuf": obuf,
-            "fresh_30s": f30, "fresh_120s": f120,
+            "live": live, "fresh_30s": f30, "fresh_120s": f120,
             "flash": labs["flash"], "panther": labs["panther"],
             "lantern": labs["lantern"], "deadass": labs["deadass"],
         },
-        "paid":    {"total": p_total, "alive": p_alive},
-        "peers":   {role: url for role, url in PEERS.items()},
+        "paid":  {"total": p_total, "alive": p_alive},
+        "peers": {role: url for role, url in PEERS.items()},
     }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1541,7 +1707,7 @@ async def _startup():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "role": ROLE}
+    return {"ok": True, "role": ROLE, "phase": _fstate}
 
 @app.get("/stats")
 async def stats():
@@ -1553,6 +1719,18 @@ async def activity(limit: int = 50):
     with _activity_lock:
         acts = list(reversed(_activity_log))
     return acts[:limit]
+
+@app.get("/qsize")
+def qsize(x_secret: Optional[str] = Header(None)):
+    if x_secret != SHARED_SECRET:
+        raise HTTPException(403, "invalid secret")
+    t1_q = 0
+    if _local_t1_queue: t1_q = _local_t1_queue.qsize()
+    elif _t1_queue:     t1_q = _t1_queue.qsize()
+    t2_q = 0
+    if _local_t2_queue: t2_q = _local_t2_queue.qsize()
+    elif _t2_queue:     t2_q = _t2_queue.qsize()
+    return {"t1_qsize": t1_q, "t2_qsize": t2_q, "role": ROLE, "phase": _fstate}
 
 async def _sse_generator():
     loop = asyncio.get_event_loop()
@@ -1736,16 +1914,14 @@ async def proxy_request(req: ProxyRequest):
             last_err = str(e)
             await loop.run_in_executor(_backend_executor, _report_dead_to_pool, proxy_addr)
             if skey:
-                with _sticky_lock:
-                    _sticky.pop(skey, None)
+                with _sticky_lock: _sticky.pop(skey, None)
             print(f"[vps] attempt {attempt+1}/{req.retries} via {proxy_addr} proxy-dead", flush=True)
 
         except aiohttp.ClientConnectionError as e:
             last_err = str(e)
             await loop.run_in_executor(_backend_executor, _report_dead_to_pool, proxy_addr)
             if skey:
-                with _sticky_lock:
-                    _sticky.pop(skey, None)
+                with _sticky_lock: _sticky.pop(skey, None)
             print(f"[vps] attempt {attempt+1}/{req.retries} via {proxy_addr} connect-fail", flush=True)
 
         except Exception as e:
@@ -1810,7 +1986,7 @@ async def remove_key(req: RemoveKeyRequest):
         entry = next((k for k in _keys if k["key"] == req.key), None)
         if not entry:
             raise HTTPException(404, "key not found")
-        label   = entry["label"]
+        label    = entry["label"]
         _keys[:] = [k for k in _keys if k["key"] != req.key]
     with _paid_lock:
         dead = [a for a, p in _paid_proxies.items() if p.get("key_label") == label]
@@ -1825,7 +2001,10 @@ async def list_keys():
     if ROLE != "vps":
         raise HTTPException(400, "keys only on vps role")
     with _keys_lock:
-        return [{"label": k["label"], "provider": k["provider"], "hint": f"***{k['key'][-6:]}"} for k in _keys]
+        return [
+            {"label": k["label"], "provider": k["provider"], "hint": f"***{k['key'][-6:]}"}
+            for k in _keys
+        ]
 
 @app.get("/")
 def root():
@@ -1834,4 +2013,4 @@ def root():
         if dash.exists():
             return HTMLResponse(dash.read_text())
         return HTMLResponse("<h2>ProxyStack — Jett Dashboard</h2><p>dashboard.html not found in /static/</p>")
-    return {"role": ROLE, "status": "running"}
+    return {"role": ROLE, "status": "running", "phase": _fstate}
