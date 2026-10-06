@@ -123,7 +123,7 @@ SRC_RAW_CAP        = 15_000
 FETCH_WORKERS      = 20
 GITHUB_POLL        = 120
 HTTP_POLL          = 60
-SCRAPER_POLL       = 600
+SCRAPER_POLL       = 120
 
 # Fetcher-local T1 (hybrid mode)
 LOCAL_T1_CONC      = 200   # concurrent httpbin checks inside fetcher
