@@ -157,11 +157,11 @@ CAT_LANTERN = 7      # 5–7s   → lantern
 CAT_DEAD    = 10     # 7–10s  → deadass ; >=10s rejected
 
 # ─── Pool refresh cadence ─────────────────────────────────────────────────────
-FRESH_HOT_S     = 30     # backend /pick freshness TTL
-FRESH_COLD_S    = 120    # fod-hunt /pick freshness TTL
-RECHECK_HOT_S   = 20     # recheck recently-served proxies
-RECHECK_WARM_S  = 100    # recheck the rest
-STALE_EVICT_S   = 150    # no successful check this long → evict
+FRESH_HOT_S     = 30
+FRESH_COLD_S    = 120
+RECHECK_HOT_S   = 20
+RECHECK_WARM_S  = 100
+STALE_EVICT_S   = 150
 SNAP_INTERVAL_S = 2
 REFRESH_TICK_S  = 2
 REFRESH_BATCH   = 400
@@ -173,6 +173,14 @@ FOD_HUNT_PATHS = (
     "/api/1.0/anonymous/fod-personalisation",
 )
 STICKY_TTL_S = 90
+
+# ─── Streaming pipeline: hash lanes, fetch cap, dedup ────────────────────────
+T1_LANES = ["fetcher_a", "fetcher_b", "t1_a", "t1_b", "t1_c", "t1_d", "t1_e"]  # 7 owners
+T2_LANES = ["fetcher_a", "fetcher_b", "t2_a", "t2_b", "t2_c"]                 # 5 owners
+FETCH_MAX_FLEET    = 5_000
+FETCH_WINDOW_S     = 300
+FETCH_MAX_PER_NODE = FETCH_MAX_FLEET // 2
+SEEN_TTL_S         = 180
 
 # Pinger (VPS role)
 PING_INTERVAL      = 600
