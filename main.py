@@ -493,6 +493,44 @@ def _weighted_pick(downstream: list[tuple[str, float]]) -> Optional[str]:
     roles   = [r for r, _ in downstream]
     weights = [w for _, w in downstream]
     return random.choices(roles, weights=weights, k=1)[0]
+
+# ─── Streaming partition + dedup ─────────────────────────────────────────────
+def _hash(addr: str) -> int:
+    return int.from_bytes(hashlib.blake2b(addr.encode("utf-8", "ignore"), digest_size=8).digest(), "big")
+
+def _t1_target(addr: str) -> str:
+    return T1_LANES[_hash(addr) % len(T1_LANES)]
+
+def _t2_target(addr: str) -> str:
+    return T2_LANES[_hash(addr) % len(T2_LANES)]
+
+_seen_lock = threading.Lock()
+_seen: dict[tuple, float] = {}
+
+def _seen_dup(stage: str, addr: str) -> bool:
+    now = time.time()
+    key = (stage, addr)
+    with _seen_lock:
+        t = _seen.get(key)
+        if t is not None and now - t < SEEN_TTL_S:
+            return True
+        _seen[key] = now
+        if len(_seen) > 400_000:
+            for k, v in list(_seen.items()):
+                if now - v >= SEEN_TTL_S:
+                    _seen.pop(k, None)
+        return False
+
+_dispatch_times: deque = deque()
+
+def _budget_room(now: float) -> int:
+    while _dispatch_times and now - _dispatch_times[0] > FETCH_WINDOW_S:
+        _dispatch_times.popleft()
+    return FETCH_MAX_PER_NODE - len(_dispatch_times)
+
+def _push_to_local_t2(addr: str, t1_elapsed: float):
+    if _local_t2_queue and _local_loop and not _local_loop.is_closed():
+        asyncio.run_coroutine_threadsafe(_local_t2_queue.put((addr, t1_elapsed)), _local_loop)
 # ═══════════════════════════════════════════════════════════════════════════════
 # PERSIST
 # ═══════════════════════════════════════════════════════════════════════════════
