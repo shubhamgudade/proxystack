@@ -1,285 +1,364 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>ProxyStack · Fleet</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400..700&family=Outfit:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
 :root{
-  --bg:#F6F7F9; --surface:#fff; --text:#14161A; --muted:#70757E; --line:#E8EAEE;
-  --accent:#5B5BD6; --accent-soft:#EDEDFB;
-  --ok:#1E9E6A; --idle:#8A8F98; --warn:#C77700; --bad:#D14343; --r:16px;
+  --bg:#F6F7F9; --surface:#FFFFFF; --text:#14161A; --muted:#70757E; --line:#E8EAEE;
+  --accent:#5B5BD6; --soft:#F1F2F6;
+  --ok:#1E9E6A; --idle:#8A8F98; --warn:#C77700; --bad:#D14343;
+  --r:16px; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
 }
 *{box-sizing:border-box}
 html,body{margin:0}
 body{
-  font-family:'Google Sans','Outfit',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-  background:var(--bg); color:var(--text); -webkit-font-smoothing:antialiased;
-  padding:32px 28px 48px; max-width:1260px; margin:0 auto; font-size:14px; line-height:1.45;
+  font-family:'Google Sans','Outfit',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+  background:var(--bg); color:var(--text); font-size:14px; line-height:1.45;
+  -webkit-font-smoothing:antialiased; padding:34px 30px 56px; max-width:1320px; margin:0 auto;
 }
-.muted{color:var(--muted)}
 h1,h2{margin:0;font-weight:500}
 h1{font-size:20px;letter-spacing:-.2px}
 h2{font-size:14px;letter-spacing:.1px}
-/* top */
-.top{display:flex;align-items:center;justify-content:space-between;margin-bottom:26px}
-.brand{display:flex;align-items:center;gap:12px}
-.logo{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,#5B5BD6,#8B7BF0);box-shadow:0 4px 14px rgba(91,91,214,.35)}
+.muted{color:var(--muted)}
+
+/* header */
+.top{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-bottom:26px;flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:13px}
+.logo{width:36px;height:36px;border-radius:11px;background:linear-gradient(135deg,#5B5BD6,#8B7BF0);
+      box-shadow:0 4px 16px rgba(91,91,214,.32);flex:0 0 auto}
 .sub{font-size:12.5px;color:var(--muted);margin:1px 0 0}
-.top-right{display:flex;align-items:center;gap:16px;font-size:12.5px}
+.top-right{display:flex;align-items:center;gap:18px;font-size:12.5px}
 .live{display:inline-flex;align-items:center;gap:7px;color:var(--muted)}
-.live i{width:8px;height:8px;border-radius:50%;background:var(--idle);transition:.2s}
-.live.on i{background:var(--ok);box-shadow:0 0 0 4px rgba(30,158,106,.14)}
+.live i{width:8px;height:8px;border-radius:50%;background:var(--idle);transition:background .2s}
+.live.on  i{background:var(--ok);box-shadow:0 0 0 4px rgba(30,158,106,.14)}
 .live.off i{background:var(--bad)}
 .clock{color:var(--muted);font-variant-numeric:tabular-nums}
+
 /* cards */
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:18px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));gap:14px;margin-bottom:18px}
 .card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:16px 18px}
-.card .k{font-size:12px;color:var(--muted);margin-bottom:8px}
-.card .v{font-size:26px;font-weight:500;letter-spacing:-.5px;font-variant-numeric:tabular-nums}
-.card .v small{font-size:13px;color:var(--muted);font-weight:400;margin-left:3px}
-/* grid */
-.grid{display:grid;grid-template-columns:1.9fr 1fr;gap:16px;align-items:start}
-@media(max-width:900px){.grid{grid-template-columns:1fr}}
-.panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:16px 18px;margin-bottom:16px}
-.panel-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.card .k{font-size:12px;color:var(--muted);margin-bottom:9px;white-space:nowrap}
+.card .v{font-size:27px;font-weight:500;letter-spacing:-.6px;font-variant-numeric:tabular-nums;line-height:1.1}
+.card .v small{font-size:13px;color:var(--muted);font-weight:400;margin-left:2px;letter-spacing:0}
+
+/* layout */
+.grid{display:grid;grid-template-columns:minmax(0,1.95fr) minmax(0,1fr);gap:16px;align-items:start}
+@media(max-width:960px){.grid{grid-template-columns:1fr}}
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);
+       padding:16px 18px;margin-bottom:16px;overflow:hidden}
+.panel-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:12px}
+.panel-head .meta{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+
 /* table */
-table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
-th{text-align:left;font-size:11.5px;color:var(--muted);font-weight:500;padding:0 10px 9px;border-bottom:1px solid var(--line)}
-td{padding:11px 10px;border-bottom:1px solid var(--line);font-size:13px}
-tr:last-child td{border-bottom:none}
-tr:hover td{background:#FBFBFD}
-.role{font-weight:500}
-.role small{display:block;color:var(--muted);font-weight:400;font-size:11.5px}
-/* pills */
-.pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:3px 10px;border-radius:999px;background:#F1F2F5;color:var(--muted)}
-.pill i{width:7px;height:7px;border-radius:50%;background:currentColor}
-.pill.running{background:rgba(30,158,106,.1);color:var(--ok)}
-.pill.idle{background:#F1F2F5;color:var(--idle)}
-.pill.offline{background:rgba(209,67,67,.1);color:var(--bad)}
-/* bars */
-.bar{margin:11px 0}
-.bar .row{display:flex;justify-content:space-between;font-size:12.5px;margin-bottom:6px}
-.bar .track{height:7px;background:#F1F2F5;border-radius:999px;overflow:hidden}
-.bar .fill{height:100%;border-radius:999px;transition:width .4s ease}
-.f-flash{background:#5B5BD6}.f-panther{background:#7C8CF0}.f-lantern{background:#9FB2F5}.f-deadass{background:#C6CEF2}
-.chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px}
-.chip{font-size:12px;background:var(--accent-soft);color:var(--accent);padding:3px 10px;border-radius:999px}
-.chip.g{background:rgba(30,158,106,.1);color:var(--ok)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;font-weight:500;color:var(--muted);font-size:11px;text-transform:uppercase;
+   letter-spacing:.5px;padding:0 12px 9px 0;white-space:nowrap}
+td{padding:9px 12px 9px 0;border-top:1px solid var(--line);font-variant-numeric:tabular-nums;white-space:nowrap}
+th:last-child,td:last-child{padding-right:0;text-align:right}
+.role{font-family:var(--mono);font-size:12.5px}
+.st{display:inline-flex;align-items:center;gap:7px}
+.dot{width:8px;height:8px;border-radius:50%;flex:0 0 auto;background:var(--idle)}
+tr.running  .dot{background:var(--ok)}
+tr.idle     .dot{background:var(--idle)}
+tr.offline  .dot{background:var(--bad)}
+tr.running td:first-child{font-weight:500}
+.zero{color:#C3C7CE}
+
 /* feed */
-.feed{list-style:none;margin:0;padding:0;max-height:340px;overflow:auto}
-.feed li{display:flex;gap:10px;padding:8px 0;border-bottom:1px solid var(--line);font-size:12.5px}
-.feed li:last-child{border-bottom:none}
-.feed .t{color:var(--muted);font-variant-numeric:tabular-nums;flex:0 0 60px}
-.feed .m{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.tag{display:inline-block;font-size:11px;color:var(--accent);background:var(--accent-soft);padding:2px 8px;border-radius:6px;flex:0 0 auto}
+.feed{max-height:460px;overflow:auto;margin:-4px 0}
+.row{display:grid;grid-template-columns:64px 92px minmax(0,1fr);gap:10px;
+     padding:8px 0;border-top:1px solid var(--line);font-size:12.5px}
+.row:first-child{border-top:0}
+.row .t{color:var(--muted);font-variant-numeric:tabular-nums}
+.row .e{color:var(--accent);font-weight:500;overflow:hidden;text-overflow:ellipsis}
+.row .d{color:var(--muted);overflow:hidden;text-overflow:ellipsis}
+.empty{color:var(--muted);font-size:13px;padding:14px 0}
+.pill{display:inline-block;padding:2px 9px;border-radius:999px;background:var(--soft);color:var(--muted);font-size:11.5px}
+.pill.flash{background:#E9F7F1;color:#14754E}
+.pill.panther{background:#EFEFFC;color:#4B4BC4}
+.pill.lantern{background:#FDF3E3;color:#9A5E00}
+.pill.deadass{background:#F4F5F7;color:#70757E}
+.bar{height:5px;border-radius:3px;background:var(--soft);overflow:hidden;margin-top:6px}
+.bar i{display:block;height:100%;background:var(--accent);width:0;transition:width .3s}
 </style>
 </head>
 <body>
-  <header class="top">
-    <div class="brand">
-      <div class="logo"></div>
-      <div><h1>ProxyStack</h1><p class="sub">Distributed proxy fleet</p></div>
-    </div>
-    <div class="top-right">
-      <span class="live" id="conn"><i></i><span>connecting…</span></span>
-      <span class="clock" id="clock">--:--:--</span>
-    </div>
-  </header>
 
-  <section class="cards" id="cards"></section>
+<div class="top">
+  <div class="brand">
+    <div class="logo"></div>
+    <div>
+      <h1>ProxyStack</h1>
+      <p class="sub">Distributed proxy fleet · live</p>
+    </div>
+  </div>
+  <div class="top-right">
+    <span class="live" id="conn"><i></i><span>connecting…</span></span>
+    <span class="clock" id="clock">--:--:--</span>
+  </div>
+</div>
 
-  <main class="grid">
-    <section class="panel">
-      <div class="panel-head"><h2>Agents</h2><span class="muted" id="agentsMeta"></span></div>
+<div class="cards" id="cards"></div>
+
+<div class="grid">
+  <div>
+    <div class="panel">
+      <div class="panel-head">
+        <h2>Agents</h2>
+        <span class="meta" id="agentsMeta">waiting…</span>
+      </div>
+      <div style="overflow-x:auto">
+        <table>
+          <thead>
+            <tr>
+              <th>Agent</th><th>Status</th><th>Live</th><th>Fresh ≤30s</th>
+              <th>Flash</th><th>Panther</th><th>Pass/s</th><th>Evict</th>
+            </tr>
+          </thead>
+          <tbody id="agents"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <h2>Pool by label</h2>
+        <span class="meta" id="poolMeta"></span>
+      </div>
       <table>
-        <thead><tr>
-          <th>Role</th><th>Status</th><th>Key metric</th><th>Rate</th><th>Details</th>
-        </tr></thead>
-        <tbody id="agents"></tbody>
+        <thead>
+          <tr><th>Label</th><th>Count</th><th>Meaning</th><th style="width:34%">Share</th></tr>
+        </thead>
+        <tbody id="labels"></tbody>
       </table>
-    </section>
+    </div>
+  </div>
 
-    <aside>
-      <section class="panel">
-        <div class="panel-head"><h2>Pool</h2><span class="muted" id="poolMeta"></span></div>
-        <div id="pool"></div>
-      </section>
-      <section class="panel">
-        <div class="panel-head"><h2>Activity</h2></div>
-        <ul class="feed" id="feed"></ul>
-      </section>
-    </aside>
-  </main>
+  <div>
+    <div class="panel">
+      <div class="panel-head">
+        <h2>Activity</h2>
+        <span class="meta" id="feedMeta"></span>
+      </div>
+      <div class="feed" id="feed"><div class="empty">waiting for nodes…</div></div>
+    </div>
+  </div>
+</div>
 
 <script>
+"use strict";
+
+const $  = (s) => document.querySelector(s);
 const ROLES = [
-  ["fetcher_a","Brimstone","fetcher"],["fetcher_b","Viper","fetcher"],
-  ["t1_a","Sage","t1"],["t1_b","Sova","t1"],["t1_c","Astra","t1"],
-  ["t1_d","Harbor","t1"],["t1_e","Reyna","t1"],
-  ["t2_a","Raze","t2"],["t2_b","Killjoy","t2"],["t2_c","Cypher","t2"],
-  ["pool","Yoru","pool"],["dashboard","Jett","dash"],["vps","Oracle","vps"],
+  "fetcher_a","fetcher_b",
+  "t1_a","t1_b","t1_c","t1_d","t1_e",
+  "t2_a","t2_b","t2_c",
+  "pool","dashboard","vps"
 ];
-const $ = s => document.querySelector(s);
-const fmt = n => n==null ? "—" : (Math.abs(n)>=1000 ? (n/1000).toFixed(1)+"k" : (Math.round(n*10)/10).toString());
-const ago = s => s==null ? "—" : (s<60 ? Math.round(s)+"s" : s<3600 ? Math.floor(s/60)+"m" : Math.floor(s/3600)+"h");
-const sumCounters = (c, keys) => keys.reduce((a,k)=>a+(c&&c[k]||0),0);
+const LABEL_INFO = [
+  ["flash",   "< 3s"],
+  ["panther", "3–5s"],
+  ["lantern", "5–7s"],
+  ["deadass", "7–10s"]
+];
 
-const T1_KEYS = ["t1_pass"];                       // per-t1 throughput
-const T2_KEYS = ["t2_pass_flash","t2_pass_panther","t2_pass_lantern","t2_pass_deadass"];
-const FETCH_KEYS = ["raw_fetched"];
+let prev       = {};   // role -> {sig, t, pass, counters}
+let lastChange = {};   // role -> ts of last counter change
+let connected  = false;
 
-let prev = {};        // role -> {t, val(key metric), counters}
-let lastActive = {};  // role -> ts of last counter change
-
-function metricFor(type, node){
-  const c = node && node.counters || {};
-  if(type==="pool")  return sumCounters(c, ["picks_served"]);
-  if(type==="fetcher") return sumCounters(c, FETCH_KEYS);
-  if(type==="t1")    return sumCounters(c, T1_KEYS);
-  if(type==="t2")    return sumCounters(c, T2_KEYS);
-  if(type==="vps")   return sumCounters(c, ["picks_served"]);
-  return sumCounters(c, ["promoted"]);
+function num(v){
+  return (v === null || v === undefined || Number.isNaN(v)) ? null : v;
+}
+function show(v){
+  const n = num(v);
+  return n === null ? "—" : n;
+}
+function cell(v){
+  const n = num(v);
+  if(n === null) return '<span class="zero">—</span>';
+  return n === 0 ? '<span class="zero">0</span>' : String(n);
+}
+function passTotal(c){
+  return (c.t1_pass              || 0)
+       + (c.t2_pass_flash        || 0)
+       + (c.t2_pass_panther      || 0)
+       + (c.t2_pass_lantern      || 0)
+       + (c.t2_pass_deadass      || 0);
+}
+function hhmmss(ts){
+  return new Date(ts * 1000).toTimeString().slice(0, 8);
+}
+function statusOf(role, n, now){
+  if(!n || n.error) return "offline";
+  const ch = lastChange[role];
+  if(ch === undefined) return "idle";
+  return (now - ch) <= 15 ? "running" : "idle";
 }
 
-function statusFor(role, node, now){
-  if(!node || node.error) return "offline";
-  const age = now - (lastActive[role] || 0);
-  return age > 15 ? "idle" : "running";
-}
+function render(data){
+  const nodes = data.nodes || {};
+  const now   = Date.now() / 1000;
 
-function renderCards(summary){
-  const items = [
-    ["Live proxies", fmt(summary.live), ""],
-    ["Fresh ≤30s",   fmt(summary.fresh30), "backend"],
-    ["Fresh ≤120s",  fmt(summary.fresh120), "fod-hunt"],
-    ["Picks /s",     fmt(summary.picks_s), ""],
-    ["Promotes /s",  fmt(summary.promoted_s), ""],
-    ["Nodes online", `${summary.online}<small>/${summary.total}</small>`, ""],
+  const agg = { live:0, f30:0, f120:0, online:0, total:0,
+                flash:0, panther:0, lantern:0, deadass:0, passRate:0, evicted:0 };
+  const activities = [];
+  const rows = [];
+
+  for(const role of ROLES){
+    if(!(role in nodes)) continue;
+    agg.total++;
+
+    const n   = nodes[role];
+    const bad = !n || n.error;
+    const c   = (n && n.counters) || {};
+    const f   = (n && n.free)     || {};
+
+    let rate = 0;
+    if(!bad){
+      agg.online++;
+      const sig = JSON.stringify(c);
+      const p   = prev[role];
+
+      if(!p || p.sig !== sig) lastChange[role] = now;
+
+      if(p && now > p.t){
+        const d  = passTotal(c) - p.pass;
+        const dt = now - p.t;
+        if(d > 0 && dt > 0) rate = d / dt;
+      }
+      prev[role] = { sig, t: now, pass: passTotal(c) };
+      agg.passRate += rate;
+      agg.evicted  += (c.evicted || 0);
+
+      if(role === "pool"){
+        agg.live    = f.live     || 0;
+        agg.f30     = f.fresh_30s  || 0;
+        agg.f120    = f.fresh_120s || 0;
+        agg.flash   = f.flash    || 0;
+        agg.panther = f.panther  || 0;
+        agg.lantern = f.lantern  || 0;
+        agg.deadass = f.deadass  || 0;
+      }
+      if(Array.isArray(n.activity)){
+        for(const a of n.activity){
+          activities.push({ ...a, role: a.role || role });
+        }
+      }
+    }
+
+    const st = statusOf(role, n, now);
+    rows.push(
+      '<tr class="' + st + '">' +
+        '<td class="role">' + role + '</td>' +
+        '<td><span class="st"><span class="dot"></span>' + st + '</span></td>' +
+        '<td>' + cell(f.live) + '</td>' +
+        '<td>' + cell(f.fresh_30s) + '</td>' +
+        '<td>' + cell(f.flash) + '</td>' +
+        '<td>' + cell(f.panther) + '</td>' +
+        '<td>' + (rate > 0 ? rate.toFixed(1) : '<span class="zero">0</span>') + '</td>' +
+        '<td>' + cell(c.evicted) + '</td>' +
+      '</tr>'
+    );
+  }
+
+  // connection + clock
+  connected = agg.online > 0;
+  $("#conn").className = "live " + (connected ? "on" : "off");
+  $("#conn").lastElementChild.textContent = connected
+    ? "connected · " + agg.online + "/" + agg.total
+    : "disconnected";
+  $("#clock").textContent = new Date().toTimeString().slice(0, 8);
+
+  // cards
+  const cards = [
+    ["Live proxies",  agg.live],
+    ["Fresh ≤30s",    agg.f30],
+    ["Fresh ≤120s",   agg.f120],
+    ["Online nodes",  agg.online + "/" + agg.total],
+    ["Flash",         agg.flash],
+    ["Panther",       agg.panther]
   ];
-  $("#cards").innerHTML = items.map(([k,v,sub])=>
-    `<div class="card"><div class="k">${k}${sub?` · ${sub}`:""}</div><div class="v">${v}</div></div>`).join("");
-}
-
-function renderAgents(nodes, now, rates){
-  const rows = ROLES.map(([role,name,type])=>{
-    const n = nodes[role];
-    const st = statusFor(role, n, now);
-    const c = n && n.counters || {};
-    const f = n && n.free || {};
-    let key = "—", det = [];
-    if(type==="pool"){ key = fmt(f.live)+" live"; det.push(`fresh30 ${fmt(f.fresh_30s)}`, `fresh120 ${fmt(f.fresh_120s)}`, `evicted ${fmt(c.evicted)}`); }
-    else if(type==="fetcher"){ key = fmt(c.raw_fetched)+" raw"; det.push(`t1_pass ${fmt(c.t1_pass)}`, `t2_fail ${fmt(c.t2_fail)}`); }
-    else if(type==="t1"){ key = fmt(c.t1_pass)+" pass"; det.push(`fail ${fmt(c.t1_fail)}`, `tcp_fail ${fmt(c.t1_tcp_fail)}`); }
-    else if(type==="t2"){ key = fmt(sumCounters(c,T2_KEYS))+" pass"; det.push(`rej ${fmt(c.t2_rejected)}`, `fail ${fmt(c.t2_fail)}`); }
-    else if(type==="vps"){ key = fmt((n&&n.paid&&n.paid.alive)||0)+" paid"; det.push(`total ${fmt((n&&n.paid&&n.paid.total)||0)}`); }
-    else if(type==="dash"){ key = "—"; det.push("aggregator"); }
-    const r = rates[role];
-    const rate = r==null ? "—" : fmt(r);
-    return `<tr>
-      <td class="role">${name}<small>${role}</small></td>
-      <td><span class="pill ${st}"><i></i>${st}</span></td>
-      <td>${key}</td>
-      <td>${rate}${r==null?"":'<span class="muted">/s</span>'}</td>
-      <td class="muted">${det.join(" · ")||"—"}</td>
-    </tr>`;
+  $("#cards").innerHTML = cards.map(function(c){
+    return '<div class="card"><div class="k">' + c[0] + '</div>' +
+           '<div class="v">' + show(c[1]) + '</div></div>';
   }).join("");
-  $("#agents").innerHTML = rows;
-  const up = ROLES.filter(([role])=>statusFor(role,nodes[role],now)!=="offline").length;
-  $("#agentsMeta").textContent = `${up}/${ROLES.length} reporting`;
-}
 
-function renderPool(nodes){
-  const f = (nodes.pool && nodes.pool.free) || {};
-  const total = Math.max(1,(f.flash||0)+(f.panther||0)+(f.lantern||0)+(f.deadass||0));
-  const chips = `<div class="chips">
-      <span class="chip g">fresh ≤30s ${fmt(f.fresh_30s||0)}</span>
-      <span class="chip">fresh ≤120s ${fmt(f.fresh_120s||0)}</span>
-    </div>`;
-  const bars = [["flash","flash · <3s",f.flash],["panther","panther · 3–5s",f.panther],
-                ["lantern","lantern · 5–7s",f.lantern],["deadass","deadass · 7–10s",f.deadass]];
-  const html = bars.map(([c,label,v])=>`<div class="bar">
-      <div class="row"><span>${label}</span><span class="muted">${fmt(v||0)}</span></div>
-      <div class="track"><div class="fill f-${c}" style="width:${Math.round(100*(v||0)/total)}%"></div></div>
-    </div>`).join("");
-  $("#pool").innerHTML = chips + html;
-  $("#poolMeta").textContent = `${fmt(f.live||0)} live`;
-}
+  // agents table
+  $("#agents").innerHTML = rows.length
+    ? rows.join("")
+    : '<tr><td colspan="8" class="empty">no nodes reachable yet…</td></tr>';
 
-function renderFeed(nodes){
-  let items = [];
-  for(const role in nodes){
-    const a = nodes[role] && nodes[role].activity;
-    if(Array.isArray(a)) for(const e of a) items.push(e);
-  }
-  items.sort((x,y)=>(y.ts||0)-(x.ts||0));
-  items = items.slice(0,40);
-  $("#feed").innerHTML = items.length ? items.map(e=>{
-    const t = new Date((e.ts||0)*1000).toTimeString().slice(0,8);
-    return `<li><span class="t">${t}</span><span class="tag">${e.role||""}</span>
-      <span class="m">${e.event||""}${e.detail?": "+e.detail:""}</span></li>`;
-  }).join("") : `<li class="muted">no recent activity</li>`;
-}
+  $("#agentsMeta").textContent =
+    agg.passRate > 0 ? agg.passRate.toFixed(1) + " pass/s fleet-wide" : "idle";
 
-function handle(msg){
-  const now = Date.now()/1000;
-  const nodes = msg.nodes || {};
-  const rates = {};
-
-  ROLES.forEach(([role,name,type])=>{
-    const m = metricFor(type, nodes[role]);
-    const p = prev[role];
-    if(p && now>p.t){
-      const dv = m - p.val;
-      if(dv>0){ lastActive[role]=now; rates[role]=dv/(now-p.t); }
-      else if(!lastActive[role]) lastActive[role]=now;
-    } else { lastActive[role]=now; }
-    prev[role] = {t:now, val:m};
-  });
-
-  const f = (nodes.pool && nodes.pool.free) || {};
-  const pc = (nodes.pool && nodes.pool.counters) || {};
-  const pv = prev.pool, pv2 = pv && pv._prev;
-  const picks_delta = (nodes.pool && nodes.pool.counters && nodes.pool.__prevPicks!=null)
-      ? pc.picks_served - nodes.pool.__prevPicks : null;
-
-  // compute picks/s + promoted/s from last snapshot
-  let picks_s = 0, promoted_s = 0;
-  if(window._prev && window._prev.t < now){
-    const dt = now - window._prev.t;
-    picks_s    = Math.max(0,((pc.picks_served||0)-(window._prev.picks||0))/dt);
-    promoted_s = Math.max(0,((pc.promoted||0)-(window._prev.promoted||0))/dt);
-  }
-  window._prev = {t:now, picks: pc.picks_served||0, promoted: pc.promoted||0};
-
-  const summary = {
-    live: f.live||0, fresh30: f.fresh_30s||0, fresh120: f.fresh_120s||0,
-    picks_s, promoted_s,
-    online: ROLES.filter(([role])=>statusFor(role,nodes[role],now)!=="offline").length,
-    total: ROLES.length,
+  // labels
+  const labelCount = {
+    flash: agg.flash, panther: agg.panther,
+    lantern: agg.lantern, deadass: agg.deadass
   };
-  renderCards(summary);
-  renderAgents(nodes, now, rates);
-  renderPool(nodes);
-  renderFeed(nodes);
+  const maxLab = Math.max(1, agg.flash, agg.panther, agg.lantern, agg.deadass);
+  $("#labels").innerHTML = LABEL_INFO.map(function(l){
+    const k = l[0];
+    const v = labelCount[k] || 0;
+    const w = Math.round((v / maxLab) * 100);
+    return '<tr>' +
+      '<td><span class="pill ' + k + '">' + k + '</span></td>' +
+      '<td>' + cell(v) + '</td>' +
+      '<td class="muted">' + l[1] + '</td>' +
+      '<td><div class="bar"><i style="width:' + w + '%"></i></div></td>' +
+    '</tr>';
+  }).join("");
+  $("#poolMeta").textContent = agg.live ? agg.live + " total" : "";
+
+  // activity feed (merged across nodes, newest first)
+  activities.sort(function(a, b){ return (b.ts || 0) - (a.ts || 0); });
+  const top = activities.slice(0, 80);
+  $("#feed").innerHTML = top.length
+    ? top.map(function(a){
+        return '<div class="row">' +
+          '<span class="t">' + hhmmss(a.ts || 0) + '</span>' +
+          '<span class="e">' + (a.event || "") + '</span>' +
+          '<span class="d">' + (a.role ? a.role + " · " : "") + (a.detail || "") + '</span>' +
+        '</div>';
+      }).join("")
+    : '<div class="empty">no recent activity</div>';
+  $("#feedMeta").textContent = top.length ? top.length + " events" : "";
 }
+
+let es = null;
 
 function connect(){
-  const es = new EventSource("/stream/stats");
-  es.onmessage = ev => {
-    try { handle(JSON.parse(ev.data)); } catch(e){}
-    $("#conn").className = "live on"; $("#conn").lastElementChild.textContent = "live";
+  if(es){ try { es.close(); } catch(_){} }
+  es = new EventSource("/stream/stats");
+
+  es.onopen = function(){
+    connected = true;
+    $("#conn").className = "live on";
   };
-  es.onerror = () => {
-    $("#conn").className = "live off"; $("#conn").lastElementChild.textContent = "reconnecting…";
+  es.onerror = function(){
+    connected = false;
+    $("#conn").className = "live off";
+    $("#conn").lastElementChild.textContent = "reconnecting…";
   };
-  setInterval(()=>{ $("#clock").textContent = new Date().toTimeString().slice(0,8); }, 1000);
+  es.onmessage = function(e){
+    let data;
+    try { data = JSON.parse(e.data); } catch(_) { return; }
+    if(data && data.nodes) render(data);
+  };
 }
 
 connect();
+setInterval(function(){
+  if(!es || es.readyState === EventSource.CLOSED) connect();
+}, 5000);
+setInterval(function(){
+  $("#clock").textContent = new Date().toTimeString().slice(0, 8);
+}, 1000);
 </script>
 </body>
 </html>
