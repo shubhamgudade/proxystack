@@ -628,8 +628,8 @@ def _outbuf_sender():
             del _outbuf[:INGEST_BATCH_SIZE]
 
         by_role: dict[str, list] = defaultdict(list)
-        for addr, role, elapsed in batch:
-            by_role[role].append({"addr": addr, "t1_elapsed": elapsed})
+        for addr, role, elapsed, stage in batch:
+            by_role[role].append({"addr": addr, "t1_elapsed": elapsed, "stage": stage})
 
         for role, items in by_role.items():
             url = PEERS.get(role)
@@ -648,7 +648,7 @@ def _outbuf_sender():
                 print(f"[outbuf] failed → {role}: {e}", flush=True)
                 with _outbuf_lock:
                     for item in items:
-                        _outbuf.insert(0, (item["addr"], role, item["t1_elapsed"]))
+                        _outbuf.insert(0, (item["addr"], role, item["t1_elapsed"], item["stage"]))
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FETCHER ROLE — Source loops
