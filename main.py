@@ -913,45 +913,40 @@ async def _local_pipeline_main():
             else:
                 _inc("t2_fail")
 
-    async def _feeder():
-        """Pull from _src_raw and push to local T1 queue."""
+    async def _distributor():
+        """Stream raw candidates to every T1 lane the moment they arrive (5k/5min cap)."""
         while True:
-            with _src_raw_lock:
-                all_proxies: list[str] = []
-                for pool in _src_raw.values():
-                    all_proxies.extend(pool)
-
-            if not all_proxies:
-                await asyncio.sleep(2)
+            room = _budget_room(time.time())
+            if room <= 0:
+                await asyncio.sleep(1.0)
                 continue
-
-            random.shuffle(all_proxies)
-            batch = all_proxies[:FEED_TARGET]
-            sent  = 0
-
-            for addr in batch:
-                if _local_t1_queue.qsize() < 25_000:
-                    await _local_t1_queue.put(addr)
-                    sent += 1
-                else:
-                    # queue full — overflow to dedicated T1s
-                    target = _weighted_pick(downstream)
-                    if target:
-                        _push_downstream(addr, target, 0.0)
-                    sent += 1
-
-            sent_set = set(batch)
             with _src_raw_lock:
+                batch = []
                 for label in list(_src_raw.keys()):
-                    _src_raw[label] = [p for p in _src_raw[label] if p not in sent_set]
-
-            if sent:
-                print(f"[{ROLE}] feeder → {sent} to local T1 queue", flush=True)
-
-            q = _local_t1_queue.qsize()
-            if q > 20_000:  await asyncio.sleep(3)
-            elif q > 8_000: await asyncio.sleep(1)
-            else:           await asyncio.sleep(0.3)
+                    pool = _src_raw[label]
+                    if not pool:
+                        continue
+                    take = pool[:room - len(batch)]
+                    if take:
+                        del pool[:len(take)]
+                        batch.extend(take)
+                    if len(batch) >= room:
+                        break
+            if not batch:
+                await asyncio.sleep(1.0)
+                continue
+            for addr in batch:
+                _dispatch_times.append(time.time())
+                t = _t1_target(addr)
+                if t == ROLE:
+                    if not _seen_dup("t1", addr):
+                        try:
+                            _local_t1_queue.put_nowait(addr)
+                        except asyncio.QueueFull:
+                            pass
+                else:
+                    _push_downstream(addr, t, 0.0, "t1")
+            await asyncio.sleep(0.2)
 
     async def _stats_printer():
         while True:
