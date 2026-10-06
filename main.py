@@ -890,7 +890,11 @@ async def _local_pipeline_main():
             if passed:
                 _inc("t1_pass")
                 _log_activity("t1_pass", addr)
-                await _local_t2_queue.put((addr, elapsed))
+                lane = _t2_target(addr)
+                if lane == ROLE:
+                    await _local_t2_queue.put((addr, elapsed))
+                else:
+                    _push_downstream(addr, lane, elapsed, "t2")
             else:
                 _inc("t1_fail")
 
@@ -905,7 +909,7 @@ async def _local_pipeline_main():
                 if cat:
                     _inc(f"t2_pass_{cat}")
                     _log_activity("t2_pass", f"{addr} → {cat} ({avg:.1f}s)")
-                    _push_downstream(addr, "pool", avg)
+                    _push_downstream(addr, "pool", avg, "pool")
             else:
                 _inc("t2_fail")
 
