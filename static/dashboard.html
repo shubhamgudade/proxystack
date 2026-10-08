@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -34,7 +33,6 @@
              env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
   }
 
-  /* ── header ── */
   header {
     position: sticky;
     top: env(safe-area-inset-top, 0px);
@@ -55,11 +53,10 @@
   .hdr-stat span { color: var(--text); font-weight: 700; }
   .ts { font-size: 10px; color: var(--muted); }
 
-  /* ── layout ── */
   .grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    grid-template-rows: auto auto auto;
+    grid-template-rows: auto;
     gap: 12px;
     padding: 16px;
     max-width: 1400px;
@@ -67,7 +64,6 @@
   }
   @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
 
-  /* ── card ── */
   .card {
     background: var(--surface);
     border: 1px solid var(--border);
@@ -85,30 +81,18 @@
     margin-bottom: 14px;
   }
 
-  /* ── pool big number ── */
-  .pool-row {
-    display: flex;
-    align-items: flex-end;
-    gap: 24px;
-    flex-wrap: wrap;
-  }
+  .pool-row { display: flex; align-items: flex-end; gap: 24px; flex-wrap: wrap; }
   .big-num { font-size: 52px; font-weight: 800; line-height: 1; color: var(--accent2); }
   .big-label { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
   .sub-stats { display: flex; flex-direction: column; gap: 4px; }
   .sub-stat { font-size: 11px; color: var(--muted); }
   .sub-stat span { font-weight: 700; }
 
-  /* ── label bars ── */
   .label-row { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
   .label-badge {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 5px 10px;
-    font-size: 11px;
+    display: flex; align-items: center; gap: 6px;
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 10px; font-size: 11px;
   }
   .label-dot { width: 7px; height: 7px; border-radius: 50%; }
   .label-badge.flash   .label-dot { background: var(--flash); }
@@ -117,7 +101,6 @@
   .label-badge.deadass .label-dot { background: var(--deadass); }
   .label-badge .cnt { font-weight: 700; color: var(--text); }
 
-  /* ── progress bar ── */
   .progress-wrap { margin-top: 14px; }
   .progress-label { display: flex; justify-content: space-between; font-size: 10px; color: var(--muted); margin-bottom: 5px; }
   .progress-bar { height: 5px; background: var(--bg); border-radius: 3px; overflow: hidden; }
@@ -126,18 +109,8 @@
   .progress-fill.panther { background: var(--panther); }
   .progress-fill.lantern { background: var(--lantern); }
 
-  /* ── checker grid ── */
-  .checker-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
-    gap: 8px;
-  }
-  .checker-card {
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 10px 12px;
-  }
+  .checker-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 8px; }
+  .checker-card { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
   .checker-top { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
   .checker-name { font-size: 11px; font-weight: 700; }
   .checker-role { font-size: 9px; color: var(--muted); margin-left: auto; }
@@ -146,36 +119,41 @@
   .checker-status.err  { background: #450a0a; color: var(--deadass); }
   .checker-status.idle { background: #1e1b4b; color: var(--accent); }
 
-  /* fetch → check progress per checker */
   .checker-progress { margin: 6px 0 4px; }
   .checker-bar-wrap { height: 3px; background: var(--border); border-radius: 2px; overflow: hidden; margin-top: 3px; }
   .checker-bar-fill { height: 100%; background: var(--accent); border-radius: 2px; transition: width .4s; }
   .checker-nums { display: flex; justify-content: space-between; font-size: 9px; color: var(--muted); }
   .checker-nums span { color: var(--text); }
 
-  /* ── pipeline summary ── */
   .pipeline { display: flex; align-items: center; gap: 0; flex-wrap: wrap; margin-top: 8px; }
   .pipe-step {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 3px;
-    padding: 10px 16px;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    min-width: 90px;
+    display: flex; flex-direction: column; align-items: center; gap: 3px;
+    padding: 10px 16px; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 8px; min-width: 90px;
   }
   .pipe-step .num  { font-size: 22px; font-weight: 800; color: var(--accent); }
   .pipe-step .lbl  { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }
   .pipe-arrow { color: var(--border); font-size: 18px; padding: 0 6px; }
 
-  /* ── activity log ── */
+  /* ── caller picks table ── */
+  .caller-table { width: 100%; border-collapse: collapse; margin-top: 4px; }
+  .caller-table th {
+    font-size: 9px; text-transform: uppercase; letter-spacing: .1em;
+    color: var(--muted); text-align: left; padding: 4px 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .caller-table td { font-size: 11px; padding: 5px 8px; border-bottom: 1px solid var(--border); }
+  .caller-table tr:last-child td { border-bottom: none; }
+  .caller-table .caller-name { color: var(--accent); font-weight: 700; }
+  .caller-table .caller-count { color: var(--accent2); font-weight: 800; text-align: right; }
+  .caller-table .caller-bar-cell { width: 40%; padding-right: 12px; }
+  .caller-mini-bar { height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; }
+  .caller-mini-fill { height: 100%; background: var(--accent); border-radius: 2px; transition: width .4s; }
+  .caller-unknown { color: var(--deadass) !important; }
+  .caller-empty { font-size: 10px; color: var(--muted); padding: 8px 0; }
+
   .log-wrap {
-    height: 280px;
-    overflow-y: auto;
-    font-size: 10px;
-    line-height: 1.7;
+    height: 280px; overflow-y: auto; font-size: 10px; line-height: 1.7;
   }
   .log-wrap::-webkit-scrollbar { width: 4px; }
   .log-wrap::-webkit-scrollbar-track { background: transparent; }
@@ -185,34 +163,12 @@
   .log-role  { color: var(--accent); flex-shrink: 0; width: 72px; overflow: hidden; text-overflow: ellipsis; }
   .log-event { color: var(--accent2); flex-shrink: 0; width: 80px; }
   .log-detail { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .log-entry.evicted .log-event  { color: var(--deadass); }
-  .log-entry.promoted .log-event { color: var(--accent2); }
-  .log-entry.commit .log-event   { color: var(--accent3); }
+  .log-entry.evicted   .log-event { color: var(--deadass); }
+  .log-entry.promoted  .log-event { color: var(--accent2); }
+  .log-entry.commit    .log-event { color: var(--accent3); }
+  .log-entry.pick_served .log-role { color: var(--accent4); }
 
-  /* ── counters ── */
-  .counter-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
-    gap: 6px;
-  }
-  .counter-item {
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 8px 10px;
-  }
-  .counter-key { font-size: 9px; color: var(--muted); margin-bottom: 2px; }
-  .counter-val { font-size: 18px; font-weight: 800; color: var(--text); }
-
-  /* ── error banner ── */
-  .banner {
-    display: none;
-    background: #450a0a;
-    color: var(--deadass);
-    font-size: 11px;
-    padding: 8px 20px;
-    text-align: center;
-  }
+  .banner { display: none; background: #450a0a; color: var(--deadass); font-size: 11px; padding: 8px 20px; text-align: center; }
   .banner.show { display: block; }
 </style>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -252,7 +208,7 @@
         <div class="sub-stat">recheck ✗  <span id="pool-recheck-fail">0</span></div>
       </div>
     </div>
-    <div class="label-row" id="label-row">
+    <div class="label-row">
       <div class="label-badge flash">  <div class="label-dot"></div><div class="cnt" id="cnt-flash">0</div>  flash &lt;3s</div>
       <div class="label-badge panther"><div class="label-dot"></div><div class="cnt" id="cnt-panther">0</div> panther &lt;5s</div>
       <div class="label-badge lantern"><div class="label-dot"></div><div class="cnt" id="cnt-lantern">0</div> lantern &lt;7s</div>
@@ -275,7 +231,7 @@
   <!-- pipeline totals -->
   <div class="card">
     <div class="card-title">Pipeline — All Checkers Combined</div>
-    <div class="pipeline" id="pipeline">
+    <div class="pipeline">
       <div class="pipe-step"><div class="num" id="p-fetched">0</div><div class="lbl">fetched</div></div>
       <div class="pipe-arrow">→</div>
       <div class="pipe-step"><div class="num" id="p-checked">0</div><div class="lbl">checked</div></div>
@@ -298,6 +254,23 @@
     </div>
   </div>
 
+  <!-- caller picks — who is asking -->
+  <div class="card span2">
+    <div class="card-title">Caller Picks — Who Is Asking</div>
+    <table class="caller-table">
+      <thead>
+        <tr>
+          <th>caller</th>
+          <th>picks</th>
+          <th class="caller-bar-cell">share</th>
+        </tr>
+      </thead>
+      <tbody id="caller-tbody">
+        <tr><td colspan="3" class="caller-empty">waiting for data...</td></tr>
+      </tbody>
+    </table>
+  </div>
+
   <!-- checker nodes -->
   <div class="card span2">
     <div class="card-title">Checker Nodes</div>
@@ -313,8 +286,7 @@
 </div>
 
 <script>
-// ── config ──────────────────────────────────────────────────────────────────
-const SSE_URL  = '/stream/stats';
+const SSE_URL = 'https://ps-omen.onrender.com/stream/stats';
 const ROLES = [
   {role:'checker_1',  agent:'Brimstone'},
   {role:'checker_2',  agent:'Viper'},
@@ -328,29 +300,20 @@ const ROLES = [
   {role:'checker_10', agent:'Killjoy'},
 ];
 
-// cumulative counter store per node
-const store = {};  // role → {counters, queues, ts, ok}
-let poolData  = null;
-let lastTs    = 0;
+const store = {};
+let poolData = null;
+let lastTs   = 0;
 
-// ── SSE ─────────────────────────────────────────────────────────────────────
+// ── SSE ──────────────────────────────────────────────────────────────────────
 let es;
 function connect() {
   if (es) es.close();
   es = new EventSource(SSE_URL);
-
-  es.onmessage = e => {
-    try {
-      const data = JSON.parse(e.data);
-      ingest(data);
-    } catch(_) {}
-  };
-
-  es.onopen = () => {
+  es.onmessage = e => { try { ingest(JSON.parse(e.data)); } catch(_) {} };
+  es.onopen  = () => {
     document.getElementById('banner').classList.remove('show');
     document.getElementById('dot').classList.add('live');
   };
-
   es.onerror = () => {
     document.getElementById('banner').classList.add('show');
     document.getElementById('dot').classList.remove('live');
@@ -363,17 +326,16 @@ function ingest(data) {
   lastTs = data.ts || Date.now()/1000;
   document.getElementById('hdr-ts').textContent = new Date(lastTs*1000).toLocaleTimeString();
 
-  // dashboard mode — data.nodes is a map of role → stats
   const nodes = data.nodes || {};
 
-  // pool
   const poolNode = nodes['pool'] || (data.role === 'pool' ? data : null);
   if (poolNode && !poolNode.error) {
     poolData = poolNode;
     renderPool(poolNode);
+    renderCallerPicks(poolNode.caller_picks || {});
+    renderLog(poolNode);
   }
 
-  // checkers
   ROLES.forEach(({role, agent}) => {
     const nd = nodes[role] || (data.role === role ? data : null);
     if (!nd) return;
@@ -382,10 +344,9 @@ function ingest(data) {
 
   renderCheckers();
   renderPipeline();
-  renderLog(poolNode);
 }
 
-// ── pool render ──────────────────────────────────────────────────────────────
+// ── pool ─────────────────────────────────────────────────────────────────────
 function renderPool(d) {
   const f  = d.free || {};
   const cn = d.counters || {};
@@ -409,36 +370,62 @@ function renderPool(d) {
   set('hdr-picks', cn.pool_picks || 0);
 
   const pct = n => live > 0 ? Math.min(100, Math.round((n/live)*100)) : 0;
-  const fl  = pct(f.flash   || 0);
-  const pa  = pct(f.panther || 0);
-  const la  = pct(f.lantern || 0);
-  bar('bar-flash',   'pct-flash',   fl);
-  bar('bar-panther', 'pct-panther', pa);
-  bar('bar-lantern', 'pct-lantern', la);
+  bar('bar-flash',   'pct-flash',   pct(f.flash   || 0));
+  bar('bar-panther', 'pct-panther', pct(f.panther || 0));
+  bar('bar-lantern', 'pct-lantern', pct(f.lantern || 0));
 }
 
-// ── pipeline render ──────────────────────────────────────────────────────────
-function renderPipeline() {
-  let fetched = 0, checked = 0, passed = 0, failed = 0, commits = 0, cycles = 0, outbuf = 0, checkq = 0;
+// ── caller picks ─────────────────────────────────────────────────────────────
+function renderCallerPicks(callerPicks) {
+  const tbody = document.getElementById('caller-tbody');
+  const entries = Object.entries(callerPicks);
 
+  if (!entries.length) {
+    tbody.innerHTML = '<tr><td colspan="3" class="caller-empty">no picks yet</td></tr>';
+    return;
+  }
+
+  // sort by count desc
+  entries.sort((a, b) => b[1] - a[1]);
+  const total = entries.reduce((s, [, v]) => s + v, 0);
+
+  tbody.innerHTML = entries.map(([caller, count]) => {
+    const pct     = total > 0 ? Math.round((count / total) * 100) : 0;
+    const isUnknown = caller.startsWith('unknown');
+    const nameClass = isUnknown ? 'caller-name caller-unknown' : 'caller-name';
+    return `
+      <tr>
+        <td class="${nameClass}">${caller}</td>
+        <td class="caller-count">${fmt(count)}</td>
+        <td class="caller-bar-cell">
+          <div style="display:flex;align-items:center;gap:6px;">
+            <div class="caller-mini-bar" style="flex:1">
+              <div class="caller-mini-fill" style="width:${pct}%"></div>
+            </div>
+            <span style="font-size:9px;color:var(--muted);width:28px;text-align:right">${pct}%</span>
+          </div>
+        </td>
+      </tr>`;
+  }).join('');
+}
+
+// ── pipeline ──────────────────────────────────────────────────────────────────
+function renderPipeline() {
+  let fetched=0, checked=0, passed=0, failed=0, commits=0, cycles=0, outbuf=0, checkq=0;
   ROLES.forEach(({role}) => {
     const s = store[role];
     if (!s) return;
     const c = s.counters;
     const passSum = (c.check_pass_flash||0)+(c.check_pass_panther||0)+(c.check_pass_lantern||0)+(c.check_pass_deadass||0);
-    const failSum = c.check_fail || 0;
     passed  += passSum;
-    failed  += failSum;
-    checked += passSum + failSum;
+    failed  += c.check_fail || 0;
+    checked += passSum + (c.check_fail||0);
     commits += c.commits_detected || 0;
     cycles  += c.cycle_fetches    || 0;
     outbuf  += s.queues.outbuf    || 0;
     checkq  += s.queues.check     || 0;
   });
-
-  // fetched = checked (we don't track raw fetch separately per node in counters)
   fetched = checked;
-
   set('p-fetched', fmt(fetched));
   set('p-checked', fmt(checked));
   set('p-passed',  fmt(passed));
@@ -447,20 +434,17 @@ function renderPipeline() {
   set('p-cycles',  cycles);
   set('p-outbuf',  outbuf);
   set('p-checkq',  checkq);
-
   const rate = checked > 0 ? Math.round((passed/checked)*100) : 0;
-  set('pass-rate-pct', rate + '%');
+  set('pass-rate-pct', rate+'%');
   bar('bar-passrate', null, rate);
 }
 
-// ── checker cards render ─────────────────────────────────────────────────────
+// ── checker cards ─────────────────────────────────────────────────────────────
 function renderCheckers() {
   const grid = document.getElementById('checker-grid');
-
   ROLES.forEach(({role, agent}) => {
-    const s   = store[role];
-    let card  = document.getElementById(`cc-${role}`);
-
+    const s = store[role];
+    let card = document.getElementById(`cc-${role}`);
     if (!card) {
       card = document.createElement('div');
       card.className = 'checker-card';
@@ -485,81 +469,58 @@ function renderCheckers() {
           <div>commits <span id="cp-commit-${role}">0</span></div>
           <div>cycles  <span id="cp-cycle-${role}">0</span></div>
           <div>outbuf  <span id="cp-obuf-${role}">0</span></div>
-        </div>
-      `;
+        </div>`;
       grid.appendChild(card);
     }
-
     if (!s) return;
-
     const c     = s.counters;
     const passS = (c.check_pass_flash||0)+(c.check_pass_panther||0)+(c.check_pass_lantern||0)+(c.check_pass_deadass||0);
     const failS = c.check_fail || 0;
     const total = passS + failS;
     const pct   = total > 0 ? Math.min(100, Math.round((passS/total)*100)) : 0;
     const age   = lastTs - (s.ts || 0);
-
     const statusEl = document.getElementById(`cs-${role}`);
-    if (age > 20) {
-      statusEl.textContent = 'offline';
-      statusEl.className   = 'checker-status err';
-    } else {
-      statusEl.textContent = 'live';
-      statusEl.className   = 'checker-status ok';
-    }
-
+    statusEl.textContent = age > 20 ? 'offline' : 'live';
+    statusEl.className   = `checker-status ${age > 20 ? 'err' : 'ok'}`;
     set(`cp-pass-${role}`,   fmt(passS));
     set(`cp-fail-${role}`,   fmt(failS));
     set(`cp-q-${role}`,      s.queues.check || 0);
     set(`cp-commit-${role}`, c.commits_detected || 0);
     set(`cp-cycle-${role}`,  c.cycle_fetches    || 0);
     set(`cp-obuf-${role}`,   s.queues.outbuf    || 0);
-
     const fill = document.getElementById(`cb-${role}`);
     if (fill) fill.style.width = pct + '%';
   });
 }
 
-// ── log render ───────────────────────────────────────────────────────────────
-const LOG_MAX = 200;
-const logEl   = document.getElementById('log');
-
+// ── log ───────────────────────────────────────────────────────────────────────
+const logEl = document.getElementById('log');
 function renderLog(poolNode) {
   if (!poolNode || !poolNode.activity) return;
-  const acts = poolNode.activity || [];
-
-  // clear and rebuild (simple — pool sends latest 50 each tick)
   logEl.innerHTML = '';
-  acts.slice(0, 80).forEach(a => {
+  poolNode.activity.slice(0, 80).forEach(a => {
     const div = document.createElement('div');
     div.className = `log-entry ${a.event}`;
-    const t = new Date(a.ts * 1000);
-    const ts = t.toLocaleTimeString('en', {hour12: false, hour:'2-digit', minute:'2-digit', second:'2-digit'});
+    const ts = new Date(a.ts * 1000).toLocaleTimeString('en', {hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
     div.innerHTML = `
       <div class="log-ts">${ts}</div>
       <div class="log-role">${a.role || ''}</div>
       <div class="log-event">${a.event || ''}</div>
-      <div class="log-detail">${a.detail || ''}</div>
-    `;
+      <div class="log-detail">${a.detail || ''}</div>`;
     logEl.appendChild(div);
   });
 }
 
-// ── utils ────────────────────────────────────────────────────────────────────
-function set(id, val) {
-  const el = document.getElementById(id);
-  if (el) el.textContent = val;
-}
-
+// ── utils ─────────────────────────────────────────────────────────────────────
+function set(id, val) { const el = document.getElementById(id); if (el) el.textContent = val; }
 function bar(barId, pctId, pct) {
   const b = document.getElementById(barId);
   if (b) b.style.width = pct + '%';
   if (pctId) set(pctId, pct + '%');
 }
-
 function fmt(n) {
-  if (n >= 1_000_000) return (n/1_000_000).toFixed(1) + 'M';
-  if (n >= 1_000)     return (n/1_000).toFixed(1) + 'k';
+  if (n >= 1_000_000) return (n/1_000_000).toFixed(1)+'M';
+  if (n >= 1_000)     return (n/1_000).toFixed(1)+'k';
   return n;
 }
 
