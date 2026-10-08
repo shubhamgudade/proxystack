@@ -1,591 +1,569 @@
-<!doctype html>
+
+<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>ProxyStack · Fleet</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400..700&family=Outfit:wght@400;500;600&display=swap" rel="stylesheet">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ProxyStack v2</title>
 <style>
-:root{
-  --bg:#0D0E11;
-  --surface:#13151A;
-  --surface2:#1A1D24;
-  --text:#E8EAF0;
-  --muted:#6B7280;
-  --line:#1F2229;
-  --accent:#7C7CF8;
-  --accent-soft:rgba(124,124,248,.12);
-  --soft:#1A1D24;
-  --ok:#22C87A;
-  --ok-soft:rgba(34,200,122,.12);
-  --idle:#4B5263;
-  --warn:#E59A2F;
-  --bad:#F05454;
-  --bad-soft:rgba(240,84,84,.12);
-  --r:14px;
-  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-}
-*{box-sizing:border-box;margin:0;padding:0}
-html,body{height:100%}
-body{
-  font-family:'Google Sans','Outfit',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-  background:var(--bg);
-  color:var(--text);
-  font-size:14px;
-  line-height:1.5;
-  -webkit-font-smoothing:antialiased;
-  padding:32px 28px 64px;
-  max-width:1380px;
-  margin:0 auto;
-}
-h1,h2{font-weight:500}
-h1{font-size:19px;letter-spacing:-.3px}
-h2{font-size:13px;letter-spacing:.05px;color:var(--text)}
-.muted{color:var(--muted)}
+  :root {
+    --bg:       #0a0a0f;
+    --surface:  #111118;
+    --border:   #1e1e2e;
+    --accent:   #7c6af5;
+    --accent2:  #4ade80;
+    --accent3:  #fb923c;
+    --accent4:  #f472b6;
+    --text:     #e2e8f0;
+    --muted:    #64748b;
+    --flash:    #4ade80;
+    --panther:  #60a5fa;
+    --lantern:  #fb923c;
+    --deadass:  #f87171;
+    --dead:     #374151;
+    font-size: 13px;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-/* ── header ── */
-.top{
-  display:flex;align-items:center;justify-content:space-between;
-  gap:16px;margin-bottom:28px;flex-wrap:wrap;
-}
-.brand{display:flex;align-items:center;gap:12px}
-.logo{
-  width:36px;height:36px;border-radius:10px;flex:0 0 auto;
-  background:linear-gradient(135deg,#5B5BD6,#9E7BF0);
-  box-shadow:0 4px 18px rgba(91,91,214,.35);
-}
-.sub{font-size:12px;color:var(--muted);margin-top:2px}
-.top-right{display:flex;align-items:center;gap:20px;font-size:12.5px}
-.live{display:inline-flex;align-items:center;gap:7px;color:var(--muted)}
-.live i{
-  width:8px;height:8px;border-radius:50%;
-  background:var(--idle);transition:background .3s;
-}
-.live.on  i{background:var(--ok);box-shadow:0 0 0 4px var(--ok-soft)}
-.live.off i{background:var(--bad);box-shadow:0 0 0 4px var(--bad-soft)}
-.clock{color:var(--muted);font-variant-numeric:tabular-nums;font-family:var(--mono);font-size:12px}
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    min-height: 100vh;
+    padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
+             env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
+  }
 
-/* ── summary cards ── */
-.cards{
-  display:grid;
-  grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
-  gap:12px;margin-bottom:20px;
-}
-.card{
-  background:var(--surface);
-  border:1px solid var(--line);
-  border-radius:var(--r);
-  padding:16px 18px;
-  transition:border-color .2s;
-}
-.card:hover{border-color:#2A2D36}
-.card .k{font-size:11.5px;color:var(--muted);margin-bottom:8px;white-space:nowrap;text-transform:uppercase;letter-spacing:.4px}
-.card .v{
-  font-size:26px;font-weight:500;letter-spacing:-.8px;
-  font-variant-numeric:tabular-nums;line-height:1.1;
-}
-.card .v small{font-size:13px;color:var(--muted);font-weight:400;margin-left:3px;letter-spacing:0}
-.card.accent-card .v{color:var(--accent)}
-.card.ok-card    .v{color:var(--ok)}
+  /* ── header ── */
+  header {
+    position: sticky;
+    top: env(safe-area-inset-top, 0px);
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 20px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    z-index: 100;
+  }
+  header h1 { font-size: 14px; font-weight: 700; letter-spacing: .05em; color: var(--accent); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dead); flex-shrink: 0; }
+  .dot.live { background: var(--accent2); box-shadow: 0 0 6px var(--accent2); animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
+  .hdr-right { margin-left: auto; display: flex; align-items: center; gap: 16px; }
+  .hdr-stat  { font-size: 11px; color: var(--muted); }
+  .hdr-stat span { color: var(--text); font-weight: 700; }
+  .ts { font-size: 10px; color: var(--muted); }
 
-/* ── main grid ── */
-.grid{
-  display:grid;
-  grid-template-columns:minmax(0,2fr) minmax(0,1fr);
-  gap:14px;align-items:start;
-}
-@media(max-width:980px){.grid{grid-template-columns:1fr}}
+  /* ── layout ── */
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: auto auto auto;
+    gap: 12px;
+    padding: 16px;
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
 
-/* ── panels ── */
-.panel{
-  background:var(--surface);
-  border:1px solid var(--line);
-  border-radius:var(--r);
-  padding:18px 20px;
-  margin-bottom:14px;
-  overflow:hidden;
-}
-.panel-head{
-  display:flex;align-items:center;justify-content:space-between;
-  gap:12px;margin-bottom:14px;
-}
-.panel-head .meta{font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+  /* ── card ── */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    overflow: hidden;
+  }
+  .card.span2 { grid-column: 1 / -1; }
+  .card-title {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 14px;
+  }
 
-/* ── table ── */
-.tbl-wrap{overflow-x:auto}
-table{width:100%;border-collapse:collapse;font-size:12.5px}
-th{
-  text-align:left;font-weight:500;color:var(--muted);
-  font-size:10.5px;text-transform:uppercase;letter-spacing:.55px;
-  padding:0 14px 10px 0;white-space:nowrap;
-}
-td{
-  padding:10px 14px 10px 0;
-  border-top:1px solid var(--line);
-  font-variant-numeric:tabular-nums;
-  white-space:nowrap;
-}
-th:last-child,td:last-child{padding-right:0;text-align:right}
-.role{font-family:var(--mono);font-size:12px;color:var(--text)}
+  /* ── pool big number ── */
+  .pool-row {
+    display: flex;
+    align-items: flex-end;
+    gap: 24px;
+    flex-wrap: wrap;
+  }
+  .big-num { font-size: 52px; font-weight: 800; line-height: 1; color: var(--accent2); }
+  .big-label { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+  .sub-stats { display: flex; flex-direction: column; gap: 4px; }
+  .sub-stat { font-size: 11px; color: var(--muted); }
+  .sub-stat span { font-weight: 700; }
 
-/* ── status ── */
-.st{display:inline-flex;align-items:center;gap:7px}
-.dot{width:7px;height:7px;border-radius:50%;flex:0 0 auto;background:var(--idle)}
-tr.running .dot{background:var(--ok);box-shadow:0 0 0 3px var(--ok-soft)}
-tr.idle    .dot{background:var(--idle)}
-tr.offline .dot{background:var(--bad)}
-tr.running td:first-child{color:var(--text);font-weight:500}
-tr.idle    td{color:var(--muted)}
-tr.offline td{color:#3A3D45}
-tr.offline .role{color:#3A3D45}
-.zero{color:#2E3140}
+  /* ── label bars ── */
+  .label-row { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+  .label-badge {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 10px;
+    font-size: 11px;
+  }
+  .label-dot { width: 7px; height: 7px; border-radius: 50%; }
+  .label-badge.flash   .label-dot { background: var(--flash); }
+  .label-badge.panther .label-dot { background: var(--panther); }
+  .label-badge.lantern .label-dot { background: var(--lantern); }
+  .label-badge.deadass .label-dot { background: var(--deadass); }
+  .label-badge .cnt { font-weight: 700; color: var(--text); }
 
-/* ── counters diff flash ── */
-@keyframes flashCell{0%{color:var(--accent)}100%{color:inherit}}
-.flash-val{animation:flashCell .6s ease-out}
+  /* ── progress bar ── */
+  .progress-wrap { margin-top: 14px; }
+  .progress-label { display: flex; justify-content: space-between; font-size: 10px; color: var(--muted); margin-bottom: 5px; }
+  .progress-bar { height: 5px; background: var(--bg); border-radius: 3px; overflow: hidden; }
+  .progress-fill { height: 100%; border-radius: 3px; transition: width .4s ease; }
+  .progress-fill.flash   { background: var(--flash); }
+  .progress-fill.panther { background: var(--panther); }
+  .progress-fill.lantern { background: var(--lantern); }
 
-/* ── labels ── */
-.pill{
-  display:inline-block;padding:2px 9px;border-radius:999px;
-  font-size:11px;font-weight:500;letter-spacing:.1px;
-}
-.pill.flash  {background:rgba(34,200,122,.14);color:#22C87A}
-.pill.panther{background:rgba(124,124,248,.14);color:#9090F8}
-.pill.lantern{background:rgba(229,154,47,.14);color:#E59A2F}
-.pill.deadass{background:rgba(107,114,128,.14);color:#8892A0}
-.bar{height:4px;border-radius:2px;background:var(--line);overflow:hidden;margin-top:7px}
-.bar i{display:block;height:100%;background:var(--accent);width:0;transition:width .35s}
-.pill.flash   + .bar i{background:var(--ok)}
-.pill.panther + .bar i{background:var(--accent)}
-.pill.lantern + .bar i{background:var(--warn)}
-.pill.deadass + .bar i{background:var(--idle)}
+  /* ── checker grid ── */
+  .checker-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 8px;
+  }
+  .checker-card {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+  }
+  .checker-top { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .checker-name { font-size: 11px; font-weight: 700; }
+  .checker-role { font-size: 9px; color: var(--muted); margin-left: auto; }
+  .checker-status { font-size: 9px; padding: 2px 6px; border-radius: 3px; }
+  .checker-status.ok   { background: #14532d; color: var(--accent2); }
+  .checker-status.err  { background: #450a0a; color: var(--deadass); }
+  .checker-status.idle { background: #1e1b4b; color: var(--accent); }
 
-/* ── activity feed ── */
-.feed{max-height:500px;overflow-y:auto;margin:-2px 0;scrollbar-width:thin;scrollbar-color:var(--line) transparent}
-.feed::-webkit-scrollbar{width:4px}
-.feed::-webkit-scrollbar-track{background:transparent}
-.feed::-webkit-scrollbar-thumb{background:var(--line);border-radius:2px}
-.row{
-  display:grid;
-  grid-template-columns:58px 110px minmax(0,1fr);
-  gap:10px;
-  padding:8px 0;
-  border-top:1px solid var(--line);
-  font-size:12px;
-  align-items:start;
-}
-.row:first-child{border-top:0}
-.row .t{color:var(--muted);font-family:var(--mono);font-size:11px;padding-top:1px}
-.row .e{
-  font-weight:500;overflow:hidden;text-overflow:ellipsis;
-  color:var(--accent);font-size:11.5px;padding-top:1px;
-}
-.row .d{color:var(--muted);overflow:hidden;text-overflow:ellipsis;font-size:11.5px}
-.row.ev-t1_pass    .e{color:var(--ok)}
-.row.ev-t2_pass    .e{color:#9090F8}
-.row.ev-evicted    .e{color:var(--bad)}
-.row.ev-pick_served .e{color:var(--warn)}
-.row.ev-startup    .e{color:var(--muted)}
-.empty{color:var(--muted);font-size:13px;padding:18px 0;text-align:center}
+  /* fetch → check progress per checker */
+  .checker-progress { margin: 6px 0 4px; }
+  .checker-bar-wrap { height: 3px; background: var(--border); border-radius: 2px; overflow: hidden; margin-top: 3px; }
+  .checker-bar-fill { height: 100%; background: var(--accent); border-radius: 2px; transition: width .4s; }
+  .checker-nums { display: flex; justify-content: space-between; font-size: 9px; color: var(--muted); }
+  .checker-nums span { color: var(--text); }
 
-/* ── raw counters panel ── */
-.counters-grid{
-  display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));
-  gap:8px;margin-top:2px;
-}
-.ctr{
-  background:var(--surface2);border:1px solid var(--line);
-  border-radius:10px;padding:10px 12px;
-}
-.ctr .ck{font-size:10.5px;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:.4px}
-.ctr .cv{font-size:20px;font-weight:500;font-variant-numeric:tabular-nums;letter-spacing:-.5px}
+  /* ── pipeline summary ── */
+  .pipeline { display: flex; align-items: center; gap: 0; flex-wrap: wrap; margin-top: 8px; }
+  .pipe-step {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 3px;
+    padding: 10px 16px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    min-width: 90px;
+  }
+  .pipe-step .num  { font-size: 22px; font-weight: 800; color: var(--accent); }
+  .pipe-step .lbl  { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }
+  .pipe-arrow { color: var(--border); font-size: 18px; padding: 0 6px; }
 
-/* ── node selector ── */
-.node-tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
-.ntab{
-  padding:4px 11px;border-radius:6px;font-size:11.5px;cursor:pointer;
-  border:1px solid var(--line);background:transparent;color:var(--muted);
-  font-family:var(--mono);transition:all .15s;
-}
-.ntab:hover{border-color:#2E3240;color:var(--text)}
-.ntab.active{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
-.ntab.st-running{border-color:rgba(34,200,122,.3)}
-.ntab.st-offline{opacity:.4}
+  /* ── activity log ── */
+  .log-wrap {
+    height: 280px;
+    overflow-y: auto;
+    font-size: 10px;
+    line-height: 1.7;
+  }
+  .log-wrap::-webkit-scrollbar { width: 4px; }
+  .log-wrap::-webkit-scrollbar-track { background: transparent; }
+  .log-wrap::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+  .log-entry { display: flex; gap: 8px; border-bottom: 1px solid var(--border); padding: 3px 0; }
+  .log-ts    { color: var(--muted); flex-shrink: 0; width: 60px; }
+  .log-role  { color: var(--accent); flex-shrink: 0; width: 72px; overflow: hidden; text-overflow: ellipsis; }
+  .log-event { color: var(--accent2); flex-shrink: 0; width: 80px; }
+  .log-detail { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .log-entry.evicted .log-event  { color: var(--deadass); }
+  .log-entry.promoted .log-event { color: var(--accent2); }
+  .log-entry.commit .log-event   { color: var(--accent3); }
+
+  /* ── counters ── */
+  .counter-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    gap: 6px;
+  }
+  .counter-item {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+  }
+  .counter-key { font-size: 9px; color: var(--muted); margin-bottom: 2px; }
+  .counter-val { font-size: 18px; font-weight: 800; color: var(--text); }
+
+  /* ── error banner ── */
+  .banner {
+    display: none;
+    background: #450a0a;
+    color: var(--deadass);
+    font-size: 11px;
+    padding: 8px 20px;
+    text-align: center;
+  }
+  .banner.show { display: block; }
 </style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700;800&display=swap" rel="stylesheet">
 </head>
 <body>
 
-<div class="top">
-  <div class="brand">
-    <div class="logo"></div>
-    <div>
-      <h1>ProxyStack</h1>
-      <p class="sub">Distributed proxy fleet · live</p>
-    </div>
-  </div>
-  <div class="top-right">
-    <span class="live" id="conn"><i></i><span>connecting…</span></span>
-    <span class="clock" id="clock">--:--:--</span>
-  </div>
-</div>
+<div class="banner" id="banner">⚠ SSE disconnected — reconnecting...</div>
 
-<!-- summary cards -->
-<div class="cards" id="cards"></div>
+<header>
+  <div class="dot" id="dot"></div>
+  <h1>ProxyStack v2</h1>
+  <div class="hdr-right">
+    <div class="hdr-stat">pool <span id="hdr-live">—</span></div>
+    <div class="hdr-stat">fresh <span id="hdr-fresh">—</span></div>
+    <div class="hdr-stat">picks <span id="hdr-picks">—</span></div>
+    <div class="ts" id="hdr-ts">—</div>
+  </div>
+</header>
 
 <div class="grid">
-  <!-- left column -->
-  <div>
-    <!-- agents table -->
-    <div class="panel">
-      <div class="panel-head">
-        <h2>Agents</h2>
-        <span class="meta" id="agentsMeta">waiting…</span>
+
+  <!-- pool overview -->
+  <div class="card">
+    <div class="card-title">Pool — Live Proxies</div>
+    <div class="pool-row">
+      <div>
+        <div class="big-label">total live</div>
+        <div class="big-num" id="pool-live">0</div>
       </div>
-      <div class="tbl-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Agent</th>
-              <th>Status</th>
-              <th>Live</th>
-              <th>Fresh ≤30s</th>
-              <th>Flash</th>
-              <th>Panther</th>
-              <th>Raw</th>
-              <th>Pass/s</th>
-              <th>Evict</th>
-            </tr>
-          </thead>
-          <tbody id="agents"></tbody>
-        </table>
+      <div class="sub-stats">
+        <div class="sub-stat">fresh 30s  <span id="pool-f30">0</span></div>
+        <div class="sub-stat">fresh 120s <span id="pool-f120">0</span></div>
+        <div class="sub-stat">evicted    <span id="pool-evicted">0</span></div>
+        <div class="sub-stat">picks      <span id="pool-picks">0</span></div>
+        <div class="sub-stat">recheck ✓  <span id="pool-recheck-pass">0</span></div>
+        <div class="sub-stat">recheck ✗  <span id="pool-recheck-fail">0</span></div>
       </div>
     </div>
-
-    <!-- pool labels -->
-    <div class="panel">
-      <div class="panel-head">
-        <h2>Pool by label</h2>
-        <span class="meta" id="poolMeta"></span>
-      </div>
-      <table>
-        <thead>
-          <tr>
-            <th>Label</th><th>Count</th><th>Latency</th><th style="width:38%">Share</th>
-          </tr>
-        </thead>
-        <tbody id="labels"></tbody>
-      </table>
+    <div class="label-row" id="label-row">
+      <div class="label-badge flash">  <div class="label-dot"></div><div class="cnt" id="cnt-flash">0</div>  flash &lt;3s</div>
+      <div class="label-badge panther"><div class="label-dot"></div><div class="cnt" id="cnt-panther">0</div> panther &lt;5s</div>
+      <div class="label-badge lantern"><div class="label-dot"></div><div class="cnt" id="cnt-lantern">0</div> lantern &lt;7s</div>
+      <div class="label-badge deadass"><div class="label-dot"></div><div class="cnt" id="cnt-deadass">0</div> deadass &lt;10s</div>
     </div>
-
-    <!-- per-node counters drill-down -->
-    <div class="panel">
-      <div class="panel-head">
-        <h2>Node counters</h2>
-        <span class="meta" id="ctrMeta"></span>
-      </div>
-      <div class="node-tabs" id="nodeTabs"></div>
-      <div class="counters-grid" id="ctrGrid"></div>
+    <div class="progress-wrap">
+      <div class="progress-label"><span>flash</span><span id="pct-flash">0%</span></div>
+      <div class="progress-bar"><div class="progress-fill flash" id="bar-flash" style="width:0%"></div></div>
+    </div>
+    <div class="progress-wrap">
+      <div class="progress-label"><span>panther</span><span id="pct-panther">0%</span></div>
+      <div class="progress-bar"><div class="progress-fill panther" id="bar-panther" style="width:0%"></div></div>
+    </div>
+    <div class="progress-wrap">
+      <div class="progress-label"><span>lantern</span><span id="pct-lantern">0%</span></div>
+      <div class="progress-bar"><div class="progress-fill lantern" id="bar-lantern" style="width:0%"></div></div>
     </div>
   </div>
 
-  <!-- right column -->
-  <div>
-    <div class="panel">
-      <div class="panel-head">
-        <h2>Activity</h2>
-        <span class="meta" id="feedMeta"></span>
+  <!-- pipeline totals -->
+  <div class="card">
+    <div class="card-title">Pipeline — All Checkers Combined</div>
+    <div class="pipeline" id="pipeline">
+      <div class="pipe-step"><div class="num" id="p-fetched">0</div><div class="lbl">fetched</div></div>
+      <div class="pipe-arrow">→</div>
+      <div class="pipe-step"><div class="num" id="p-checked">0</div><div class="lbl">checked</div></div>
+      <div class="pipe-arrow">→</div>
+      <div class="pipe-step"><div class="num" id="p-passed">0</div><div class="lbl">passed</div></div>
+      <div class="pipe-arrow">→</div>
+      <div class="pipe-step"><div class="num" id="p-failed">0</div><div class="lbl">failed</div></div>
+    </div>
+    <div style="margin-top:14px;">
+      <div class="progress-label"><div>check pass rate</div><div id="pass-rate-pct">0%</div></div>
+      <div class="progress-bar" style="height:8px;margin-top:4px;">
+        <div class="progress-fill flash" id="bar-passrate" style="width:0%;height:100%"></div>
       </div>
-      <div class="feed" id="feed"><div class="empty">waiting for nodes…</div></div>
+    </div>
+    <div style="margin-top:14px;display:flex;gap:16px;flex-wrap:wrap;">
+      <div class="sub-stat">commits detected <span id="p-commits">0</span></div>
+      <div class="sub-stat">cycle fetches <span id="p-cycles">0</span></div>
+      <div class="sub-stat">outbuf <span id="p-outbuf">0</span></div>
+      <div class="sub-stat">check queue <span id="p-checkq">0</span></div>
     </div>
   </div>
+
+  <!-- checker nodes -->
+  <div class="card span2">
+    <div class="card-title">Checker Nodes</div>
+    <div class="checker-grid" id="checker-grid"></div>
+  </div>
+
+  <!-- activity log -->
+  <div class="card span2">
+    <div class="card-title">Activity Log</div>
+    <div class="log-wrap" id="log"></div>
+  </div>
+
 </div>
 
 <script>
-"use strict";
-
-const $ = (s) => document.querySelector(s);
-
+// ── config ──────────────────────────────────────────────────────────────────
+const SSE_URL  = '/stream/stats';
 const ROLES = [
-  "fetcher_a","fetcher_b",
-  "t1_a","t1_b","t1_c","t1_d","t1_e",
-  "t2_a","t2_b","t2_c",
-  "pool","dashboard","vps"
+  {role:'checker_1',  agent:'Brimstone'},
+  {role:'checker_2',  agent:'Viper'},
+  {role:'checker_3',  agent:'Sage'},
+  {role:'checker_4',  agent:'Sova'},
+  {role:'checker_5',  agent:'Astra'},
+  {role:'checker_6',  agent:'Harbor'},
+  {role:'checker_7',  agent:'Phoenix'},
+  {role:'checker_8',  agent:'Breach'},
+  {role:'checker_9',  agent:'Neon'},
+  {role:'checker_10', agent:'Killjoy'},
 ];
 
-const LABEL_INFO = [
-  ["flash",   "< 3 s"],
-  ["panther", "3 – 5 s"],
-  ["lantern", "5 – 7 s"],
-  ["deadass", "7 – 10 s"]
-];
+// cumulative counter store per node
+const store = {};  // role → {counters, queues, ts, ok}
+let poolData  = null;
+let lastTs    = 0;
 
-const COUNTER_LABELS = {
-  raw_fetched:      "Raw fetched",
-  t1_tcp_fail:      "T1 TCP fail",
-  t1_pass:          "T1 pass",
-  t1_fail:          "T1 fail",
-  t2_pass_flash:    "T2 flash",
-  t2_pass_panther:  "T2 panther",
-  t2_pass_lantern:  "T2 lantern",
-  t2_pass_deadass:  "T2 deadass",
-  t2_rejected:      "T2 rejected",
-  t2_fail:          "T2 fail",
-  promoted:         "Promoted",
-  evicted:          "Evicted",
-  picks_served:     "Picks served",
-  health_pings:     "Health pings",
-};
+// ── SSE ─────────────────────────────────────────────────────────────────────
+let es;
+function connect() {
+  if (es) es.close();
+  es = new EventSource(SSE_URL);
 
-let prev        = {};
-let lastChange  = {};
-let selectedNode = "pool";
-let latestNodes  = {};
-
-function num(v){ return (v === null || v === undefined || Number.isNaN(+v)) ? null : +v; }
-function show(v){ const n = num(v); return n === null ? "—" : n; }
-function cell(v){
-  const n = num(v);
-  if(n === null) return '<span class="zero">—</span>';
-  return n === 0  ? '<span class="zero">0</span>' : String(n);
-}
-function passTotal(c){
-  return (c.t1_pass           || 0)
-       + (c.t2_pass_flash     || 0)
-       + (c.t2_pass_panther   || 0)
-       + (c.t2_pass_lantern   || 0)
-       + (c.t2_pass_deadass   || 0);
-}
-function hhmmss(ts){
-  return new Date(ts * 1000).toTimeString().slice(0,8);
-}
-function statusOf(role, n, now){
-  if(!n || n.error) return "offline";
-  const ch = lastChange[role];
-  if(ch === undefined) return "idle";
-  return (now - ch) <= 15 ? "running" : "idle";
-}
-function evClass(ev){
-  const m = (ev||"").replace(/[^a-z0-9_]/gi,"_");
-  return "ev-" + m;
-}
-
-// ── node tabs ────────────────────────────────────────────────────────────────
-function renderNodeTabs(nodes, now){
-  const wrap = $("#nodeTabs");
-  const existing = new Set([...wrap.querySelectorAll(".ntab")].map(b => b.dataset.role));
-  const incoming = new Set(ROLES.filter(r => r in nodes));
-
-  // add new
-  for(const role of ROLES){
-    if(!(role in nodes)) continue;
-    if(!existing.has(role)){
-      const b = document.createElement("button");
-      b.className = "ntab";
-      b.dataset.role = role;
-      b.textContent = role;
-      b.onclick = () => { selectedNode = role; renderCtrGrid(latestNodes); };
-      wrap.appendChild(b);
-    }
-    const b = wrap.querySelector(`[data-role="${role}"]`);
-    if(b){
-      const st = statusOf(role, nodes[role], now);
-      b.className = "ntab st-" + st + (selectedNode === role ? " active" : "");
-    }
-  }
-}
-
-function renderCtrGrid(nodes){
-  const n = nodes[selectedNode];
-  const c = (n && !n.error && n.counters) || {};
-  const keys = Object.keys(COUNTER_LABELS);
-  $("#ctrMeta").textContent = selectedNode;
-  $("#ctrGrid").innerHTML = keys.map(k => {
-    const v = num(c[k]);
-    return `<div class="ctr">
-      <div class="ck">${COUNTER_LABELS[k]}</div>
-      <div class="cv">${v === null ? '<span class="zero">—</span>' : v === 0 ? '<span class="zero">0</span>' : v}</div>
-    </div>`;
-  }).join("");
-}
-
-// ── main render ───────────────────────────────────────────────────────────────
-function render(data){
-  const nodes = data.nodes || {};
-  const now   = Date.now() / 1000;
-  latestNodes = nodes;
-
-  const agg = {
-    live:0, f30:0, f120:0, online:0, total:0,
-    flash:0, panther:0, lantern:0, deadass:0,
-    passRate:0, evicted:0, raw:0,
+  es.onmessage = e => {
+    try {
+      const data = JSON.parse(e.data);
+      ingest(data);
+    } catch(_) {}
   };
-  const activities = [];
-  const rows = [];
-
-  for(const role of ROLES){
-    if(!(role in nodes)) continue;
-    agg.total++;
-
-    const n   = nodes[role];
-    const bad = !n || n.error;
-    const c   = (n && n.counters) || {};
-    const f   = (n && n.free)     || {};
-
-    let rate = 0;
-    if(!bad){
-      agg.online++;
-      const sig = JSON.stringify(c);
-      const p   = prev[role];
-      if(!p || p.sig !== sig) lastChange[role] = now;
-
-      if(p && now > p.t){
-        const d  = passTotal(c) - p.pass;
-        const dt = now - p.t;
-        if(d > 0 && dt > 0) rate = d / dt;
-      }
-      prev[role] = { sig, t: now, pass: passTotal(c), counters: c };
-
-      agg.passRate += rate;
-      agg.evicted  += (c.evicted  || 0);
-      agg.raw      += (c.raw_fetched || 0);
-
-      if(role === "pool"){
-        agg.live    = f.live       || 0;
-        agg.f30     = f.fresh_30s  || 0;
-        agg.f120    = f.fresh_120s || 0;
-        agg.flash   = f.flash      || 0;
-        agg.panther = f.panther    || 0;
-        agg.lantern = f.lantern    || 0;
-        agg.deadass = f.deadass    || 0;
-      }
-      if(Array.isArray(n.activity)){
-        for(const a of n.activity){
-          activities.push({ ...a, role: a.role || role });
-        }
-      }
-    }
-
-    const st = statusOf(role, n, now);
-    rows.push(
-      `<tr class="${st}">
-        <td class="role">${role}</td>
-        <td><span class="st"><span class="dot"></span>${st}</span></td>
-        <td>${cell(f.live)}</td>
-        <td>${cell(f.fresh_30s)}</td>
-        <td>${cell(f.flash)}</td>
-        <td>${cell(f.panther)}</td>
-        <td>${cell(c.raw_fetched)}</td>
-        <td>${rate > 0 ? rate.toFixed(1) : '<span class="zero">0</span>'}</td>
-        <td>${cell(c.evicted)}</td>
-      </tr>`
-    );
-  }
-
-  // ── connection indicator ──
-  const online = agg.online > 0;
-  $("#conn").className = "live " + (online ? "on" : "off");
-  $("#conn").lastElementChild.textContent = online
-    ? `connected · ${agg.online}/${agg.total}`
-    : "disconnected";
-
-  // ── summary cards ──
-  const CARDS = [
-    { k:"Live proxies", v:agg.live,    cls:"ok-card" },
-    { k:"Fresh ≤30s",   v:agg.f30,     cls:"" },
-    { k:"Fresh ≤120s",  v:agg.f120,    cls:"" },
-    { k:"Online nodes", v:`${agg.online}<small>/${agg.total}</small>`, cls:"" },
-    { k:"Flash",        v:agg.flash,   cls:"accent-card" },
-    { k:"Panther",      v:agg.panther, cls:"" },
-    { k:"Raw fetched",  v:agg.raw,     cls:"" },
-    { k:"Pass/s",       v:agg.passRate > 0 ? agg.passRate.toFixed(1) : "0", cls:"" },
-  ];
-  $("#cards").innerHTML = CARDS.map(c =>
-    `<div class="card ${c.cls}">
-      <div class="k">${c.k}</div>
-      <div class="v">${c.v}</div>
-    </div>`
-  ).join("");
-
-  // ── agents table ──
-  $("#agents").innerHTML = rows.length
-    ? rows.join("")
-    : '<tr><td colspan="9" class="empty">no nodes reachable yet…</td></tr>';
-  $("#agentsMeta").textContent = agg.passRate > 0
-    ? `${agg.passRate.toFixed(1)} pass/s fleet-wide`
-    : "idle";
-
-  // ── labels ──
-  const lc  = { flash:agg.flash, panther:agg.panther, lantern:agg.lantern, deadass:agg.deadass };
-  const max = Math.max(1, agg.flash, agg.panther, agg.lantern, agg.deadass);
-  $("#labels").innerHTML = LABEL_INFO.map(([k, meaning]) => {
-    const v = lc[k] || 0;
-    const w = Math.round((v / max) * 100);
-    return `<tr>
-      <td><span class="pill ${k}">${k}</span></td>
-      <td>${cell(v)}</td>
-      <td class="muted">${meaning}</td>
-      <td>
-        <div class="bar" style="position:relative">
-          <i style="width:${w}%"></i>
-        </div>
-      </td>
-    </tr>`;
-  }).join("");
-  $("#poolMeta").textContent = agg.live ? `${agg.live} total` : "";
-
-  // ── node tabs + counters ──
-  renderNodeTabs(nodes, now);
-  renderCtrGrid(nodes);
-
-  // ── activity feed ──
-  activities.sort((a, b) => (b.ts || 0) - (a.ts || 0));
-  const top = activities.slice(0, 100);
-  $("#feed").innerHTML = top.length
-    ? top.map(a =>
-        `<div class="row ${evClass(a.event)}">
-          <span class="t">${hhmmss(a.ts || 0)}</span>
-          <span class="e">${a.event || ""}</span>
-          <span class="d">${a.role ? a.role + " · " : ""}${a.detail || ""}</span>
-        </div>`
-      ).join("")
-    : '<div class="empty">no recent activity</div>';
-  $("#feedMeta").textContent = top.length ? `${top.length} events` : "";
-}
-
-// ── SSE connection — hits /stream/stats on the dashboard role ─────────────────
-let es = null;
-
-function connect(){
-  if(es){ try{ es.close(); }catch(_){} }
-  es = new EventSource("/stream/stats");
 
   es.onopen = () => {
-    $("#conn").className = "live on";
+    document.getElementById('banner').classList.remove('show');
+    document.getElementById('dot').classList.add('live');
   };
+
   es.onerror = () => {
-    $("#conn").className = "live off";
-    $("#conn").lastElementChild.textContent = "reconnecting…";
+    document.getElementById('banner').classList.add('show');
+    document.getElementById('dot').classList.remove('live');
+    es.close();
+    setTimeout(connect, 3000);
   };
-  es.onmessage = (e) => {
-    let data;
-    try{ data = JSON.parse(e.data); }catch(_){ return; }
-    if(data && data.nodes) render(data);
-  };
+}
+
+function ingest(data) {
+  lastTs = data.ts || Date.now()/1000;
+  document.getElementById('hdr-ts').textContent = new Date(lastTs*1000).toLocaleTimeString();
+
+  // dashboard mode — data.nodes is a map of role → stats
+  const nodes = data.nodes || {};
+
+  // pool
+  const poolNode = nodes['pool'] || (data.role === 'pool' ? data : null);
+  if (poolNode && !poolNode.error) {
+    poolData = poolNode;
+    renderPool(poolNode);
+  }
+
+  // checkers
+  ROLES.forEach(({role, agent}) => {
+    const nd = nodes[role] || (data.role === role ? data : null);
+    if (!nd) return;
+    store[role] = { counters: nd.counters || {}, queues: nd.queues || {}, ts: lastTs, ok: !nd.error, agent };
+  });
+
+  renderCheckers();
+  renderPipeline();
+  renderLog(poolNode);
+}
+
+// ── pool render ──────────────────────────────────────────────────────────────
+function renderPool(d) {
+  const f  = d.free || {};
+  const cn = d.counters || {};
+  const live = f.live || 0;
+
+  set('pool-live',         live);
+  set('pool-f30',          f.fresh_30s  || 0);
+  set('pool-f120',         f.fresh_120s || 0);
+  set('pool-evicted',      cn.pool_evicted || 0);
+  set('pool-picks',        cn.pool_picks   || 0);
+  set('pool-recheck-pass', cn.recheck_pass || 0);
+  set('pool-recheck-fail', cn.recheck_fail || 0);
+
+  set('cnt-flash',   f.flash   || 0);
+  set('cnt-panther', f.panther || 0);
+  set('cnt-lantern', f.lantern || 0);
+  set('cnt-deadass', f.deadass || 0);
+
+  set('hdr-live',  live);
+  set('hdr-fresh', f.fresh_30s || 0);
+  set('hdr-picks', cn.pool_picks || 0);
+
+  const pct = n => live > 0 ? Math.min(100, Math.round((n/live)*100)) : 0;
+  const fl  = pct(f.flash   || 0);
+  const pa  = pct(f.panther || 0);
+  const la  = pct(f.lantern || 0);
+  bar('bar-flash',   'pct-flash',   fl);
+  bar('bar-panther', 'pct-panther', pa);
+  bar('bar-lantern', 'pct-lantern', la);
+}
+
+// ── pipeline render ──────────────────────────────────────────────────────────
+function renderPipeline() {
+  let fetched = 0, checked = 0, passed = 0, failed = 0, commits = 0, cycles = 0, outbuf = 0, checkq = 0;
+
+  ROLES.forEach(({role}) => {
+    const s = store[role];
+    if (!s) return;
+    const c = s.counters;
+    const passSum = (c.check_pass_flash||0)+(c.check_pass_panther||0)+(c.check_pass_lantern||0)+(c.check_pass_deadass||0);
+    const failSum = c.check_fail || 0;
+    passed  += passSum;
+    failed  += failSum;
+    checked += passSum + failSum;
+    commits += c.commits_detected || 0;
+    cycles  += c.cycle_fetches    || 0;
+    outbuf  += s.queues.outbuf    || 0;
+    checkq  += s.queues.check     || 0;
+  });
+
+  // fetched = checked (we don't track raw fetch separately per node in counters)
+  fetched = checked;
+
+  set('p-fetched', fmt(fetched));
+  set('p-checked', fmt(checked));
+  set('p-passed',  fmt(passed));
+  set('p-failed',  fmt(failed));
+  set('p-commits', commits);
+  set('p-cycles',  cycles);
+  set('p-outbuf',  outbuf);
+  set('p-checkq',  checkq);
+
+  const rate = checked > 0 ? Math.round((passed/checked)*100) : 0;
+  set('pass-rate-pct', rate + '%');
+  bar('bar-passrate', null, rate);
+}
+
+// ── checker cards render ─────────────────────────────────────────────────────
+function renderCheckers() {
+  const grid = document.getElementById('checker-grid');
+
+  ROLES.forEach(({role, agent}) => {
+    const s   = store[role];
+    let card  = document.getElementById(`cc-${role}`);
+
+    if (!card) {
+      card = document.createElement('div');
+      card.className = 'checker-card';
+      card.id = `cc-${role}`;
+      card.innerHTML = `
+        <div class="checker-top">
+          <div class="checker-name">${agent}</div>
+          <div class="checker-role">${role}</div>
+          <div class="checker-status idle" id="cs-${role}">idle</div>
+        </div>
+        <div class="checker-progress">
+          <div class="checker-nums">
+            <div>passed <span id="cp-pass-${role}">—</span></div>
+            <div>failed <span id="cp-fail-${role}">—</span></div>
+            <div>q <span id="cp-q-${role}">—</span></div>
+          </div>
+          <div class="checker-bar-wrap">
+            <div class="checker-bar-fill" id="cb-${role}" style="width:0%"></div>
+          </div>
+        </div>
+        <div class="checker-nums" style="margin-top:4px;">
+          <div>commits <span id="cp-commit-${role}">0</span></div>
+          <div>cycles  <span id="cp-cycle-${role}">0</span></div>
+          <div>outbuf  <span id="cp-obuf-${role}">0</span></div>
+        </div>
+      `;
+      grid.appendChild(card);
+    }
+
+    if (!s) return;
+
+    const c     = s.counters;
+    const passS = (c.check_pass_flash||0)+(c.check_pass_panther||0)+(c.check_pass_lantern||0)+(c.check_pass_deadass||0);
+    const failS = c.check_fail || 0;
+    const total = passS + failS;
+    const pct   = total > 0 ? Math.min(100, Math.round((passS/total)*100)) : 0;
+    const age   = lastTs - (s.ts || 0);
+
+    const statusEl = document.getElementById(`cs-${role}`);
+    if (age > 20) {
+      statusEl.textContent = 'offline';
+      statusEl.className   = 'checker-status err';
+    } else {
+      statusEl.textContent = 'live';
+      statusEl.className   = 'checker-status ok';
+    }
+
+    set(`cp-pass-${role}`,   fmt(passS));
+    set(`cp-fail-${role}`,   fmt(failS));
+    set(`cp-q-${role}`,      s.queues.check || 0);
+    set(`cp-commit-${role}`, c.commits_detected || 0);
+    set(`cp-cycle-${role}`,  c.cycle_fetches    || 0);
+    set(`cp-obuf-${role}`,   s.queues.outbuf    || 0);
+
+    const fill = document.getElementById(`cb-${role}`);
+    if (fill) fill.style.width = pct + '%';
+  });
+}
+
+// ── log render ───────────────────────────────────────────────────────────────
+const LOG_MAX = 200;
+const logEl   = document.getElementById('log');
+
+function renderLog(poolNode) {
+  if (!poolNode || !poolNode.activity) return;
+  const acts = poolNode.activity || [];
+
+  // clear and rebuild (simple — pool sends latest 50 each tick)
+  logEl.innerHTML = '';
+  acts.slice(0, 80).forEach(a => {
+    const div = document.createElement('div');
+    div.className = `log-entry ${a.event}`;
+    const t = new Date(a.ts * 1000);
+    const ts = t.toLocaleTimeString('en', {hour12: false, hour:'2-digit', minute:'2-digit', second:'2-digit'});
+    div.innerHTML = `
+      <div class="log-ts">${ts}</div>
+      <div class="log-role">${a.role || ''}</div>
+      <div class="log-event">${a.event || ''}</div>
+      <div class="log-detail">${a.detail || ''}</div>
+    `;
+    logEl.appendChild(div);
+  });
+}
+
+// ── utils ────────────────────────────────────────────────────────────────────
+function set(id, val) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = val;
+}
+
+function bar(barId, pctId, pct) {
+  const b = document.getElementById(barId);
+  if (b) b.style.width = pct + '%';
+  if (pctId) set(pctId, pct + '%');
+}
+
+function fmt(n) {
+  if (n >= 1_000_000) return (n/1_000_000).toFixed(1) + 'M';
+  if (n >= 1_000)     return (n/1_000).toFixed(1) + 'k';
+  return n;
 }
 
 connect();
-
-// reconnect if SSE dies
-setInterval(() => {
-  if(!es || es.readyState === EventSource.CLOSED) connect();
-}, 5000);
-
-// clock tick
-setInterval(() => {
-  $("#clock").textContent = new Date().toTimeString().slice(0,8);
-}, 1000);
 </script>
 </body>
 </html>
