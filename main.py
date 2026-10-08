@@ -109,8 +109,8 @@ KEYS_FILE    = BASE / "keys.json"
 # ═══════════════════════════════════════════════════════════════════════════════
 # TUNING
 # ═══════════════════════════════════════════════════════════════════════════════
-BOOT_FETCH_COUNT    = 700      # proxies to fetch on boot
-COMMIT_FETCH_COUNT  = 2000    # proxies to fetch per new commit
+BOOT_FETCH_COUNT    = 500      # proxies to fetch on boot
+COMMIT_FETCH_COUNT  = 1000     # proxies to fetch per new commit
 CYCLE_FETCH_COUNT   = 500      # proxies per normal cycle
 COMMIT_POLL_S       = 60       # how often to poll for new commits
 CHECK_CONCURRENCY   = 150      # concurrent meesho checks per checker
@@ -121,14 +121,19 @@ INGEST_BATCH_SIZE   = 100
 INGEST_INTERVAL_S   = 1.0
 
 # pool tuning
-POOL_RECHECK_INTERVAL_S = 480   # 8min between recheck passes
-POOL_RECHECK_MIN_AGE_S  = 300   # only recheck proxies older than 5min
-POOL_RECHECK_BATCH      = 80    # max per recheck pass
-POOL_TTL_S              = 900   # 15min hard evict
-POOL_COOLDOWN_S         = 8     # min seconds between picks of same proxy
+POOL_RECHECK_INTERVAL_S = 480
+POOL_RECHECK_MIN_AGE_S  = 300
+POOL_RECHECK_BATCH      = 80
+POOL_TTL_S              = 900
+POOL_COOLDOWN_S         = 8
+
+# request freshness tuning
+PICK_WAIT_S          = 2.0
+PICK_FAST_MAX_S      = 4.0
+PICK_FALLBACK_COUNT  = 10
+
 SNAP_INTERVAL_S         = 2
 PERSIST_INTERVAL_S      = 60
-
 # latency categories
 CAT_FLASH   = 3.0
 CAT_PANTHER = 5.0
@@ -760,31 +765,126 @@ def _evict(addr: str, reason: str = "dead"):
     with _used_lock:
         _last_used.pop(addr, None)
 
+
+
 def _pick(purpose: str = "backend", caller: str = "unknown") -> dict:
+    # Mark the beginning of this request's 2-second observation window.
+    window_start = time.time()
+
+    # Wait so we can capture the freshest proxy that arrives during
+    # this exact window.
+    time.sleep(PICK_WAIT_S)
+
     now = time.time()
-    with _snap_lock:
-        pool = _snap_fresh30 or _snap_fresh120
-        if not pool:
-            return {}
-        addr = random.choice(pool)
-        with _used_lock:
-            if now - _last_used.get(addr, 0) < POOL_COOLDOWN_S:
-                for _ in range(6):
-                    alt = random.choice(pool)
-                    if now - _last_used.get(alt, 0) >= POOL_COOLDOWN_S:
-                        addr = alt
-                        break
+
+    with _proxies_lock:
+        items = list(_proxies.items())
+
+    if not items:
+        return {}
+
+    # ─────────────────────────────────────────────────────────────
+    # 1. Proxies promoted/checked during THIS 2-second window
+    # ─────────────────────────────────────────────────────────────
+    window_candidates = []
+
+    for addr, rec in items:
+        checked_at = rec.get("last_checked", 0)
+        latency_ms = rec.get("latency_ms", 0)
+
+        if window_start <= checked_at <= now:
+            latency_s = latency_ms / 1000.0
+
+            # Only accept a fresh proxy if it was <4 seconds.
+            if 0 < latency_s < PICK_FAST_MAX_S:
+                window_candidates.append(
+                    (checked_at, addr, rec)
+                )
+
+    # Newest successful proxy from the 2-second window.
+    if window_candidates:
+        _, addr, rec = max(
+            window_candidates,
+            key=lambda x: x[0]
+        )
+
         with _used_lock:
             _last_used[addr] = now
+
+        with _proxies_lock:
+            current = _proxies.get(addr)
+            if current:
+                current["next_check"] = now + POOL_RECHECK_MIN_AGE_S
+
+        _inc("pool_picks")
+        _inc(f"pool_picks_by_{caller}")
+        _inc("pool_picks_fresh_window")
+
+        _log(
+            "pick_fresh_window",
+            f"{addr} latency={rec.get('latency_ms', 0)/1000:.2f}s "
+            f"caller={caller} purpose={purpose}"
+        )
+
+        return {
+            "http": f"http://{addr}",
+            "https": f"http://{addr}",
+            "addr": addr,
+        }
+
+    # ─────────────────────────────────────────────────────────────
+    # 2. No suitable proxy arrived during the 2-second window.
+    #    Fallback → freshest 10 LIVE proxies.
+    # ─────────────────────────────────────────────────────────────
+    live_sorted = sorted(
+        items,
+        key=lambda x: x[1].get("last_checked", 0),
+        reverse=True,
+    )
+
+    latest_10 = live_sorted[:PICK_FALLBACK_COUNT]
+
+    if not latest_10:
+        return {}
+
+    # Prefer a proxy that isn't inside cooldown.
+    available = []
+
+    with _used_lock:
+        for addr, rec in latest_10:
+            if now - _last_used.get(addr, 0) >= POOL_COOLDOWN_S:
+                available.append((addr, rec))
+
+    if available:
+        addr, rec = available[0]
+    else:
+        # Everything in the latest 10 is on cooldown.
+        # Still use the freshest one.
+        addr, rec = latest_10[0]
+
+    with _used_lock:
+        _last_used[addr] = now
+
     with _proxies_lock:
-        r = _proxies.get(addr)
-        if r:
-            r["next_check"] = now + POOL_RECHECK_MIN_AGE_S
+        current = _proxies.get(addr)
+        if current:
+            current["next_check"] = now + POOL_RECHECK_MIN_AGE_S
+
     _inc("pool_picks")
     _inc(f"pool_picks_by_{caller}")
-    _log("pick_served", f"{addr} caller={caller} purpose={purpose}")
-    return {"http": f"http://{addr}", "https": f"http://{addr}", "addr": addr}
+    _inc("pool_picks_fallback")
 
+    _log(
+        "pick_fallback",
+        f"{addr} latency={rec.get('latency_ms', 0)/1000:.2f}s "
+        f"caller={caller} purpose={purpose}"
+    )
+
+    return {
+        "http": f"http://{addr}",
+        "https": f"http://{addr}",
+        "addr": addr,
+    }
 def mark_dead(addr: str):
     addr = addr.replace("http://", "").replace("https://", "").split("/")[0]
     _evict(addr, "dead (reported)")
