@@ -48,7 +48,7 @@ import aiohttp
 import requests
 import urllib3
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -84,38 +84,6 @@ PEERS = {
 CHECKER_ROLES = [f"checker_{i}" for i in range(1, 11)]
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CALLER IDENTIFICATION
-# ═══════════════════════════════════════════════════════════════════════════════
-# Maps source port → human label. Add any new script port here.
-CALLER_PORT_MAP: dict[int, str] = {
-    8001: "MesoWebBackend",
-    8090: "pinger_dashboard",
-    8080: "proxystack-internal",
-}
-
-# Whitelist — only these ports may call /pick, /request, /ingest, /dead.
-# Set to None to disable whitelist (allow all with valid secret).
-ALLOWED_CALLER_PORTS: set[int] | None = {8001, 8090, 8080}
-
-def _identify_caller(request: Request) -> str:
-    """Return a human-readable label for whoever is calling."""
-    if request.client is None:
-        return "unknown"
-    port = request.client.port
-    return CALLER_PORT_MAP.get(port, f"unknown:{port}")
-
-def _enforce_whitelist(request: Request):
-    """Raise 403 if caller port is not in ALLOWED_CALLER_PORTS."""
-    if ALLOWED_CALLER_PORTS is None:
-        return
-    if request.client is None:
-        raise HTTPException(403, "no client info")
-    port = request.client.port
-    if port not in ALLOWED_CALLER_PORTS:
-        label = CALLER_PORT_MAP.get(port, f"port:{port}")
-        raise HTTPException(403, f"caller not whitelisted: {label}")
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # PATHS
 # ═══════════════════════════════════════════════════════════════════════════════
 BASE         = Path(__file__).parent
@@ -126,25 +94,27 @@ KEYS_FILE    = BASE / "keys.json"
 # ═══════════════════════════════════════════════════════════════════════════════
 # TUNING
 # ═══════════════════════════════════════════════════════════════════════════════
-BOOT_FETCH_COUNT    = 500
-COMMIT_FETCH_COUNT  = 1000
-CYCLE_FETCH_COUNT   = 500
-COMMIT_POLL_S       = 60
-CHECK_CONCURRENCY   = 150
-CHECK_TIMEOUT_S     = 12
-FETCH_WORKERS       = 20
-SEEN_TTL_S          = 3600
+BOOT_FETCH_COUNT    = 500      # proxies to fetch on boot
+COMMIT_FETCH_COUNT  = 1000     # proxies to fetch per new commit
+CYCLE_FETCH_COUNT   = 500      # proxies per normal cycle
+COMMIT_POLL_S       = 60       # how often to poll for new commits
+CHECK_CONCURRENCY   = 150      # concurrent meesho checks per checker
+CHECK_TIMEOUT_S     = 12       # meesho check timeout
+FETCH_WORKERS       = 20       # concurrent source fetchers
+SEEN_TTL_S          = 3600     # 1hr — don't recheck same proxy in cycle
 INGEST_BATCH_SIZE   = 100
 INGEST_INTERVAL_S   = 1.0
 
-POOL_RECHECK_INTERVAL_S = 480
-POOL_RECHECK_MIN_AGE_S  = 300
-POOL_RECHECK_BATCH      = 80
-POOL_TTL_S              = 900
-POOL_COOLDOWN_S         = 8
+# pool tuning
+POOL_RECHECK_INTERVAL_S = 480   # 8min between recheck passes
+POOL_RECHECK_MIN_AGE_S  = 300   # only recheck proxies older than 5min
+POOL_RECHECK_BATCH      = 80    # max per recheck pass
+POOL_TTL_S              = 900   # 15min hard evict
+POOL_COOLDOWN_S         = 8     # min seconds between picks of same proxy
 SNAP_INTERVAL_S         = 2
 PERSIST_INTERVAL_S      = 60
 
+# latency categories
 CAT_FLASH   = 3.0
 CAT_PANTHER = 5.0
 CAT_LANTERN = 7.0
@@ -153,11 +123,12 @@ CAT_DEAD    = 10.0
 FRESH_HOT_S  = 30
 FRESH_COLD_S = 120
 
+# paid
 MEESHO_API  = "https://prod.meeshoapi.com"
 MEESHO_AUTH = "32c4d8137cn9eb493a1921f203173080"
 APP_ID      = "com.meesho.supply"
 
-STICKY_TTL_S  = 90
+STICKY_TTL_S = 90
 PING_INTERVAL = 240
 
 FOD_HUNT_PATHS = (
@@ -222,21 +193,32 @@ ALL_GITHUB_REPOS = [
 ]
 
 ALL_HTTP_SOURCES = [
+    # proxyscrape — global, by quality tier (not country)
     "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=ipport&format=text",
     "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=ipport&format=text&anonymity=elite",
     "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=ipport&format=text&anonymity=anonymous",
+    # proxy-list.download — global http + https
     "https://www.proxy-list.download/api/v1/get?type=http",
     "https://www.proxy-list.download/api/v1/get?type=https",
+    # openproxylist
     "https://api.openproxylist.xyz/http.txt",
+    # proxyspace
     "https://proxyspace.pro/http.txt",
     "https://proxyspace.pro/https.txt",
+    # proxyscan
     "https://proxyscan.io/download?type=http",
+    # spys
     "https://spys.me/proxy.txt",
+    # multiproxy
     "https://multiproxy.org/txt_all/proxy.txt",
+    # freeproxychecker
     "https://www.freeproxychecker.com/result/http_proxies.txt",
+    # jsdelivr mirrors — updated every 5min
     "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/protocols/http/data.txt",
     "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt",
+    # sockslist global
     "https://sockslist.us/Api?request=display&country=all&level=all&token=free",
+    # pubproxy
     "http://pubproxy.com/api/proxy?limit=20&format=txt&type=http",
 ]
 
@@ -253,14 +235,17 @@ HTML_SOURCES = [
     "https://free-proxy-list.net/anonymous-proxy.html",
 ]
 
+# ── Split sources across 10 checkers ─────────────────────────────────────────
 def _split_sources(lst: list, n: int, idx: int) -> list:
+    """Give checker idx (0-based) its slice of lst split into n parts."""
     chunk = len(lst) // n
     start = idx * chunk
     end   = start + chunk if idx < n - 1 else len(lst)
     return lst[start:end]
 
 def _get_my_sources():
-    idx = int(ROLE.split("_")[1]) - 1
+    """Returns (github_repos, http_sources, geonode_pages, html_sources) for this checker."""
+    idx = int(ROLE.split("_")[1]) - 1   # checker_1 → 0, checker_10 → 9
     n   = 10
     return (
         _split_sources(ALL_GITHUB_REPOS, n, idx),
@@ -277,6 +262,7 @@ _IP_PORT = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})\b")
 def _parse(text: str) -> list[str]:
     return [m.group(0) for m in _IP_PORT.finditer(text)]
 
+# ── Proxy live store (pool role) ──────────────────────────────────────────────
 _proxies_lock = threading.Lock()
 _proxies: dict[str, dict] = {}
 
@@ -294,34 +280,44 @@ _paid_proxies: dict[str, dict] = {}
 _keys_lock = threading.Lock()
 _keys: list[dict] = []
 
+# ── Seen dedup (per checker instance) ────────────────────────────────────────
 _seen_lock = threading.Lock()
 _seen: dict[str, float] = {}
 
+# ── Outbound buffer (checker → pool) ─────────────────────────────────────────
 _outbuf_lock = threading.Lock()
-_outbuf: list[tuple[str, float]] = []
+_outbuf: list[tuple[str, float]] = []   # (addr, latency_s)
 
+# ── Counters ──────────────────────────────────────────────────────────────────
 _counter_lock = threading.Lock()
 _counters: dict[str, int] = defaultdict(int)
 
+# ── Activity log ─────────────────────────────────────────────────────────────
 _activity_lock = threading.Lock()
 _activity_log: list[dict] = []
 ACTIVITY_MAX = 200
 
+# ── Persist ───────────────────────────────────────────────────────────────────
 _persist_event = threading.Event()
 
+# ── SHA cache (commit watcher) ────────────────────────────────────────────────
 _sha_lock  = threading.Lock()
 _repo_sha: dict[str, str] = {}
 
+# ── Etag cache (http sources) ─────────────────────────────────────────────────
 _etag_lock = threading.Lock()
 _http_etag: dict[str, str] = {}
 _http_lmod: dict[str, str] = {}
 
+# ── Async check queue ─────────────────────────────────────────────────────────
 _check_queue: asyncio.Queue = None
 _check_loop:  asyncio.AbstractEventLoop = None
 
+# ── Sticky sessions (vps) ─────────────────────────────────────────────────────
 _sticky_lock = threading.Lock()
 _sticky: dict[str, tuple] = {}
 
+# ── API executors ─────────────────────────────────────────────────────────────
 _api_executor     = ThreadPoolExecutor(max_workers=8,  thread_name_prefix="api")
 _backend_executor = ThreadPoolExecutor(max_workers=24, thread_name_prefix="backend")
 
@@ -384,6 +380,7 @@ def _seen_dup(addr: str) -> bool:
         if t is not None and now - t < SEEN_TTL_S:
             return True
         _seen[addr] = now
+        # prune stale entries every ~10k inserts
         if len(_seen) > 50_000:
             for k, v in list(_seen.items()):
                 if now - v >= SEEN_TTL_S:
@@ -415,6 +412,7 @@ def _sticky_key(headers) -> str:
 # SOURCE FETCHERS
 # ═══════════════════════════════════════════════════════════════════════════════
 def _fetch_github_raw(owner: str, repo: str, path: str, sha: str = "main") -> list[str]:
+    """Fetch raw file from github at specific sha."""
     try:
         r = requests.get(
             f"https://raw.githubusercontent.com/{owner}/{repo}/{sha}/{path}",
@@ -428,6 +426,8 @@ def _fetch_github_raw(owner: str, repo: str, path: str, sha: str = "main") -> li
     return []
 
 def _fetch_github_latest(owner: str, repo: str, path: str) -> tuple[list[str], str]:
+    """Fetch latest proxies from github repo. Returns (proxies, sha)."""
+    key = f"{owner}/{repo}/{path}"
     try:
         r = requests.get(
             f"https://api.github.com/repos/{owner}/{repo}/commits",
@@ -448,10 +448,15 @@ def _fetch_github_latest(owner: str, repo: str, path: str) -> tuple[list[str], s
             return [], ""
     except Exception:
         return [], ""
+
     proxies = _fetch_github_raw(owner, repo, path, sha)
     return proxies, sha
 
 def _fetch_github_commit(owner: str, repo: str, path: str) -> tuple[list[str], str]:
+    """
+    Check for new commit on repo/path.
+    Returns (proxies_from_commit, new_sha) if new commit, else ([], "").
+    """
     key = f"{owner}/{repo}/{path}"
     proxies, sha = _fetch_github_latest(owner, repo, path)
     if not sha:
@@ -459,8 +464,9 @@ def _fetch_github_commit(owner: str, repo: str, path: str) -> tuple[list[str], s
     with _sha_lock:
         old_sha = _repo_sha.get(key, "")
         if sha == old_sha:
-            return [], ""
+            return [], ""          # no new commit
         _repo_sha[key] = sha
+    # cap at COMMIT_FETCH_COUNT
     return proxies[:COMMIT_FETCH_COUNT], sha
 
 def _fetch_http_url(url: str) -> list[str]:
@@ -517,6 +523,10 @@ def _fetch_checkerproxy() -> list[str]:
         return []
 
 def _bulk_fetch(repos: list, http_srcs: list, geonode: list, html: list, limit: int) -> list[str]:
+    """
+    Fetch from all assigned sources, return up to `limit` unique proxies.
+    Uses pointer-based advancement from known list on subsequent calls.
+    """
     collected: set[str] = set()
     results: list[str]  = []
 
@@ -549,7 +559,7 @@ def _bulk_fetch(repos: list, http_srcs: list, geonode: list, html: list, limit: 
     return results[:limit]
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MEESHO CHECK
+# MEESHO CHECK (the ONLY validation gate)
 # ═══════════════════════════════════════════════════════════════════════════════
 async def _meesho_check(session: aiohttp.ClientSession, addr: str) -> tuple[bool, float]:
     hdr = _meesho_headers()
@@ -589,13 +599,16 @@ def _outbuf_sender():
     while True:
         with _outbuf_lock:
             pending = len(_outbuf)
+
         sleep_s = 0.1 if pending > 50 else INGEST_INTERVAL_S
         time.sleep(sleep_s)
+
         with _outbuf_lock:
             if not _outbuf:
                 continue
             batch = list(_outbuf[:INGEST_BATCH_SIZE])
             del _outbuf[:INGEST_BATCH_SIZE]
+
         if not pool_url:
             continue
         try:
@@ -614,7 +627,7 @@ def _outbuf_sender():
                     _outbuf.insert(0, item)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ASYNC CHECK PIPELINE
+# ASYNC CHECK PIPELINE (per checker)
 # ═══════════════════════════════════════════════════════════════════════════════
 async def _checker_pipeline():
     global _check_queue
@@ -667,6 +680,7 @@ def _checker_pipeline_thread():
     _check_loop.run_until_complete(_checker_pipeline())
 
 def _enqueue(addr: str):
+    """Push addr to async check queue from any thread."""
     if _seen_dup(addr):
         return
     if _check_queue and _check_loop and not _check_loop.is_closed():
@@ -680,15 +694,18 @@ def _enqueue(addr: str):
 # ═══════════════════════════════════════════════════════════════════════════════
 def _checker_main():
     repos, http_srcs, geonode, html = _get_my_sources()
+
     print(f"[{ROLE}] sources: {len(repos)} github repos, {len(http_srcs)} http, "
           f"{len(geonode)} geonode, {len(html)} html", flush=True)
 
+    # ── BOOT: fetch latest 500 ────────────────────────────────────────────────
     print(f"[{ROLE}] boot fetch — targeting {BOOT_FETCH_COUNT} proxies", flush=True)
     boot_batch = _bulk_fetch(repos, http_srcs, geonode, html, BOOT_FETCH_COUNT)
     print(f"[{ROLE}] boot fetch got {len(boot_batch)} — queuing for check", flush=True)
     for addr in boot_batch:
         _enqueue(addr)
 
+    # init sha cache so commit watcher only catches NEW commits after boot
     def _init_sha_cache():
         for owner, repo, path in repos:
             key = f"{owner}/{repo}/{path}"
@@ -698,13 +715,16 @@ def _checker_main():
                     _repo_sha[key] = sha
     threading.Thread(target=_init_sha_cache, daemon=True, name="sha-init").start()
 
+    # ── MAIN LOOP ─────────────────────────────────────────────────────────────
     last_commit_poll = time.time()
+    # pointer tracks how far into the full source list we've fetched
     cycle_offset = BOOT_FETCH_COUNT
 
     while True:
         time.sleep(5)
         now = time.time()
 
+        # ── commit poll ───────────────────────────────────────────────────────
         if now - last_commit_poll >= COMMIT_POLL_S:
             last_commit_poll = now
             commit_found = False
@@ -717,11 +737,14 @@ def _checker_main():
                     _inc("commits_detected")
                     for addr in new_proxies:
                         _enqueue(addr)
+
             if commit_found:
                 continue
 
+        # ── normal cycle: next 500 ────────────────────────────────────────────
         q_depth = _check_queue.qsize() if _check_queue else 0
         if q_depth > 2000:
+            # queue still has plenty — don't pile on
             continue
 
         print(f"[{ROLE}] cycle fetch — offset={cycle_offset} target={CYCLE_FETCH_COUNT}", flush=True)
@@ -735,13 +758,21 @@ def _checker_main():
         print(f"[{ROLE}] cycle queued {queued} for check", flush=True)
 
 def _start_checker():
+    # pipeline first — waits until queue is ready
     t = threading.Thread(target=_checker_pipeline_thread, daemon=True, name="pipeline")
     t.start()
+
+    # wait for queue to init
     deadline = time.time() + 10
     while _check_queue is None and time.time() < deadline:
         time.sleep(0.05)
+
+    # outbound sender
     threading.Thread(target=_outbuf_sender, daemon=True, name="outbuf").start()
+
+    # main checker loop
     threading.Thread(target=_checker_main, daemon=True, name="checker").start()
+
     print(f"[{ROLE}] checker started", flush=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -776,13 +807,14 @@ def _evict(addr: str, reason: str = "dead"):
     with _used_lock:
         _last_used.pop(addr, None)
 
-def _pick(purpose: str = "backend", caller: str = "unknown") -> dict:
+def _pick(purpose: str = "backend") -> dict:
     now = time.time()
     with _snap_lock:
         pool = _snap_fresh30 or _snap_fresh120
         if not pool:
             return {}
         addr = random.choice(pool)
+        # try to avoid recently used
         with _used_lock:
             if now - _last_used.get(addr, 0) < POOL_COOLDOWN_S:
                 for _ in range(6):
@@ -797,8 +829,7 @@ def _pick(purpose: str = "backend", caller: str = "unknown") -> dict:
         if r:
             r["next_check"] = now + POOL_RECHECK_MIN_AGE_S
     _inc("pool_picks")
-    _inc(f"pool_picks_by_{caller}")
-    _log("pick_served", f"{addr} caller={caller} purpose={purpose}")
+    _log("pick_served", addr)
     return {"http": f"http://{addr}", "https": f"http://{addr}", "addr": addr}
 
 def mark_dead(addr: str):
@@ -833,6 +864,7 @@ def _snapshot_worker():
         time.sleep(SNAP_INTERVAL_S)
 
 async def _pool_recheck_worker():
+    """Periodically recheck proxies older than POOL_RECHECK_MIN_AGE_S via meesho."""
     connector = aiohttp.TCPConnector(limit=POOL_RECHECK_BATCH + 10, ttl_dns_cache=300)
     sem = asyncio.Semaphore(POOL_RECHECK_BATCH)
 
@@ -849,6 +881,7 @@ async def _pool_recheck_worker():
             batch = due[:POOL_RECHECK_BATCH]
             if not batch:
                 continue
+
             print(f"[pool] recheck {len(batch)} proxies", flush=True)
 
             async def _check_one(addr):
@@ -1064,6 +1097,7 @@ def _load_free():
         rows = data.items() if isinstance(data, dict) else [(a, {}) for a in data]
         with _proxies_lock:
             for addr, r in rows:
+                # skip if too old to trust
                 if now - r.get("received_at", 0) > POOL_TTL_S:
                     continue
                 _proxies[addr] = {
@@ -1139,27 +1173,19 @@ def _get_stats() -> dict:
     with _activity_lock: acts = list(reversed(_activity_log))
     q_depth = _check_queue.qsize() if _check_queue else 0
 
-    # build per-caller pick counts from dynamic counter keys
-    caller_picks = {
-        k[len("pool_picks_by_"):]: v
-        for k, v in cnts.items()
-        if k.startswith("pool_picks_by_")
-    }
-
     return {
-        "role":         ROLE,
-        "counters":     cnts,
-        "caller_picks": caller_picks,
-        "activity":     acts[:50],
-        "queues":       {"check": q_depth, "outbuf": obuf},
+        "role":     ROLE,
+        "counters": cnts,
+        "activity": acts[:50],
+        "queues":   {"check": q_depth, "outbuf": obuf},
         "free": {
-            "live":       live,
-            "fresh_30s":  f30,
+            "live":      live,
+            "fresh_30s": f30,
             "fresh_120s": f120,
-            "flash":      labs["flash"],
-            "panther":    labs["panther"],
-            "lantern":    labs["lantern"],
-            "deadass":    labs["deadass"],
+            "flash":     labs["flash"],
+            "panther":   labs["panther"],
+            "lantern":   labs["lantern"],
+            "deadass":   labs["deadass"],
         },
         "paid":  {"total": p_total, "alive": p_alive},
         "peers": {role: url for role, url in PEERS.items()},
@@ -1182,12 +1208,16 @@ async def _startup():
         deadline = time.time() + 10
         while _check_queue is None and time.time() < deadline:
             await asyncio.sleep(0.05)
+
     elif ROLE == "pool":
         _start_pool()
+
     elif ROLE == "dashboard":
         print(f"[dashboard] Yoru started", flush=True)
+
     elif ROLE == "vps":
         _start_vps()
+
     print(f"[ProxyStack v2] {ROLE} booted on port {PORT}", flush=True)
 
 @app.get("/health")
@@ -1264,16 +1294,11 @@ class IngestRequest(BaseModel):
     proxies: list[IngestItem]
 
 @app.post("/ingest")
-async def ingest(
-    req: IngestRequest,
-    request: Request,
-    x_secret: Optional[str] = Header(None),
-):
+async def ingest(req: IngestRequest, x_secret: Optional[str] = Header(None)):
     if x_secret != SHARED_SECRET:
         raise HTTPException(403, "invalid secret")
     if ROLE != "pool":
         raise HTTPException(400, f"ingest only on pool role, this is {ROLE}")
-    _enforce_whitelist(request)
     for item in req.proxies:
         _promote(item.addr, item.latency_s)
     return {"ingested": len(req.proxies)}
@@ -1281,7 +1306,6 @@ async def ingest(
 # ── Pool pick ─────────────────────────────────────────────────────────────────
 @app.get("/pick")
 async def pick_route(
-    request: Request,
     cat: str = "any",
     purpose: str = "backend",
     x_secret: Optional[str] = Header(None),
@@ -1290,10 +1314,8 @@ async def pick_route(
         raise HTTPException(403, "invalid secret")
     if ROLE != "pool":
         raise HTTPException(400, "pick only on pool role")
-    _enforce_whitelist(request)
-    caller = _identify_caller(request)
     loop = asyncio.get_event_loop()
-    p = await loop.run_in_executor(_api_executor, _pick, purpose, caller)
+    p = await loop.run_in_executor(_api_executor, _pick, purpose)
     if not p:
         raise HTTPException(503, "no live proxies available")
     return p
@@ -1303,20 +1325,15 @@ class DeadReport(BaseModel):
     addr: str
 
 @app.post("/dead")
-async def report_dead(
-    req: DeadReport,
-    request: Request,
-    x_secret: Optional[str] = Header(None),
-):
+async def report_dead(req: DeadReport, x_secret: Optional[str] = Header(None)):
     if x_secret != SHARED_SECRET:
         raise HTTPException(403, "invalid secret")
     if ROLE != "pool":
         raise HTTPException(400, "dead report only on pool role")
-    _enforce_whitelist(request)
     mark_dead(req.addr)
     return {"ok": True}
 
-# ── VPS /request ──────────────────────────────────────────────────────────────
+# ── VPS /request (unchanged contract) ────────────────────────────────────────
 class ProxyRequest(BaseModel):
     url:      str
     method:   str            = "GET"
@@ -1329,10 +1346,9 @@ class ProxyRequest(BaseModel):
     category: str            = "any"
 
 @app.post("/request")
-async def proxy_request(req: ProxyRequest, request: Request):
+async def proxy_request(req: ProxyRequest):
     if ROLE != "vps":
         raise HTTPException(400, "/request only on vps role")
-    _enforce_whitelist(request)
 
     method   = req.method.upper()
     last_err = None
@@ -1404,7 +1420,7 @@ async def proxy_request(req: ProxyRequest, request: Request):
 
     raise HTTPException(502, f"all {req.retries} attempts failed. last: {last_err}")
 
-# ── VPS key management ────────────────────────────────────────────────────────
+# ── VPS key management (unchanged) ───────────────────────────────────────────
 class AddKeyRequest(BaseModel):
     provider: str
     key:      str
