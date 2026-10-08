@@ -109,8 +109,8 @@ KEYS_FILE    = BASE / "keys.json"
 # ═══════════════════════════════════════════════════════════════════════════════
 # TUNING
 # ═══════════════════════════════════════════════════════════════════════════════
-BOOT_FETCH_COUNT    = 500      # proxies to fetch on boot
-COMMIT_FETCH_COUNT  = 1000     # proxies to fetch per new commit
+BOOT_FETCH_COUNT    = 700      # proxies to fetch on boot
+COMMIT_FETCH_COUNT  = 2000    # proxies to fetch per new commit
 CYCLE_FETCH_COUNT   = 500      # proxies per normal cycle
 COMMIT_POLL_S       = 60       # how often to poll for new commits
 CHECK_CONCURRENCY   = 150      # concurrent meesho checks per checker
