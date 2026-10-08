@@ -128,7 +128,7 @@ POOL_TTL_S              = 900
 POOL_COOLDOWN_S         = 8
 
 # request freshness tuning
-PICK_WAIT_S          = 2.0
+PICK_WAIT_S          = 0.0
 PICK_FAST_MAX_S      = 4.0
 PICK_FALLBACK_COUNT  = 10
 
@@ -156,6 +156,59 @@ FOD_HUNT_PATHS = (
     "/api/1.0/anonymous/referral-app-install",
     "/api/1.0/anonymous/fod-personalisation",
 )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SERVER-SIDE REQUEST RACING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+RACE_WAIT_S      = 2.0
+RACE_FRESH_MAX_S = 4.0
+RACE_PROXY_COUNT = 10
+
+STICKY_URL_FRAGMENTS = [
+    "/api/1.0/cart",
+    "/api/8.0/cart",
+    "/api/1.0/cart/add",
+    "/api/1.0/cart/location",
+    "/api/1.0/cart/paymentinfo",
+    "/api/3.0/order",
+    "/api/4.0/preorders",
+    "/api/2.0/orders",
+    "/api/3.0/user/orders",
+    "/api/3.0/user/order-details",
+    "/api/3.0/addresses",
+    "/api/2.0/addresses",
+    "/api/1.0/user/delivery-location",
+    "/api/1.0/suborders/ratings/pending",
+]
+
+RACEABLE_URL_FRAGMENTS = [
+    "/api/3.0/search/suggest",
+    "/api/3.0/anonymous/search/suggest",
+    "/api/1.0/widget-groups/fetch",
+    "/api/1.0/anonymous/widget-groups/fetch",
+    "/api/3.0/product/static",
+    "/api/3.0/product/dynamic",
+    "/api/2.0/catalogs/",
+    "/api/2.0/anonymous/catalogs/",
+    "/api/1.0/catalogs/recommendations",
+    "/api/1.0/anonymous/catalogs/recommendations",
+    "/api/4.0/anonymous/for-you",
+    "/api/3.0/user/orders",
+    "/api/3.0/user/order-details",
+    "/api/1.0/anonymous/fod-personalisation",
+    "/api/1.0/anonymous/config",
+]
+
+def _is_sticky_url(url: str) -> bool:
+    return any(frag in url for frag in STICKY_URL_FRAGMENTS)
+
+def _is_raceable_url(url: str) -> bool:
+    # Sticky wins if a URL appears in both lists.
+    if _is_sticky_url(url):
+        return False
+    return any(frag in url for frag in RACEABLE_URL_FRAGMENTS)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SOURCES
@@ -768,13 +821,7 @@ def _evict(addr: str, reason: str = "dead"):
 
 
 def _pick(purpose: str = "backend", caller: str = "unknown") -> dict:
-    # Mark the beginning of this request's 2-second observation window.
-    window_start = time.time()
-
-    # Wait so we can capture the freshest proxy that arrives during
-    # this exact window.
-    time.sleep(PICK_WAIT_S)
-
+    """Pick one proxy immediately for normal/sticky requests."""
     now = time.time()
 
     with _proxies_lock:
@@ -783,84 +830,23 @@ def _pick(purpose: str = "backend", caller: str = "unknown") -> dict:
     if not items:
         return {}
 
-    # ─────────────────────────────────────────────────────────────
-    # 1. Proxies promoted/checked during THIS 2-second window
-    # ─────────────────────────────────────────────────────────────
-    window_candidates = []
-
-    for addr, rec in items:
-        checked_at = rec.get("last_checked", 0)
-        latency_ms = rec.get("latency_ms", 0)
-
-        if window_start <= checked_at <= now:
-            latency_s = latency_ms / 1000.0
-
-            # Only accept a fresh proxy if it was <4 seconds.
-            if 0 < latency_s < PICK_FAST_MAX_S:
-                window_candidates.append(
-                    (checked_at, addr, rec)
-                )
-
-    # Newest successful proxy from the 2-second window.
-    if window_candidates:
-        _, addr, rec = max(
-            window_candidates,
-            key=lambda x: x[0]
-        )
-
-        with _used_lock:
-            _last_used[addr] = now
-
-        with _proxies_lock:
-            current = _proxies.get(addr)
-            if current:
-                current["next_check"] = now + POOL_RECHECK_MIN_AGE_S
-
-        _inc("pool_picks")
-        _inc(f"pool_picks_by_{caller}")
-        _inc("pool_picks_fresh_window")
-
-        _log(
-            "pick_fresh_window",
-            f"{addr} latency={rec.get('latency_ms', 0)/1000:.2f}s "
-            f"caller={caller} purpose={purpose}"
-        )
-
-        return {
-            "http": f"http://{addr}",
-            "https": f"http://{addr}",
-            "addr": addr,
-        }
-
-    # ─────────────────────────────────────────────────────────────
-    # 2. No suitable proxy arrived during the 2-second window.
-    #    Fallback → freshest 10 LIVE proxies.
-    # ─────────────────────────────────────────────────────────────
     live_sorted = sorted(
         items,
         key=lambda x: x[1].get("last_checked", 0),
         reverse=True,
     )
 
-    latest_10 = live_sorted[:PICK_FALLBACK_COUNT]
-
-    if not latest_10:
-        return {}
-
-    # Prefer a proxy that isn't inside cooldown.
-    available = []
-
+    selected = None
     with _used_lock:
-        for addr, rec in latest_10:
+        for addr, rec in live_sorted:
             if now - _last_used.get(addr, 0) >= POOL_COOLDOWN_S:
-                available.append((addr, rec))
+                selected = (addr, rec)
+                break
 
-    if available:
-        addr, rec = available[0]
-    else:
-        # Everything in the latest 10 is on cooldown.
-        # Still use the freshest one.
-        addr, rec = latest_10[0]
+    if selected is None:
+        selected = live_sorted[0]
+
+    addr, rec = selected
 
     with _used_lock:
         _last_used[addr] = now
@@ -872,12 +858,12 @@ def _pick(purpose: str = "backend", caller: str = "unknown") -> dict:
 
     _inc("pool_picks")
     _inc(f"pool_picks_by_{caller}")
-    _inc("pool_picks_fallback")
+    _inc("pool_picks_normal")
 
     _log(
-        "pick_fallback",
+        "pick_normal",
         f"{addr} latency={rec.get('latency_ms', 0)/1000:.2f}s "
-        f"caller={caller} purpose={purpose}"
+        f"caller={caller} purpose={purpose}",
     )
 
     return {
@@ -885,6 +871,78 @@ def _pick(purpose: str = "backend", caller: str = "unknown") -> dict:
         "https": f"http://{addr}",
         "addr": addr,
     }
+
+
+def _pick_race_candidates(
+    caller: str = "unknown",
+    count: int = RACE_PROXY_COUNT,
+) -> list[dict]:
+    """Wait 2s, then return fresh-window candidates or latest 10 live proxies."""
+    window_start = time.time()
+    time.sleep(RACE_WAIT_S)
+    now = time.time()
+
+    with _proxies_lock:
+        items = list(_proxies.items())
+
+    if not items:
+        return []
+
+    fresh = []
+    for addr, rec in items:
+        checked_at = rec.get("last_checked", 0)
+        latency_s = rec.get("latency_ms", 0) / 1000.0
+
+        if window_start <= checked_at <= now and 0 < latency_s < RACE_FRESH_MAX_S:
+            fresh.append((checked_at, addr, rec))
+
+    fresh.sort(key=lambda x: x[0], reverse=True)
+
+    if fresh:
+        selected = [(addr, rec) for _, addr, rec in fresh[:count]]
+        source = "fresh_window"
+    else:
+        selected = sorted(
+            items,
+            key=lambda x: x[1].get("last_checked", 0),
+            reverse=True,
+        )[:count]
+        source = "latest_10"
+
+    if not selected:
+        return []
+
+    with _used_lock:
+        for addr, _ in selected:
+            _last_used[addr] = now
+
+    with _proxies_lock:
+        for addr, _ in selected:
+            current = _proxies.get(addr)
+            if current:
+                current["next_check"] = now + POOL_RECHECK_MIN_AGE_S
+
+    _inc("pool_race_sets")
+    _inc(f"pool_race_sets_{source}")
+    _inc("pool_race_candidates", len(selected))
+
+    _log(
+        "race_candidates",
+        f"source={source} count={len(selected)} caller={caller} "
+        f"addrs={','.join(a for a, _ in selected)}",
+        len(selected),
+    )
+
+    return [
+        {
+            "http": f"http://{addr}",
+            "https": f"http://{addr}",
+            "addr": addr,
+        }
+        for addr, _ in selected
+    ]
+
+
 def mark_dead(addr: str):
     addr = addr.replace("http://", "").replace("https://", "").split("/")[0]
     _evict(addr, "dead (reported)")
@@ -981,6 +1039,29 @@ def _get_proxy_from_pool(cat: str = "any", purpose: str = "backend") -> dict:
     except Exception as e:
         print(f"[vps] pool /pick failed: {e}", flush=True)
     return {}
+
+
+def _get_race_proxies_from_pool(count: int = RACE_PROXY_COUNT) -> list[dict]:
+    pool_url = PEERS.get("pool", "")
+    if not pool_url:
+        return []
+
+    try:
+        r = requests.get(
+            f"{pool_url}/pick-many",
+            params={"count": count},
+            headers={"X-Secret": SHARED_SECRET},
+            timeout=RACE_WAIT_S + 3,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            proxies = data.get("proxies", [])
+            if isinstance(proxies, list):
+                return proxies
+    except Exception as e:
+        print(f"[vps] pool /pick-many failed: {e}", flush=True)
+
+    return []
 
 def _report_dead_to_pool(addr: str):
     pool_url = PEERS.get("pool", "")
@@ -1375,6 +1456,33 @@ async def pick_route(
 class DeadReport(BaseModel):
     addr: str
 
+@app.get("/pick-many")
+async def pick_many_route(
+    request: Request,
+    count: int = RACE_PROXY_COUNT,
+    x_secret: Optional[str] = Header(None),
+):
+    if x_secret != SHARED_SECRET:
+        raise HTTPException(403, "invalid secret")
+    if ROLE != "pool":
+        raise HTTPException(400, "pick-many only on pool role")
+
+    count = max(1, min(count, RACE_PROXY_COUNT))
+    caller = _identify_caller(request)
+    loop = asyncio.get_event_loop()
+
+    proxies = await loop.run_in_executor(
+        _api_executor,
+        _pick_race_candidates,
+        caller,
+        count,
+    )
+
+    if not proxies:
+        raise HTTPException(503, "no live proxies available")
+
+    return {"proxies": proxies}
+
 @app.post("/dead")
 async def report_dead(req: DeadReport, x_secret: Optional[str] = Header(None)):
     if x_secret != SHARED_SECRET:
@@ -1401,75 +1509,257 @@ async def proxy_request(req: ProxyRequest):
     if ROLE != "vps":
         raise HTTPException(400, "/request only on vps role")
 
-    method   = req.method.upper()
-    last_err = None
-    purpose  = "fod-hunt" if _is_fod_hunt(req.url) else "backend"
-    skey     = _sticky_key(req.headers) if purpose == "fod-hunt" else ""
-    loop     = asyncio.get_event_loop()
+    method = req.method.upper()
+    purpose = "fod-hunt" if _is_fod_hunt(req.url) else "backend"
+    skey = _sticky_key(req.headers) if purpose == "fod-hunt" else ""
+    loop = asyncio.get_event_loop()
 
-    for attempt in range(req.retries):
-        prx = None
+    # Sticky URLs stay single-proxy. Only explicitly raceable URLs race.
+    if _is_raceable_url(req.url):
+        _inc("race_requests")
+        _log("race_start", f"url={req.url} method={method}")
+
+        proxies = await loop.run_in_executor(
+            _backend_executor,
+            _get_race_proxies_from_pool,
+            RACE_PROXY_COUNT,
+        )
+
+        if not proxies:
+            raise HTTPException(503, "no proxies available for race")
+
+        connector = aiohttp.TCPConnector(
+            limit=len(proxies) + 5,
+            ssl=False,
+            enable_cleanup_closed=True,
+        )
+
+        async with aiohttp.ClientSession(
+            connector=connector,
+        ) as session:
+
+            async def _one_shot(prx: dict):
+                addr = prx.get("addr", "")
+                proxy_url = prx.get("http", "")
+
+                if not proxy_url:
+                    return None
+
+                try:
+                    async with session.request(
+                        method=method,
+                        url=req.url,
+                        headers=req.headers or {},
+                        json=req.body if method in ("POST", "PUT", "PATCH") else None,
+                        params=req.params,
+                        proxy=proxy_url,
+                        timeout=aiohttp.ClientTimeout(total=req.timeout),
+                    ) as r:
+
+                        raw = await r.read()
+                        enc = r.headers.get("Content-Encoding", "")
+                        ct = r.headers.get(
+                            "Content-Type",
+                            "application/octet-stream",
+                        )
+
+                        try:
+                            if "gzip" in enc:
+                                raw = gzip.decompress(raw)
+                            elif "deflate" in enc:
+                                raw = zlib.decompress(raw)
+                        except Exception:
+                            pass
+
+                        if r.status < 400:
+                            return {
+                                "addr": addr,
+                                "status": r.status,
+                                "raw": raw,
+                                "content_type": ct,
+                            }
+
+                except (
+                    asyncio.TimeoutError,
+                    aiohttp.ClientConnectionError,
+                    aiohttp.ClientProxyConnectionError,
+                    aiohttp.ClientError,
+                ):
+                    if addr:
+                        await asyncio.get_running_loop().run_in_executor(
+                            _backend_executor,
+                            _report_dead_to_pool,
+                            addr,
+                        )
+                except Exception:
+                    pass
+
+                return None
+
+            tasks = [
+                asyncio.create_task(_one_shot(prx))
+                for prx in proxies
+            ]
+
+            try:
+                for completed in asyncio.as_completed(
+                    tasks,
+                    timeout=req.timeout,
+                ):
+                    result = await completed
+
+                    if result is None:
+                        continue
+
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+
+                    await asyncio.gather(
+                        *tasks,
+                        return_exceptions=True,
+                    )
+
+                    _inc("race_wins")
+                    _log(
+                        "race_win",
+                        f"url={req.url} proxy={result['addr']} "
+                        f"status={result['status']} candidates={len(proxies)}",
+                    )
+
+                    return Response(
+                        content=result["raw"],
+                        status_code=result["status"],
+                        media_type=result["content_type"],
+                    )
+
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+
+                await asyncio.gather(
+                    *tasks,
+                    return_exceptions=True,
+                )
+
+        _inc("race_all_failed")
+        raise HTTPException(502, "all race proxies failed")
+
+    # Normal/sticky request: immediate single proxy.
+    prx = None
+
+    if skey:
+        with _sticky_lock:
+            st = _sticky.get(skey)
+            if st and st[1] > time.time():
+                prx = {
+                    "http": f"http://{st[0]}",
+                    "https": f"http://{st[0]}",
+                    "addr": st[0],
+                }
+                _sticky[skey] = (
+                    st[0],
+                    time.time() + STICKY_TTL_S,
+                )
+
+    if prx is None:
+        prx = await loop.run_in_executor(
+            _backend_executor,
+            pick_proxy_vps,
+            req.tier,
+            req.category,
+            purpose,
+        )
+
+        if prx and skey:
+            with _sticky_lock:
+                _sticky[skey] = (
+                    prx.get("addr", ""),
+                    time.time() + STICKY_TTL_S,
+                )
+
+    if not prx:
+        raise HTTPException(503, "no live proxies available")
+
+    proxy_addr = prx.get(
+        "addr",
+        prx.get("http", ""),
+    )
+    proxy_url = prx["http"]
+
+    try:
+        connector = aiohttp.TCPConnector(
+            ssl=False,
+            enable_cleanup_closed=True,
+        )
+
+        async with aiohttp.ClientSession(
+            connector=connector,
+        ) as session:
+
+            async with session.request(
+                method=method,
+                url=req.url,
+                headers=req.headers or {},
+                json=req.body if method in ("POST", "PUT", "PATCH") else None,
+                params=req.params,
+                proxy=proxy_url,
+                timeout=aiohttp.ClientTimeout(total=req.timeout),
+            ) as r:
+
+                raw = await r.read()
+                enc = r.headers.get("Content-Encoding", "")
+                ct = r.headers.get(
+                    "Content-Type",
+                    "application/octet-stream",
+                )
+
+                try:
+                    if "gzip" in enc:
+                        raw = gzip.decompress(raw)
+                    elif "deflate" in enc:
+                        raw = zlib.decompress(raw)
+                except Exception:
+                    pass
+
+                return Response(
+                    content=raw,
+                    status_code=r.status,
+                    media_type=ct,
+                )
+
+    except asyncio.TimeoutError:
+        raise HTTPException(504, "upstream request timed out")
+
+    except (
+        aiohttp.ClientProxyConnectionError,
+        aiohttp.ClientConnectionError,
+    ) as e:
+
+        await loop.run_in_executor(
+            _backend_executor,
+            _report_dead_to_pool,
+            proxy_addr,
+        )
 
         if skey:
             with _sticky_lock:
-                s = _sticky.get(skey)
-                if s and s[1] > time.time():
-                    prx = {"http": f"http://{s[0]}", "https": f"http://{s[0]}", "addr": s[0]}
-                    _sticky[skey] = (s[0], time.time() + STICKY_TTL_S)
+                _sticky.pop(skey, None)
 
-        if prx is None:
-            prx = await loop.run_in_executor(
-                _backend_executor, pick_proxy_vps, req.tier, req.category, purpose
-            )
-            if prx and skey:
-                with _sticky_lock:
-                    _sticky[skey] = (prx.get("addr", ""), time.time() + STICKY_TTL_S)
+        raise HTTPException(
+            502,
+            f"proxy connection failed: {e}",
+        )
 
-        if not prx:
-            await asyncio.sleep(0.5)
-            continue
+    except Exception as e:
+        raise HTTPException(
+            502,
+            f"upstream request failed: {e}",
+        )
 
-        proxy_addr = prx.get("addr", prx.get("http", ""))
-        proxy_url  = prx["http"]
-
-        try:
-            connector = aiohttp.TCPConnector(ssl=False, enable_cleanup_closed=True)
-            async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.request(
-                    method=method,
-                    url=req.url,
-                    headers=req.headers or {},
-                    json=req.body if method in ("POST", "PUT", "PATCH") else None,
-                    params=req.params,
-                    proxy=proxy_url,
-                    timeout=aiohttp.ClientTimeout(total=req.timeout),
-                ) as r:
-                    raw = await r.read()
-                    enc = r.headers.get("Content-Encoding", "")
-                    ct  = r.headers.get("Content-Type", "application/octet-stream")
-                    try:
-                        if "gzip"      in enc: raw = gzip.decompress(raw)
-                        elif "deflate" in enc: raw = zlib.decompress(raw)
-                    except Exception:
-                        pass
-                    return Response(content=raw, status_code=r.status, media_type=ct)
-
-        except asyncio.TimeoutError as e:
-            last_err = str(e)
-        except aiohttp.ClientProxyConnectionError as e:
-            last_err = str(e)
-            await loop.run_in_executor(_backend_executor, _report_dead_to_pool, proxy_addr)
-            if skey:
-                with _sticky_lock: _sticky.pop(skey, None)
-        except aiohttp.ClientConnectionError as e:
-            last_err = str(e)
-            await loop.run_in_executor(_backend_executor, _report_dead_to_pool, proxy_addr)
-            if skey:
-                with _sticky_lock: _sticky.pop(skey, None)
-        except Exception as e:
-            last_err = str(e)
-
-    raise HTTPException(502, f"all {req.retries} attempts failed. last: {last_err}")
 
 # ── VPS key management ────────────────────────────────────────────────────────
 class AddKeyRequest(BaseModel):
