@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -79,7 +80,24 @@
     text-transform: uppercase;
     color: var(--muted);
     margin-bottom: 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
   }
+  .card-title .refresh-btn {
+    margin-left: auto;
+    font-size: 9px;
+    color: var(--accent);
+    cursor: pointer;
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-family: inherit;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+  }
+  .card-title .refresh-btn:hover { background: var(--border); }
 
   .pool-row { display: flex; align-items: flex-end; gap: 24px; flex-wrap: wrap; }
   .big-num { font-size: 52px; font-weight: 800; line-height: 1; color: var(--accent2); }
@@ -109,6 +127,45 @@
   .progress-fill.panther { background: var(--panther); }
   .progress-fill.lantern { background: var(--lantern); }
 
+  /* ── health grid ── */
+  .health-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 8px;
+  }
+  .health-card {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .health-top { display: flex; align-items: center; gap: 8px; }
+  .health-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dead); flex-shrink: 0; }
+  .health-dot.up      { background: var(--accent2); box-shadow: 0 0 5px var(--accent2); }
+  .health-dot.down    { background: var(--deadass); }
+  .health-dot.pending { background: var(--lantern); animation: pulse 1s infinite; }
+  .health-name   { font-size: 11px; font-weight: 700; color: var(--text); }
+  .health-role   { font-size: 9px; color: var(--muted); }
+  .health-url    { font-size: 9px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .health-ping   { font-size: 10px; margin-left: auto; }
+  .health-ping.up   { color: var(--accent2); }
+  .health-ping.down { color: var(--deadass); }
+  .health-status { font-size: 9px; padding: 2px 6px; border-radius: 3px; align-self: flex-start; }
+  .health-status.up      { background: #14532d; color: var(--accent2); }
+  .health-status.down    { background: #450a0a; color: var(--deadass); }
+  .health-status.pending { background: #1c1917; color: var(--lantern); }
+
+  .health-summary {
+    display: flex; gap: 12px; margin-bottom: 12px; flex-wrap: wrap;
+  }
+  .health-summary-stat { font-size: 11px; color: var(--muted); }
+  .health-summary-stat span { font-weight: 700; color: var(--text); }
+  .health-summary-stat span.all-up   { color: var(--accent2); }
+  .health-summary-stat span.some-down{ color: var(--deadass); }
+
   .checker-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 8px; }
   .checker-card { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
   .checker-top { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
@@ -135,7 +192,6 @@
   .pipe-step .lbl  { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }
   .pipe-arrow { color: var(--border); font-size: 18px; padding: 0 6px; }
 
-  /* ── caller picks table ── */
   .caller-table { width: 100%; border-collapse: collapse; margin-top: 4px; }
   .caller-table th {
     font-size: 9px; text-transform: uppercase; letter-spacing: .1em;
@@ -254,7 +310,22 @@
     </div>
   </div>
 
-  <!-- caller picks — who is asking -->
+  <!-- peer health -->
+  <div class="card span2">
+    <div class="card-title">
+      Peer Health
+      <button class="refresh-btn" onclick="pingAllPeers()">↻ refresh</button>
+    </div>
+    <div class="health-summary">
+      <div class="health-summary-stat">total <span id="h-total">12</span></div>
+      <div class="health-summary-stat">up <span id="h-up" class="all-up">—</span></div>
+      <div class="health-summary-stat">down <span id="h-down">—</span></div>
+      <div class="health-summary-stat">last check <span id="h-last">—</span></div>
+    </div>
+    <div class="health-grid" id="health-grid"></div>
+  </div>
+
+  <!-- caller picks -->
   <div class="card span2">
     <div class="card-title">Caller Picks — Who Is Asking</div>
     <table class="caller-table">
@@ -286,7 +357,39 @@
 </div>
 
 <script>
-const SSE_URL = 'https://ps-omen.onrender.com/stream/stats';
+// ── dynamic origin — works on any host ───────────────────────────────────────
+const SSE_URL = `${location.origin}/stream/stats`;
+
+const PEERS = {
+  pool:       'https://ps-omen.onrender.com',
+  dashboard:  'https://ps-yoru.onrender.com',
+  checker_1:  'https://ps-brimstone.onrender.com',
+  checker_2:  'https://ps-viper.onrender.com',
+  checker_3:  'https://ps-sage.onrender.com',
+  checker_4:  'https://ps-sova.onrender.com',
+  checker_5:  'https://ps-astra.onrender.com',
+  checker_6:  'https://ps-harbor.onrender.com',
+  checker_7:  'https://ps-phoenix.onrender.com',
+  checker_8:  'https://ps-breach.onrender.com',
+  checker_9:  'https://ps-neon.onrender.com',
+  checker_10: 'https://ps-killjoy.onrender.com',
+};
+
+const PEER_NAMES = {
+  pool:       'Omen',
+  dashboard:  'Yoru',
+  checker_1:  'Brimstone',
+  checker_2:  'Viper',
+  checker_3:  'Sage',
+  checker_4:  'Sova',
+  checker_5:  'Astra',
+  checker_6:  'Harbor',
+  checker_7:  'Phoenix',
+  checker_8:  'Breach',
+  checker_9:  'Neon',
+  checker_10: 'Killjoy',
+};
+
 const ROLES = [
   {role:'checker_1',  agent:'Brimstone'},
   {role:'checker_2',  agent:'Viper'},
@@ -303,6 +406,94 @@ const ROLES = [
 const store = {};
 let poolData = null;
 let lastTs   = 0;
+
+// ── health state ──────────────────────────────────────────────────────────────
+const healthState = {};
+Object.keys(PEERS).forEach(role => {
+  healthState[role] = { status: 'pending', ping: null, role_reported: null };
+});
+
+function _buildHealthGrid() {
+  const grid = document.getElementById('health-grid');
+  grid.innerHTML = '';
+  Object.entries(PEERS).forEach(([role, url]) => {
+    const card = document.createElement('div');
+    card.className = 'health-card';
+    card.id = `hc-${role}`;
+    const host = url.replace('https://', '').replace('http://', '');
+    card.innerHTML = `
+      <div class="health-top">
+        <div class="health-dot pending" id="hd-${role}"></div>
+        <div class="health-name">${PEER_NAMES[role]}</div>
+        <div class="health-ping pending" id="hp-${role}">…</div>
+      </div>
+      <div class="health-role" id="hr-${role}">${role}</div>
+      <div class="health-url">${host}</div>
+      <div class="health-status pending" id="hs-${role}">checking</div>`;
+    grid.appendChild(card);
+  });
+}
+
+async function _pingPeer(role, url) {
+  const t0 = performance.now();
+  try {
+    const res = await fetch(`${url}/health`, { signal: AbortSignal.timeout(6000) });
+    const ms  = Math.round(performance.now() - t0);
+    if (res.ok) {
+      let reported_role = role;
+      try {
+        const j = await res.json();
+        reported_role = j.role || role;
+      } catch(_) {}
+      healthState[role] = { status: 'up', ping: ms, role_reported: reported_role };
+    } else {
+      healthState[role] = { status: 'down', ping: ms, role_reported: null };
+    }
+  } catch(e) {
+    const ms = Math.round(performance.now() - t0);
+    healthState[role] = { status: 'down', ping: ms, role_reported: null };
+  }
+  _renderHealthCard(role);
+  _renderHealthSummary();
+}
+
+function _renderHealthCard(role) {
+  const s   = healthState[role];
+  const dot = document.getElementById(`hd-${role}`);
+  const pg  = document.getElementById(`hp-${role}`);
+  const rr  = document.getElementById(`hr-${role}`);
+  const st  = document.getElementById(`hs-${role}`);
+  if (!dot) return;
+  dot.className = `health-dot ${s.status}`;
+  pg.className  = `health-ping ${s.status}`;
+  pg.textContent = s.ping !== null ? `${s.ping}ms` : '—';
+  rr.textContent = s.role_reported || role;
+  st.className   = `health-status ${s.status}`;
+  st.textContent = s.status === 'up' ? 'online' : s.status === 'down' ? 'offline' : 'checking';
+}
+
+function _renderHealthSummary() {
+  const vals  = Object.values(healthState);
+  const up    = vals.filter(s => s.status === 'up').length;
+  const down  = vals.filter(s => s.status === 'down').length;
+  const total = vals.length;
+  const upEl  = document.getElementById('h-up');
+  upEl.textContent = up;
+  upEl.className   = up === total ? 'all-up' : 'some-down';
+  set('h-down',  down);
+  set('h-total', total);
+  set('h-last',  new Date().toLocaleTimeString());
+}
+
+async function pingAllPeers() {
+  // reset to pending
+  Object.keys(PEERS).forEach(role => {
+    healthState[role].status = 'pending';
+    _renderHealthCard(role);
+  });
+  // fire all in parallel
+  await Promise.all(Object.entries(PEERS).map(([role, url]) => _pingPeer(role, url)));
+}
 
 // ── SSE ──────────────────────────────────────────────────────────────────────
 let es;
@@ -385,12 +576,11 @@ function renderCallerPicks(callerPicks) {
     return;
   }
 
-  // sort by count desc
   entries.sort((a, b) => b[1] - a[1]);
   const total = entries.reduce((s, [, v]) => s + v, 0);
 
   tbody.innerHTML = entries.map(([caller, count]) => {
-    const pct     = total > 0 ? Math.round((count / total) * 100) : 0;
+    const pct       = total > 0 ? Math.round((count / total) * 100) : 0;
     const isUnknown = caller.startsWith('unknown');
     const nameClass = isUnknown ? 'caller-name caller-unknown' : 'caller-name';
     return `
@@ -524,6 +714,10 @@ function fmt(n) {
   return n;
 }
 
+// ── boot ──────────────────────────────────────────────────────────────────────
+_buildHealthGrid();
+pingAllPeers();
+setInterval(pingAllPeers, 30_000);
 connect();
 </script>
 </body>
