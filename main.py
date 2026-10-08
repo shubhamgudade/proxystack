@@ -1,40 +1,34 @@
 #!/usr/bin/env python3
 """
-ProxyStack — Distributed Proxy Gateway
-=======================================
-One file. 13 machines. Change ROLE env var, different behavior.
+ProxyStack v2 — Simplified Distributed Proxy Gateway
+=====================================================
+One file. Multiple machines. Change ROLE env var, different behavior.
 
 ROLES:
-  fetcher_a  → Brimstone — fetch 5k from sources A, distribute, switch to T1 checker
-  fetcher_b  → Viper     — fetch 5k from sources B, distribute, switch to T1 checker
-  t1_a       → Sage      — TCP + Httpbin check
-  t1_b       → Sova      — TCP + Httpbin check
-  t1_c       → Astra     — TCP + Httpbin check
-  t1_d       → Harbor    — TCP + Httpbin check
-  t1_e       → Reyna     — TCP + Httpbin check
-  t2_a       → Raze      — Meesho T2 check
-  t2_b       → Killjoy   — Meesho T2 check
-  t2_c       → Cypher    — Meesho T2 check
-  pool       → Yoru      — Live proxy pool, /pick, /dead, persist
-  dashboard  → Jett      — Stats + dashboard UI
-  vps        → Oracle    — /request, pinger, paid proxies, main app API
+  checker_1  through checker_10 → fetch from source slice, check meesho, push to pool
+  pool       → Omen  — ingest, pick, dead, recheck, persist, dashboard SSE
+  dashboard  → Yoru  — stats aggregator + dashboard UI
+  vps        → Oracle — /request, pinger, paid proxies, main app API
 
-Pipeline:
-  Brimstone fetches 5k → distributes to all T1s + self → switches to T1 checker
-  Viper     fetches 5k → distributes to all T1s + self → switches to T1 checker
-  All T1 nodes check → pass → T2 immediately
-  T2 nodes check → pass → Yoru /ingest
-  VPS → Yoru /pick → makes request → returns response
+Pipeline (per checker):
+  Boot → fetch latest 500 from my sources → check meesho → push live → pool
+  Loop:
+    Poll repos every 60s for new commits
+      new commit  → fetch up to 1000 proxies → check → push pool
+      no commit   → grab next 500 from known list (pointer advances) → check → push pool
+  Dedup: per-instance seen set, 1hr TTL — never recheck same addr in cycle
 
-Phase Logic (per fetcher):
-  FETCH → hit 5k or 90s timeout → distribute → CHECK
-  CHECK → time_to_finish <= FETCH_TIMEOUT → flip back to FETCH
-  rate tracked as rolling average of T1 passes/sec over last 30s
+Pool:
+  /ingest    → store with timestamp + latency label
+  /pick      → serve freshest proxy (flash/panther preferred)
+  /dead      → immediate evict
+  recheck    → every 8min, proxies older than 5min → meesho check → evict if dead
+  hard TTL   → 15min evict regardless
+  dashboard  → served here, SSE /stream/stats
 """
 
 import asyncio
 import gzip
-import hashlib
 import json
 import os
 import random
@@ -49,7 +43,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlsplit
 
 import aiohttp
 import requests
@@ -69,46 +62,26 @@ urllib3.disable_warnings()
 ROLE          = os.getenv("ROLE", "pool").lower()
 SHARED_SECRET = os.getenv("SHARED_SECRET", "changeme")
 PORT          = int(os.getenv("PORT", "8080"))
-
-# GitHub API token -- set on the TWO FETCHER services only (Render -> Environment).
 GITHUB_TOKEN  = os.getenv("GITHUB_TOKEN", "")
 
 # ─── Peer URLs ────────────────────────────────────────────────────────────────
 PEERS = {
-    "fetcher_a": os.getenv("PEER_FETCHER_A", "https://ps-brimstone.onrender.com"),
-    "fetcher_b": os.getenv("PEER_FETCHER_B", "https://ps-viper.onrender.com"),
-    "t1_a":      os.getenv("PEER_T1_A",      "https://ps-sage.onrender.com"),
-    "t1_b":      os.getenv("PEER_T1_B",      "https://ps-sova.onrender.com"),
-    "t1_c":      os.getenv("PEER_T1_C",      "https://ps-astra.onrender.com"),
-    "t1_d":      os.getenv("PEER_T1_D",      "https://ps-harbor.onrender.com"),
-    "t1_e":      os.getenv("PEER_T1_E",      "https://ps-phoenix.onrender.com"),
-    "t2_a":      os.getenv("PEER_T2_A",      "https://ps-breach.onrender.com"),
-    "t2_b":      os.getenv("PEER_T2_B",      "https://ps-neon.onrender.com"),
-    "t2_c":      os.getenv("PEER_T2_C",      "https://ps-killjoy.onrender.com"),
-    "pool":      os.getenv("PEER_POOL",      "https://ps-omen.onrender.com"),
-    "dashboard": os.getenv("PEER_DASHBOARD", "https://ps-yoru.onrender.com"),
-    "vps":       os.getenv("PEER_VPS",       "http://130.210.16.206:8080"),
+    "checker_1":  os.getenv("PEER_CHECKER_1",  "https://ps-brimstone.onrender.com"),
+    "checker_2":  os.getenv("PEER_CHECKER_2",  "https://ps-viper.onrender.com"),
+    "checker_3":  os.getenv("PEER_CHECKER_3",  "https://ps-sage.onrender.com"),
+    "checker_4":  os.getenv("PEER_CHECKER_4",  "https://ps-sova.onrender.com"),
+    "checker_5":  os.getenv("PEER_CHECKER_5",  "https://ps-astra.onrender.com"),
+    "checker_6":  os.getenv("PEER_CHECKER_6",  "https://ps-harbor.onrender.com"),
+    "checker_7":  os.getenv("PEER_CHECKER_7",  "https://ps-phoenix.onrender.com"),
+    "checker_8":  os.getenv("PEER_CHECKER_8",  "https://ps-breach.onrender.com"),
+    "checker_9":  os.getenv("PEER_CHECKER_9",  "https://ps-neon.onrender.com"),
+    "checker_10": os.getenv("PEER_CHECKER_10", "https://ps-killjoy.onrender.com"),
+    "pool":       os.getenv("PEER_POOL",       "https://ps-omen.onrender.com"),
+    "dashboard":  os.getenv("PEER_DASHBOARD",  "https://ps-yoru.onrender.com"),
+    "vps":        os.getenv("PEER_VPS",        "http://130.210.16.206:8080"),
 }
 
-T1_ROLES = ["t1_a", "t1_b", "t1_c", "t1_d", "t1_e"]
-T2_ROLES = ["t2_a", "t2_b", "t2_c"]
-ALL_T1_NODES = T1_ROLES + ["fetcher_a", "fetcher_b"]  # fetchers also act as T1 in check phase
-
-DOWNSTREAM = {
-    "fetcher_a": [],  # dynamic — fetcher handles its own routing
-    "fetcher_b": [],
-    "t1_a":      [("t2_a", 1.0)],
-    "t1_b":      [("t2_b", 1.0)],
-    "t1_c":      [("t2_c", 1.0)],
-    "t1_d":      [("t2_a", 0.5), ("t2_b", 0.5)],
-    "t1_e":      [("t2_b", 0.5), ("t2_c", 0.5)],
-    "t2_a":      [("pool", 1.0)],
-    "t2_b":      [("pool", 1.0)],
-    "t2_c":      [("pool", 1.0)],
-    "pool":      [],
-    "dashboard": [],
-    "vps":       [],
-}
+CHECKER_ROLES = [f"checker_{i}" for i in range(1, 11)]
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PATHS
@@ -121,96 +94,51 @@ KEYS_FILE    = BASE / "keys.json"
 # ═══════════════════════════════════════════════════════════════════════════════
 # TUNING
 # ═══════════════════════════════════════════════════════════════════════════════
-FETCH_TARGET_PER_NODE  = 5_000   # each fetcher targets 5k independently
-FETCH_TIMEOUT_S        = 90      # max seconds in fetch mode before forced switch
-RATE_WINDOW_S          = 30      # rolling window for T1 pass rate calculation
-SWITCH_BACK_LEAD_S     = 5       # extra buffer when calculating switch-back time
+BOOT_FETCH_COUNT    = 500      # proxies to fetch on boot
+COMMIT_FETCH_COUNT  = 1000     # proxies to fetch per new commit
+CYCLE_FETCH_COUNT   = 500      # proxies per normal cycle
+COMMIT_POLL_S       = 60       # how often to poll for new commits
+CHECK_CONCURRENCY   = 150      # concurrent meesho checks per checker
+CHECK_TIMEOUT_S     = 12       # meesho check timeout
+FETCH_WORKERS       = 20       # concurrent source fetchers
+SEEN_TTL_S          = 3600     # 1hr — don't recheck same proxy in cycle
+INGEST_BATCH_SIZE   = 100
+INGEST_INTERVAL_S   = 1.0
 
-SRC_RAW_CAP        = 8_000
-FETCH_WORKERS      = 20
-GITHUB_POLL        = 120
-HTTP_POLL          = 60
-SCRAPER_POLL       = 120
+# pool tuning
+POOL_RECHECK_INTERVAL_S = 480   # 8min between recheck passes
+POOL_RECHECK_MIN_AGE_S  = 300   # only recheck proxies older than 5min
+POOL_RECHECK_BATCH      = 80    # max per recheck pass
+POOL_TTL_S              = 900   # 15min hard evict
+POOL_COOLDOWN_S         = 8     # min seconds between picks of same proxy
+SNAP_INTERVAL_S         = 2
+PERSIST_INTERVAL_S      = 60
 
-LOCAL_T1_CONC      = 200
-LOCAL_T1_TIMEOUT   = 20
-LOCAL_T1_BATCH     = 400
+# latency categories
+CAT_FLASH   = 3.0
+CAT_PANTHER = 5.0
+CAT_LANTERN = 7.0
+CAT_DEAD    = 10.0
 
-LOCAL_T2_CONC      = 80
-LOCAL_T2_TIMEOUT   = 12
+FRESH_HOT_S  = 30
+FRESH_COLD_S = 120
 
-TCP_PREFILTER_CONC = 300
-T1_BATCH_SIZE      = 500
-T1_TIMEOUT         = 20
-INGEST_BATCH_SIZE  = 150
-INGEST_INTERVAL    = 2.0
+# paid
+MEESHO_API  = "https://prod.meeshoapi.com"
+MEESHO_AUTH = "32c4d8137cn9eb493a1921f203173080"
+APP_ID      = "com.meesho.supply"
 
-T2_CONCURRENT      = 100
-T2_WORKERS         = 60
-T2_TIMEOUT         = 12
-
-PERSIST_INTERVAL   = 60
-COOLDOWN_SEC       = 8
-
-CAT_FLASH   = 3
-CAT_PANTHER = 5
-CAT_LANTERN = 7
-CAT_DEAD    = 10
-
-FRESH_HOT_S     = 30
-FRESH_COLD_S    = 120
-RECHECK_HOT_S   = 20
-RECHECK_WARM_S  = 100
-STALE_EVICT_S   = 150
-SNAP_INTERVAL_S = 2
-REFRESH_TICK_S  = 2
-REFRESH_BATCH   = 400
+STICKY_TTL_S = 90
+PING_INTERVAL = 240
 
 FOD_HUNT_PATHS = (
     "/api/1.0/anonymous/config",
     "/api/1.0/anonymous/referral-app-install",
     "/api/1.0/anonymous/fod-personalisation",
 )
-STICKY_TTL_S = 90
-
-SEEN_TTL_S         = 600   # extended to cover full fetch+check cycle
-PING_INTERVAL      = 240
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MEESHO
-# ═══════════════════════════════════════════════════════════════════════════════
-MEESHO_API  = "https://prod.meeshoapi.com"
-MEESHO_AUTH = "32c4d8137cn9eb493a1921f203173080"
-APP_ID      = "com.meesho.supply"
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# T1 TARGETS
-# ═══════════════════════════════════════════════════════════════════════════════
-T1_TARGETS = [
-    ("http://httpbin.org/ip",        "origin"),
-    ("http://api.ipify.org",         "."),
-    ("http://icanhazip.com",         "."),
-    ("http://ip-api.com/json",       "query"),
-    ("http://checkip.amazonaws.com", "."),
-    ("http://ifconfig.me/ip",        "."),
-    ("http://myexternalip.com/raw",  "."),
-    ("http://ipecho.net/plain",      "."),
-    ("http://ident.me",              "."),
-    ("http://api4.my-ip.io/ip",      "."),
-    ("http://ip.seeip.org",          "."),
-]
-_t1_idx      = 0
-_t1_idx_lock = threading.Lock()
-
-def _next_t1():
-    global _t1_idx
-    with _t1_idx_lock:
-        t = T1_TARGETS[_t1_idx % len(T1_TARGETS)]
-        _t1_idx += 1
-    return t
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SOURCES — split A/B so each fetcher owns specific sources
+# SOURCES
 # ═══════════════════════════════════════════════════════════════════════════════
 ALL_GITHUB_REPOS = [
     ("monosans",           "proxy-list",          "proxies/http.txt"),
@@ -259,36 +187,39 @@ ALL_GITHUB_REPOS = [
     ("Fkunn1326",          "opz-proxies",         "http.txt"),
     ("hookzof",            "socks5_list",         "proxy/socks5.txt"),
     ("calpt",              "glitch-socks",        "http.txt"),
+    ("iplocate",           "free-proxy-list",     "protocols/http.txt"),
+    ("adasd223",           "checked-proxy-list",  "http.txt"),
+    ("gfpcom",             "free-proxy-list",     "lists/http.txt"),
 ]
-
-_mid = len(ALL_GITHUB_REPOS) // 2
-GITHUB_REPOS_A = ALL_GITHUB_REPOS[:_mid]
-GITHUB_REPOS_B = ALL_GITHUB_REPOS[_mid:]
 
 ALL_HTTP_SOURCES = [
-    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&timeout=10000&proxy_format=ipport&format=text",
-    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&timeout=10000&country=IN&proxy_format=ipport&format=text",
-    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&timeout=5000&proxy_format=ipport&format=text",
-    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&timeout=10000&country=US&proxy_format=ipport&format=text",
-    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&timeout=10000&country=DE&proxy_format=ipport&format=text",
-    "https://api.openproxylist.xyz/http.txt",
+    # proxyscrape — global, by quality tier (not country)
+    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=ipport&format=text",
+    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=ipport&format=text&anonymity=elite",
+    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=ipport&format=text&anonymity=anonymous",
+    # proxy-list.download — global http + https
     "https://www.proxy-list.download/api/v1/get?type=http",
     "https://www.proxy-list.download/api/v1/get?type=https",
-    "https://www.proxy-list.download/api/v1/get?type=http&anon=elite",
-    "https://www.proxy-list.download/api/v1/get?type=http&anon=anonymous",
-    "https://www.proxy-list.download/api/v1/get?type=http&country=IN",
-    "https://spys.me/proxy.txt",
+    # openproxylist
+    "https://api.openproxylist.xyz/http.txt",
+    # proxyspace
     "https://proxyspace.pro/http.txt",
     "https://proxyspace.pro/https.txt",
+    # proxyscan
     "https://proxyscan.io/download?type=http",
-]
-
-HTML_SOURCES = [
-    "https://free-proxy-list.net",
-    "https://sslproxies.org",
-    "https://us-proxy.org",
-    "https://free-proxy-list.net/uk-proxy.html",
-    "https://free-proxy-list.net/anonymous-proxy.html",
+    # spys
+    "https://spys.me/proxy.txt",
+    # multiproxy
+    "https://multiproxy.org/txt_all/proxy.txt",
+    # freeproxychecker
+    "https://www.freeproxychecker.com/result/http_proxies.txt",
+    # jsdelivr mirrors — updated every 5min
+    "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/protocols/http/data.txt",
+    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt",
+    # sockslist global
+    "https://sockslist.us/Api?request=display&country=all&level=all&token=free",
+    # pubproxy
+    "http://pubproxy.com/api/proxy?limit=20&format=txt&type=http",
 ]
 
 GEONODE_PAGES = [
@@ -297,9 +228,31 @@ GEONODE_PAGES = [
     "https://proxylist.geonode.com/api/proxy-list?limit=500&page=3&sort_by=lastChecked&sort_type=desc&protocols=http",
 ]
 
-_http_mid      = len(ALL_HTTP_SOURCES) // 2
-HTTP_SOURCES_A = ALL_HTTP_SOURCES[:_http_mid]
-HTTP_SOURCES_B = ALL_HTTP_SOURCES[_http_mid:]
+HTML_SOURCES = [
+    "https://free-proxy-list.net",
+    "https://sslproxies.org",
+    "https://us-proxy.org",
+    "https://free-proxy-list.net/anonymous-proxy.html",
+]
+
+# ── Split sources across 10 checkers ─────────────────────────────────────────
+def _split_sources(lst: list, n: int, idx: int) -> list:
+    """Give checker idx (0-based) its slice of lst split into n parts."""
+    chunk = len(lst) // n
+    start = idx * chunk
+    end   = start + chunk if idx < n - 1 else len(lst)
+    return lst[start:end]
+
+def _get_my_sources():
+    """Returns (github_repos, http_sources, geonode_pages, html_sources) for this checker."""
+    idx = int(ROLE.split("_")[1]) - 1   # checker_1 → 0, checker_10 → 9
+    n   = 10
+    return (
+        _split_sources(ALL_GITHUB_REPOS, n, idx),
+        _split_sources(ALL_HTTP_SOURCES, n, idx),
+        _split_sources(GEONODE_PAGES,   n, idx),
+        _split_sources(HTML_SOURCES,    n, idx),
+    )
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SHARED STATE
@@ -309,18 +262,11 @@ _IP_PORT = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})\b")
 def _parse(text: str) -> list[str]:
     return [m.group(0) for m in _IP_PORT.finditer(text)]
 
-# ── Raw pool (fetchers fill this, deduped at entry) ──────────────────────────
-_raw_pool_lock  = threading.Lock()
-_raw_pool: list[str] = []
-_raw_pool_set:  set[str] = set()   # dedup set for raw pool
-_raw_pool_count = 0                # total added this fetch cycle
-
-# ── Proxy live store ──────────────────────────────────────────────────────────
+# ── Proxy live store (pool role) ──────────────────────────────────────────────
 _proxies_lock = threading.Lock()
 _proxies: dict[str, dict] = {}
-_live: set[str] = set()
 
-_used_lock = threading.Lock()
+_used_lock  = threading.Lock()
 _last_used: dict[str, float] = {}
 
 _snap_lock     = threading.Lock()
@@ -328,69 +274,52 @@ _snap_fresh30:  list[str] = []
 _snap_fresh120: list[str] = []
 _snap_fast:     list[str] = []
 
-_paid_lock = threading.Lock()
+_paid_lock    = threading.Lock()
 _paid_proxies: dict[str, dict] = {}
 
 _keys_lock = threading.Lock()
 _keys: list[dict] = []
 
-# ── Seen dedup (extended TTL covers full cycle) ───────────────────────────────
+# ── Seen dedup (per checker instance) ────────────────────────────────────────
 _seen_lock = threading.Lock()
-_seen: dict[tuple, float] = {}
+_seen: dict[str, float] = {}
+
+# ── Outbound buffer (checker → pool) ─────────────────────────────────────────
+_outbuf_lock = threading.Lock()
+_outbuf: list[tuple[str, float]] = []   # (addr, latency_s)
+
+# ── Counters ──────────────────────────────────────────────────────────────────
+_counter_lock = threading.Lock()
+_counters: dict[str, int] = defaultdict(int)
 
 # ── Activity log ─────────────────────────────────────────────────────────────
 _activity_lock = threading.Lock()
 _activity_log: list[dict] = []
 ACTIVITY_MAX = 200
 
-# ── Counters ──────────────────────────────────────────────────────────────────
-_counter_lock = threading.Lock()
-_counters: dict[str, int] = defaultdict(int)
-
-# ── Outbound buffer ───────────────────────────────────────────────────────────
-_outbuf_lock = threading.Lock()
-_outbuf: list[tuple[str, str, float, str]] = []
-
-# ── Persist event ─────────────────────────────────────────────────────────────
+# ── Persist ───────────────────────────────────────────────────────────────────
 _persist_event = threading.Event()
 
-# ── Async queues / loops ──────────────────────────────────────────────────────
-_t1_queue: asyncio.Queue = None
-_t1_loop:  asyncio.AbstractEventLoop = None
-
-_t2_queue: asyncio.Queue = None
-_t2_loop:  asyncio.AbstractEventLoop = None
-
-_local_t1_queue: asyncio.Queue = None
-_local_t2_queue: asyncio.Queue = None
-_local_loop:     asyncio.AbstractEventLoop = None
-
-# ── Phase state (fetcher nodes only) ─────────────────────────────────────────
-FSTATE_FETCH = "fetch"
-FSTATE_CHECK = "check"
-
-_fstate      = FSTATE_FETCH
-_fstate_lock = threading.Lock()
-_fetch_phase_start = time.time()
-
-# ── T1 pass rate tracker (for time-based switch-back) ────────────────────────
-_rate_lock       = threading.Lock()
-_rate_timestamps: deque = deque()   # timestamps of each T1 pass
-
-# ── SHA / etag caches ────────────────────────────────────────────────────────
+# ── SHA cache (commit watcher) ────────────────────────────────────────────────
 _sha_lock  = threading.Lock()
 _repo_sha: dict[str, str] = {}
+
+# ── Etag cache (http sources) ─────────────────────────────────────────────────
 _etag_lock = threading.Lock()
 _http_etag: dict[str, str] = {}
 _http_lmod: dict[str, str] = {}
 
+# ── Async check queue ─────────────────────────────────────────────────────────
+_check_queue: asyncio.Queue = None
+_check_loop:  asyncio.AbstractEventLoop = None
+
+# ── Sticky sessions (vps) ─────────────────────────────────────────────────────
+_sticky_lock = threading.Lock()
+_sticky: dict[str, tuple] = {}
+
 # ── API executors ─────────────────────────────────────────────────────────────
 _api_executor     = ThreadPoolExecutor(max_workers=8,  thread_name_prefix="api")
 _backend_executor = ThreadPoolExecutor(max_workers=24, thread_name_prefix="backend")
-
-# ── Sticky sessions ───────────────────────────────────────────────────────────
-_sticky_lock = threading.Lock()
-_sticky: dict[str, tuple] = {}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # HELPERS
@@ -399,49 +328,19 @@ def _inc(key: str, n: int = 1):
     with _counter_lock:
         _counters[key] += n
 
-def _log_activity(event: str, detail: str = "", count: int = 0):
+def _log(event: str, detail: str = "", count: int = 0):
     entry = {"ts": time.time(), "role": ROLE, "event": event, "detail": detail, "count": count}
     with _activity_lock:
         _activity_log.append(entry)
         if len(_activity_log) > ACTIVITY_MAX:
             del _activity_log[:-ACTIVITY_MAX]
 
-def _assign_cat(avg_sec: float) -> Optional[str]:
-    if avg_sec <  CAT_FLASH:   return "flash"
-    if avg_sec <  CAT_PANTHER: return "panther"
-    if avg_sec <  CAT_LANTERN: return "lantern"
-    if avg_sec <  CAT_DEAD:    return "deadass"
+def _assign_cat(avg_s: float) -> Optional[str]:
+    if avg_s < CAT_FLASH:   return "flash"
+    if avg_s < CAT_PANTHER: return "panther"
+    if avg_s < CAT_LANTERN: return "lantern"
+    if avg_s < CAT_DEAD:    return "deadass"
     return None
-
-def _promote(addr: str, latency_s: float):
-    if latency_s >= CAT_DEAD:
-        _evict(addr, "too slow")
-        return
-    now = time.time()
-    with _proxies_lock:
-        rec = _proxies.get(addr)
-        if rec is None:
-            rec = {"received_at": now}
-            _proxies[addr] = rec
-        rec["last_checked"]  = now
-        rec["latency_ms"]    = int(latency_s * 1000)
-        rec["label"]         = _assign_cat(latency_s)
-        hot                  = addr in _last_used
-        rec["next_check_at"] = now + (RECHECK_HOT_S if hot else RECHECK_WARM_S)
-    _live.add(addr)
-    _inc("promoted")
-    _persist_event.set()
-
-def _evict(addr: str, reason: str = "dead"):
-    with _proxies_lock:
-        existed = _proxies.pop(addr, None) is not None
-    _live.discard(addr)
-    with _used_lock:
-        _last_used.pop(addr, None)
-    if existed:
-        _inc("evicted")
-        _log_activity("evicted", f"{addr} — {reason}")
-        _persist_event.set()
 
 def _meesho_headers() -> dict:
     return {
@@ -465,7 +364,7 @@ def _meesho_headers() -> dict:
 
 def _decode_meesho(raw: bytes, enc: str) -> dict:
     try:
-        if "gzip"      in enc: raw = gzip.decompress(raw)
+        if "gzip"    in enc: raw = gzip.decompress(raw)
         elif "deflate" in enc: raw = zlib.decompress(raw)
     except Exception:
         pass
@@ -474,85 +373,28 @@ def _decode_meesho(raw: bytes, enc: str) -> dict:
     except Exception:
         return {}
 
-def _tcp_open(addr: str, timeout: float = 2.0) -> bool:
-    try:
-        ip, port = addr.rsplit(":", 1)
-        with socket.create_connection((ip, int(port)), timeout=timeout):
-            return True
-    except Exception:
-        return False
-
-async def _tcp_open_async(addr: str) -> bool:
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _tcp_open, addr)
-
-def _hash(addr: str) -> int:
-    return int.from_bytes(
-        hashlib.blake2b(addr.encode("utf-8", "ignore"), digest_size=8).digest(), "big"
-    )
-
-def _t2_target(addr: str) -> str:
-    return T2_ROLES[_hash(addr) % len(T2_ROLES)]
-
-def _seen_dup(stage: str, addr: str) -> bool:
+def _seen_dup(addr: str) -> bool:
     now = time.time()
-    key = (stage, addr)
     with _seen_lock:
-        t = _seen.get(key)
+        t = _seen.get(addr)
         if t is not None and now - t < SEEN_TTL_S:
             return True
-        _seen[key] = now
-        if len(_seen) > 400_000:
+        _seen[addr] = now
+        # prune stale entries every ~10k inserts
+        if len(_seen) > 50_000:
             for k, v in list(_seen.items()):
                 if now - v >= SEEN_TTL_S:
                     _seen.pop(k, None)
         return False
 
-def _record_t1_pass():
-    """Record timestamp of a T1 pass for rate calculation."""
-    now = time.time()
-    with _rate_lock:
-        _rate_timestamps.append(now)
-        # prune old entries outside window
-        cutoff = now - RATE_WINDOW_S
-        while _rate_timestamps and _rate_timestamps[0] < cutoff:
-            _rate_timestamps.popleft()
-
-def _get_t1_pass_rate() -> float:
-    """Returns T1 passes per second over last RATE_WINDOW_S seconds."""
-    now = time.time()
-    with _rate_lock:
-        cutoff = now - RATE_WINDOW_S
-        while _rate_timestamps and _rate_timestamps[0] < cutoff:
-            _rate_timestamps.popleft()
-        count = len(_rate_timestamps)
-    if count == 0:
-        return 0.0
-    return count / RATE_WINDOW_S
-
-def _get_t1_queue_depth_total() -> int:
-    """Sum queue depth across all T1 nodes including fetchers acting as T1."""
-    total = 0
-    for role in ALL_T1_NODES:
-        if role == ROLE:
-            q = _local_t1_queue or _t1_queue
-            total += q.qsize() if q else 0
-        else:
-            url = PEERS.get(role)
-            if not url:
-                continue
-            try:
-                r = requests.get(
-                    f"{url}/qsize",
-                    headers={"X-Secret": SHARED_SECRET},
-                    timeout=3,
-                )
-                total += r.json().get("t1_qsize", 0)
-            except Exception:
-                pass
-    return total
+def _gh_headers() -> dict:
+    h = {"Accept": "application/vnd.github.v3+json"}
+    if GITHUB_TOKEN:
+        h["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    return h
 
 def _is_fod_hunt(url: str) -> bool:
+    from urllib.parse import urlsplit
     try:
         path = urlsplit(url).path
     except Exception:
@@ -567,211 +409,24 @@ def _sticky_key(headers) -> str:
     return f"fod:{k}" if k else ""
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# DEDUP — raw pool entry
+# SOURCE FETCHERS
 # ═══════════════════════════════════════════════════════════════════════════════
-def _add_to_raw_pool(proxies: list[str]) -> int:
-    """Add proxies to raw pool with dedup. Returns count actually added."""
-    added = 0
-    with _raw_pool_lock:
-        global _raw_pool_count
-        for addr in proxies:
-            if addr not in _raw_pool_set:
-                _raw_pool_set.add(addr)
-                _raw_pool.append(addr)
-                _raw_pool_count += 1
-                added += 1
-    return added
-
-def _drain_raw_pool() -> list[str]:
-    """Take everything from raw pool and clear it."""
-    with _raw_pool_lock:
-        global _raw_pool_count
-        batch = list(_raw_pool)
-        _raw_pool.clear()
-        _raw_pool_set.clear()
-        _raw_pool_count = 0
-    return batch
-
-def _raw_pool_size() -> int:
-    with _raw_pool_lock:
-        return _raw_pool_count
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# OUTBOUND INGEST SENDER
-# ═══════════════════════════════════════════════════════════════════════════════
-def _push_downstream(addr: str, next_role: str, t1_elapsed: float = 5.0, stage: str = "t1"):
-    with _outbuf_lock:
-        _outbuf.append((addr, next_role, t1_elapsed, stage))
-
-def _outbuf_sender():
-    while True:
-        with _outbuf_lock:
-            pending = len(_outbuf)
-
-        time.sleep(0.1 if pending > 100 else (0.5 if pending > 0 else INGEST_INTERVAL))
-
-        with _outbuf_lock:
-            if not _outbuf:
-                continue
-            batch = list(_outbuf[:INGEST_BATCH_SIZE])
-            del _outbuf[:INGEST_BATCH_SIZE]
-
-        by_role: dict[str, list] = defaultdict(list)
-        for addr, role, elapsed, stage in batch:
-            by_role[role].append({"addr": addr, "t1_elapsed": elapsed, "stage": stage})
-
-        for role, items in by_role.items():
-            url = PEERS.get(role)
-            if not url:
-                continue
-            try:
-                r = requests.post(
-                    f"{url}/ingest",
-                    json={"proxies": items},
-                    headers={"X-Secret": SHARED_SECRET},
-                    timeout=8,
-                )
-                print(f"[outbuf] sent {len(items)} → {role} ({r.status_code})", flush=True)
-            except Exception as e:
-                print(f"[outbuf] failed → {role}: {e}", flush=True)
-                with _outbuf_lock:
-                    for item in items:
-                        _outbuf.insert(0, (item["addr"], role, item["t1_elapsed"], item["stage"]))
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# DISTRIBUTION — fetcher sends batch to all T1 nodes including self
-# ═══════════════════════════════════════════════════════════════════════════════
-def _distribute_batch_to_t1s(batch: list[str]):
-    """Evenly distribute raw proxies across all T1 nodes + self (fetcher in check mode)."""
-    if not batch:
-        return
-
-    nodes      = list(ALL_T1_NODES)  # 7 nodes total
-    chunk_size = len(batch) // len(nodes)
-    chunks     = [batch[i * chunk_size:(i + 1) * chunk_size] for i in range(len(nodes))]
-
-    # remainder to first node
-    remainder = batch[chunk_size * len(nodes):]
-    if remainder:
-        chunks[0].extend(remainder)
-
-    for role, chunk in zip(nodes, chunks):
-        if not chunk:
-            continue
-        if role == ROLE:
-            # push to own local T1 queue
-            for addr in chunk:
-                _push_to_local_t1_direct(addr)
-            print(f"[{ROLE}] distributed {len(chunk)} to self (local T1)", flush=True)
-        else:
-            url = PEERS.get(role)
-            if not url:
-                continue
-            try:
-                requests.post(
-                    f"{url}/ingest",
-                    json={"proxies": [{"addr": a, "stage": "t1", "t1_elapsed": 0.0} for a in chunk]},
-                    headers={"X-Secret": SHARED_SECRET},
-                    timeout=15,
-                )
-                print(f"[{ROLE}] distributed {len(chunk)} → {role}", flush=True)
-            except Exception as e:
-                print(f"[{ROLE}] dist failed → {role}: {e}", flush=True)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PERSIST
-# ═══════════════════════════════════════════════════════════════════════════════
-def _save_free():
+def _fetch_github_raw(owner: str, repo: str, path: str, sha: str = "main") -> list[str]:
+    """Fetch raw file from github at specific sha."""
     try:
-        with _proxies_lock:
-            data = {
-                a: {"label": r.get("label"), "latency_ms": r.get("latency_ms"),
-                    "last_checked": r.get("last_checked", 0)}
-                for a, r in _proxies.items()
-            }
-        PERSIST_FREE.write_text(json.dumps(data))
+        r = requests.get(
+            f"https://raw.githubusercontent.com/{owner}/{repo}/{sha}/{path}",
+            headers=_gh_headers(),
+            timeout=10,
+        )
+        if r.status_code == 200:
+            return _parse(r.text)
     except Exception as e:
-        print(f"[persist] free save failed: {e}", flush=True)
+        print(f"[gh] {owner}/{repo} raw fetch failed: {e}", flush=True)
+    return []
 
-def _load_free():
-    if not PERSIST_FREE.exists():
-        return
-    try:
-        data = json.loads(PERSIST_FREE.read_text())
-        now  = time.time()
-        rows = data.items() if isinstance(data, dict) else [(a, {}) for a in data]
-        with _proxies_lock:
-            for addr, r in rows:
-                _proxies[addr] = {
-                    "received_at":   now,
-                    "last_checked":  r.get("last_checked", 0),
-                    "latency_ms":    r.get("latency_ms", 0),
-                    "label":         r.get("label"),
-                    "next_check_at": now,
-                }
-                _live.add(addr)
-        print(f"[persist] loaded {len(_proxies)} free proxies", flush=True)
-    except Exception as e:
-        print(f"[persist] free load failed: {e}", flush=True)
-
-def _save_paid():
-    try:
-        with _paid_lock:
-            data = {a: dict(p) for a, p in _paid_proxies.items() if p.get("alive")}
-        PERSIST_PAID.write_text(json.dumps(data))
-    except Exception as e:
-        print(f"[persist] paid save failed: {e}", flush=True)
-
-def _load_paid():
-    if not PERSIST_PAID.exists():
-        return
-    try:
-        data = json.loads(PERSIST_PAID.read_text())
-        with _paid_lock:
-            for addr, p in data.items():
-                if addr not in _paid_proxies:
-                    _paid_proxies[addr] = p
-        print(f"[persist] loaded {len(data)} paid proxies", flush=True)
-    except Exception as e:
-        print(f"[persist] paid load failed: {e}", flush=True)
-
-def _save_keys():
-    try:
-        with _keys_lock:
-            keys = list(_keys)
-        KEYS_FILE.write_text(json.dumps(keys, indent=2))
-    except Exception as e:
-        print(f"[persist] keys save failed: {e}", flush=True)
-
-def _load_keys():
-    if not KEYS_FILE.exists():
-        return
-    try:
-        data = json.loads(KEYS_FILE.read_text())
-        with _keys_lock:
-            _keys.extend(data)
-        print(f"[persist] loaded {len(data)} keys", flush=True)
-    except Exception as e:
-        print(f"[persist] keys load failed: {e}", flush=True)
-
-def _persist_worker():
-    while True:
-        _persist_event.wait(timeout=PERSIST_INTERVAL)
-        _persist_event.clear()
-        if ROLE in ("pool", "vps"):
-            _save_free()
-            _save_paid()
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SOURCE FETCHERS (pure fetch functions, no side effects)
-# ═══════════════════════════════════════════════════════════════════════════════
-def _gh_headers() -> dict:
-    h = {"Accept": "application/vnd.github.v3+json"}
-    if GITHUB_TOKEN:
-        h["Authorization"] = f"Bearer {GITHUB_TOKEN}"
-    return h
-
-def _fetch_github(owner: str, repo: str, path: str) -> list[str]:
+def _fetch_github_latest(owner: str, repo: str, path: str) -> tuple[list[str], str]:
+    """Fetch latest proxies from github repo. Returns (proxies, sha)."""
     key = f"{owner}/{repo}/{path}"
     try:
         r = requests.get(
@@ -781,45 +436,38 @@ def _fetch_github(owner: str, repo: str, path: str) -> list[str]:
             timeout=8,
         )
         if r.status_code in (403, 429):
-            print(f"[gh] RATE LIMITED {owner}/{repo} HTTP {r.status_code} "
-                  f"token={'yes' if GITHUB_TOKEN else 'NO'}", flush=True)
             _inc("gh_ratelimited")
-            return []
+            return [], ""
         if r.status_code != 200:
-            print(f"[gh] {owner}/{repo} commits HTTP {r.status_code}", flush=True)
-            _inc("gh_error")
-            return []
+            return [], ""
         commits = r.json()
         if not isinstance(commits, list) or not commits:
-            return []
+            return [], ""
         sha = commits[0].get("sha", "")
         if not sha:
-            return []
-    except Exception as e:
-        print(f"[gh] {owner}/{repo} commit check failed: {e}", flush=True)
-        _inc("gh_error")
-        return []
+            return [], ""
+    except Exception:
+        return [], ""
+
+    proxies = _fetch_github_raw(owner, repo, path, sha)
+    return proxies, sha
+
+def _fetch_github_commit(owner: str, repo: str, path: str) -> tuple[list[str], str]:
+    """
+    Check for new commit on repo/path.
+    Returns (proxies_from_commit, new_sha) if new commit, else ([], "").
+    """
+    key = f"{owner}/{repo}/{path}"
+    proxies, sha = _fetch_github_latest(owner, repo, path)
+    if not sha:
+        return [], ""
     with _sha_lock:
-        if sha == _repo_sha.get(key):
-            return []
-    try:
-        r2 = requests.get(
-            f"https://raw.githubusercontent.com/{owner}/{repo}/{sha}/{path}",
-            headers=_gh_headers(),
-            timeout=8,
-        )
-        if r2.status_code != 200:
-            print(f"[gh] {owner}/{repo} raw HTTP {r2.status_code} sha={sha[:8]}", flush=True)
-            _inc("gh_error")
-            return []
-        proxies = _parse(r2.text)
-    except Exception as e:
-        print(f"[gh] {owner}/{repo} raw fetch failed: {e}", flush=True)
-        _inc("gh_error")
-        return []
-    with _sha_lock:
+        old_sha = _repo_sha.get(key, "")
+        if sha == old_sha:
+            return [], ""          # no new commit
         _repo_sha[key] = sha
-    return proxies
+    # cap at COMMIT_FETCH_COUNT
+    return proxies[:COMMIT_FETCH_COUNT], sha
 
 def _fetch_http_url(url: str) -> list[str]:
     hdrs = {}
@@ -827,7 +475,7 @@ def _fetch_http_url(url: str) -> list[str]:
         if url in _http_etag: hdrs["If-None-Match"]     = _http_etag[url]
         if url in _http_lmod: hdrs["If-Modified-Since"] = _http_lmod[url]
     try:
-        r = requests.get(url, headers=hdrs, timeout=8)
+        r = requests.get(url, headers=hdrs, timeout=10)
         if r.status_code == 304:
             return []
         with _etag_lock:
@@ -839,7 +487,7 @@ def _fetch_http_url(url: str) -> list[str]:
 
 def _fetch_geonode_page(url: str) -> list[str]:
     try:
-        r    = requests.get(url, timeout=8)
+        r    = requests.get(url, timeout=10)
         data = r.json()
         return [f"{p['ip']}:{p['port']}" for p in data.get("data", [])]
     except Exception:
@@ -847,7 +495,7 @@ def _fetch_geonode_page(url: str) -> list[str]:
 
 def _fetch_html_page(url: str) -> list[str]:
     try:
-        r    = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        r    = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
         soup = BeautifulSoup(r.text, "html.parser")
         out  = []
         for table in soup.find_all("table"):
@@ -865,7 +513,7 @@ def _fetch_html_page(url: str) -> list[str]:
 def _fetch_checkerproxy() -> list[str]:
     try:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        r     = requests.get(f"https://checkerproxy.net/api/archive/{today}", timeout=8)
+        r     = requests.get(f"https://checkerproxy.net/api/archive/{today}", timeout=10)
         data  = r.json()
         return [
             p["addr"] for p in data
@@ -874,543 +522,319 @@ def _fetch_checkerproxy() -> list[str]:
     except Exception:
         return []
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# FETCHER PHASE MANAGER
-# ═══════════════════════════════════════════════════════════════════════════════
-def _run_fetch_cycle(repos: list, http_sources: list) -> int:
+def _bulk_fetch(repos: list, http_srcs: list, geonode: list, html: list, limit: int) -> list[str]:
     """
-    Run one full fetch cycle. Returns total proxies added to raw pool.
-    Stops early if FETCH_TARGET_PER_NODE reached.
-    Stops at FETCH_TIMEOUT_S regardless.
+    Fetch from all assigned sources, return up to `limit` unique proxies.
+    Uses pointer-based advancement from known list on subsequent calls.
     """
-    global _fetch_phase_start
-    _fetch_phase_start = time.time()
+    collected: set[str] = set()
+    results: list[str]  = []
 
-    # clear raw pool for new cycle
-    with _raw_pool_lock:
-        global _raw_pool_count
-        _raw_pool.clear()
-        _raw_pool_set.clear()
-        _raw_pool_count = 0
-
-    _log_activity("fetch_cycle_start", f"target={FETCH_TARGET_PER_NODE}")
-    print(f"[{ROLE}] FETCH cycle started — target {FETCH_TARGET_PER_NODE}", flush=True)
-
-    def _check_done() -> bool:
-        elapsed = time.time() - _fetch_phase_start
-        size    = _raw_pool_size()
-        if size >= FETCH_TARGET_PER_NODE:
-            print(f"[{ROLE}] target hit — {size} proxies in {elapsed:.0f}s", flush=True)
-            return True
-        if elapsed >= FETCH_TIMEOUT_S:
-            print(f"[{ROLE}] timeout — {size} proxies in {elapsed:.0f}s", flush=True)
-            return True
-        return False
+    def _add(proxies: list[str]):
+        for p in proxies:
+            if p not in collected:
+                collected.add(p)
+                results.append(p)
 
     with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
-        # Submit GitHub fetches
-        gh_futs = {ex.submit(_fetch_github, o, r, p): f"{o}/{r}" for o, r, p in repos}
-        # Submit HTTP fetches
-        ht_futs = {ex.submit(_fetch_http_url, url): url for url in http_sources}
-        # Submit supplementary
-        gn_futs = {ex.submit(_fetch_geonode_page, url): url for url in GEONODE_PAGES}
-        hl_futs = {ex.submit(_fetch_html_page,    url): url for url in HTML_SOURCES}
-        cp_fut  = ex.submit(_fetch_checkerproxy)
+        futs = {}
+        for o, r, p in repos:
+            futs[ex.submit(_fetch_github_raw, o, r, p)] = f"gh:{o}/{r}"
+        for url in http_srcs:
+            futs[ex.submit(_fetch_http_url, url)] = f"http:{url[:40]}"
+        for url in geonode:
+            futs[ex.submit(_fetch_geonode_page, url)] = f"geo:{url[:40]}"
+        for url in html:
+            futs[ex.submit(_fetch_html_page, url)] = f"html:{url[:40]}"
+        futs[ex.submit(_fetch_checkerproxy)] = "checkerproxy"
 
-        all_futs = list(gh_futs) + list(ht_futs) + list(gn_futs) + list(hl_futs) + [cp_fut]
-
-        for fut in as_completed(all_futs):
-            if _check_done():
-                # cancel remaining (best effort)
-                for f in all_futs:
-                    f.cancel()
-                break
+        for fut in as_completed(futs):
             try:
-                result = fut.result(timeout=0)
-                if result:
-                    added = _add_to_raw_pool(result)
-                    if added:
-                        _inc("raw_fetched", added)
+                _add(fut.result() or [])
             except Exception:
                 pass
+            if len(results) >= limit:
+                break
 
-    final = _raw_pool_size()
-    _log_activity("fetch_cycle_done", f"got {final} proxies")
-    print(f"[{ROLE}] FETCH cycle done — {final} unique proxies collected", flush=True)
-    return final
+    return results[:limit]
 
-def _phase_manager(repos: list, http_sources: list):
-    """
-    Main phase loop for fetcher nodes.
-    FETCH → distribute → CHECK → time-based switch back → repeat
-    """
-    global _fstate
+# ═══════════════════════════════════════════════════════════════════════════════
+# MEESHO CHECK (the ONLY validation gate)
+# ═══════════════════════════════════════════════════════════════════════════════
+async def _meesho_check(session: aiohttp.ClientSession, addr: str) -> tuple[bool, float]:
+    hdr = _meesho_headers()
+    t0  = asyncio.get_event_loop().time()
+    try:
+        async with session.get(
+            f"{MEESHO_API}/api/1.0/anonymous/config",
+            headers=hdr,
+            proxy=f"http://{addr}",
+            timeout=aiohttp.ClientTimeout(total=CHECK_TIMEOUT_S),
+            ssl=False,
+        ) as r:
+            if r.status == 200:
+                raw  = await r.read()
+                enc  = r.headers.get("Content-Encoding", "")
+                data = _decode_meesho(raw, enc)
+                xoox = data.get("xoox", {})
+                if isinstance(xoox, str):
+                    try:    xoox = json.loads(xoox)
+                    except: xoox = {}
+                elapsed = asyncio.get_event_loop().time() - t0
+                if isinstance(xoox, dict) and xoox.get("xo"):
+                    return True, elapsed
+    except Exception:
+        pass
+    return False, 0.0
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# OUTBOUND SENDER (checker → pool)
+# ═══════════════════════════════════════════════════════════════════════════════
+def _push_to_pool(addr: str, latency_s: float):
+    with _outbuf_lock:
+        _outbuf.append((addr, latency_s))
+
+def _outbuf_sender():
+    pool_url = PEERS.get("pool", "")
+    while True:
+        with _outbuf_lock:
+            pending = len(_outbuf)
+
+        sleep_s = 0.1 if pending > 50 else INGEST_INTERVAL_S
+        time.sleep(sleep_s)
+
+        with _outbuf_lock:
+            if not _outbuf:
+                continue
+            batch = list(_outbuf[:INGEST_BATCH_SIZE])
+            del _outbuf[:INGEST_BATCH_SIZE]
+
+        if not pool_url:
+            continue
+        try:
+            payload = [{"addr": a, "latency_s": l} for a, l in batch]
+            r = requests.post(
+                f"{pool_url}/ingest",
+                json={"proxies": payload},
+                headers={"X-Secret": SHARED_SECRET},
+                timeout=10,
+            )
+            print(f"[{ROLE}] pushed {len(batch)} → pool ({r.status_code})", flush=True)
+        except Exception as e:
+            print(f"[{ROLE}] push failed: {e}", flush=True)
+            with _outbuf_lock:
+                for item in batch:
+                    _outbuf.insert(0, item)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ASYNC CHECK PIPELINE (per checker)
+# ═══════════════════════════════════════════════════════════════════════════════
+async def _checker_pipeline():
+    global _check_queue
+    _check_queue = asyncio.Queue(maxsize=10_000)
+    sem          = asyncio.Semaphore(CHECK_CONCURRENCY)
+    connector    = aiohttp.TCPConnector(
+        limit=CHECK_CONCURRENCY + 50,
+        ttl_dns_cache=300,
+        enable_cleanup_closed=True,
+    )
+
+    async def _worker(session: aiohttp.ClientSession):
+        while True:
+            addr = await _check_queue.get()
+            async with sem:
+                passed, latency = await _meesho_check(session, addr)
+            if passed:
+                cat = _assign_cat(latency)
+                if cat:
+                    _inc(f"check_pass_{cat}")
+                    _log("check_pass", f"{addr} {cat} {latency:.1f}s")
+                    _push_to_pool(addr, latency)
+                else:
+                    _inc("check_too_slow")
+            else:
+                _inc("check_fail")
+
+    async def _stats_printer():
+        while True:
+            await asyncio.sleep(15)
+            q = _check_queue.qsize() if _check_queue else 0
+            with _outbuf_lock: ob = len(_outbuf)
+            with _counter_lock: cnts = dict(_counters)
+            print(
+                f"[{ROLE}] q={q} outbuf={ob} "
+                f"pass={sum(cnts.get(f'check_pass_{c}', 0) for c in ('flash','panther','lantern','deadass'))} "
+                f"fail={cnts.get('check_fail', 0)}",
+                flush=True,
+            )
+
+    async with aiohttp.ClientSession(connector=connector) as session:
+        workers = [asyncio.create_task(_worker(session)) for _ in range(CHECK_CONCURRENCY)]
+        stats   = asyncio.create_task(_stats_printer())
+        await asyncio.gather(*workers, stats)
+
+def _checker_pipeline_thread():
+    global _check_loop
+    _check_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_check_loop)
+    _check_loop.run_until_complete(_checker_pipeline())
+
+def _enqueue(addr: str):
+    """Push addr to async check queue from any thread."""
+    if _seen_dup(addr):
+        return
+    if _check_queue and _check_loop and not _check_loop.is_closed():
+        try:
+            asyncio.run_coroutine_threadsafe(_check_queue.put(addr), _check_loop)
+        except RuntimeError:
+            pass
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHECKER MAIN LOOP
+# ═══════════════════════════════════════════════════════════════════════════════
+def _checker_main():
+    repos, http_srcs, geonode, html = _get_my_sources()
+
+    print(f"[{ROLE}] sources: {len(repos)} github repos, {len(http_srcs)} http, "
+          f"{len(geonode)} geonode, {len(html)} html", flush=True)
+
+    # ── BOOT: fetch latest 500 ────────────────────────────────────────────────
+    print(f"[{ROLE}] boot fetch — targeting {BOOT_FETCH_COUNT} proxies", flush=True)
+    boot_batch = _bulk_fetch(repos, http_srcs, geonode, html, BOOT_FETCH_COUNT)
+    print(f"[{ROLE}] boot fetch got {len(boot_batch)} — queuing for check", flush=True)
+    for addr in boot_batch:
+        _enqueue(addr)
+
+    # init sha cache so commit watcher only catches NEW commits after boot
+    def _init_sha_cache():
+        for owner, repo, path in repos:
+            key = f"{owner}/{repo}/{path}"
+            _, sha = _fetch_github_latest(owner, repo, path)
+            if sha:
+                with _sha_lock:
+                    _repo_sha[key] = sha
+    threading.Thread(target=_init_sha_cache, daemon=True, name="sha-init").start()
+
+    # ── MAIN LOOP ─────────────────────────────────────────────────────────────
+    last_commit_poll = time.time()
+    # pointer tracks how far into the full source list we've fetched
+    cycle_offset = BOOT_FETCH_COUNT
 
     while True:
-        # ── FETCH PHASE ──────────────────────────────────────────────────────
-        with _fstate_lock:
-            _fstate = FSTATE_FETCH
-        _log_activity("phase_switch", "→ FETCH")
-        print(f"[{ROLE}] phase → FETCH", flush=True)
+        time.sleep(5)
+        now = time.time()
 
-        count = _run_fetch_cycle(repos, http_sources)
+        # ── commit poll ───────────────────────────────────────────────────────
+        if now - last_commit_poll >= COMMIT_POLL_S:
+            last_commit_poll = now
+            commit_found = False
+            for owner, repo, path in repos:
+                new_proxies, sha = _fetch_github_commit(owner, repo, path)
+                if new_proxies:
+                    commit_found = True
+                    print(f"[{ROLE}] new commit {owner}/{repo} → {len(new_proxies)} proxies", flush=True)
+                    _log("new_commit", f"{owner}/{repo} sha={sha[:8]} count={len(new_proxies)}")
+                    _inc("commits_detected")
+                    for addr in new_proxies:
+                        _enqueue(addr)
 
-        # drain pool and distribute even if count is 0
-        batch = _drain_raw_pool()
-        if batch:
-            print(f"[{ROLE}] distributing {len(batch)} proxies to all T1 nodes", flush=True)
-            _distribute_batch_to_t1s(batch)
-        else:
-            print(f"[{ROLE}] fetch cycle returned 0 proxies — retrying", flush=True)
-            time.sleep(10)
+            if commit_found:
+                continue
+
+        # ── normal cycle: next 500 ────────────────────────────────────────────
+        q_depth = _check_queue.qsize() if _check_queue else 0
+        if q_depth > 2000:
+            # queue still has plenty — don't pile on
             continue
 
-        # ── CHECK PHASE ───────────────────────────────────────────────────────
-        with _fstate_lock:
-            _fstate = FSTATE_CHECK
-        _log_activity("phase_switch", "→ CHECK")
-        print(f"[{ROLE}] phase → CHECK — monitoring queue depth + rate", flush=True)
+        print(f"[{ROLE}] cycle fetch — offset={cycle_offset} target={CYCLE_FETCH_COUNT}", flush=True)
+        batch = _bulk_fetch(repos, http_srcs, geonode, html, CYCLE_FETCH_COUNT)
+        queued = 0
+        for addr in batch:
+            _enqueue(addr)
+            queued += 1
+        cycle_offset += queued
+        _inc("cycle_fetches")
+        print(f"[{ROLE}] cycle queued {queued} for check", flush=True)
 
-        # Wait until it's time to go back and fetch
-        while True:
-            time.sleep(5)
+def _start_checker():
+    # pipeline first — waits until queue is ready
+    t = threading.Thread(target=_checker_pipeline_thread, daemon=True, name="pipeline")
+    t.start()
 
-            # get current queue depth across all T1 nodes
-            remaining = _get_t1_queue_depth_total()
+    # wait for queue to init
+    deadline = time.time() + 10
+    while _check_queue is None and time.time() < deadline:
+        time.sleep(0.05)
 
-            # get current processing rate
-            rate = _get_t1_pass_rate()   # passes/sec (approximate drain rate)
+    # outbound sender
+    threading.Thread(target=_outbuf_sender, daemon=True, name="outbuf").start()
 
-            if rate > 0:
-                time_to_finish = remaining / rate
-            else:
-                # no rate data yet — use raw queue size as fallback
-                # if remaining is very low just switch back
-                time_to_finish = remaining / 1.0  # assume 1/sec minimum
+    # main checker loop
+    threading.Thread(target=_checker_main, daemon=True, name="checker").start()
 
-            print(
-                f"[{ROLE}] CHECK — remaining={remaining} rate={rate:.2f}/s "
-                f"eta={time_to_finish:.0f}s threshold={FETCH_TIMEOUT_S}s",
-                flush=True,
-            )
-
-            # switch back when estimated finish time <= fetch timeout
-            # so fetching completes just as checking finishes
-            if time_to_finish <= (FETCH_TIMEOUT_S + SWITCH_BACK_LEAD_S):
-                print(
-                    f"[{ROLE}] ETA {time_to_finish:.0f}s ≤ threshold — switching back to FETCH",
-                    flush=True,
-                )
-                break
-
-            # safety — if queue is already empty just go
-            if remaining == 0:
-                print(f"[{ROLE}] queue empty — switching back to FETCH immediately", flush=True)
-                break
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# LOCAL T1 + T2 PIPELINE (fetcher in check mode / fetcher_a/b acting as T1)
-# ═══════════════════════════════════════════════════════════════════════════════
-async def _local_t1_check(session: aiohttp.ClientSession, addr: str) -> tuple[bool, float]:
-    url, keyword = _next_t1()
-    t0 = asyncio.get_event_loop().time()
-    try:
-        async with session.get(
-            url,
-            proxy=f"http://{addr}",
-            timeout=aiohttp.ClientTimeout(total=LOCAL_T1_TIMEOUT),
-            ssl=False,
-        ) as r:
-            if r.status == 200:
-                text    = await r.text()
-                elapsed = asyncio.get_event_loop().time() - t0
-                if keyword == "." or keyword in text:
-                    return True, elapsed
-    except Exception:
-        pass
-    return False, 0.0
-
-async def _local_t2_check(session: aiohttp.ClientSession, addr: str) -> tuple[bool, float]:
-    hdr = _meesho_headers()
-    t0  = asyncio.get_event_loop().time()
-    try:
-        async with session.get(
-            f"{MEESHO_API}/api/1.0/anonymous/config",
-            headers=hdr,
-            proxy=f"http://{addr}",
-            timeout=aiohttp.ClientTimeout(total=LOCAL_T2_TIMEOUT),
-            ssl=False,
-        ) as r:
-            if r.status == 200:
-                raw  = await r.read()
-                enc  = r.headers.get("Content-Encoding", "")
-                data = _decode_meesho(raw, enc)
-                xoox = data.get("xoox", {})
-                if isinstance(xoox, str):
-                    try:    xoox = json.loads(xoox)
-                    except: xoox = {}
-                elapsed = asyncio.get_event_loop().time() - t0
-                if isinstance(xoox, dict) and xoox.get("xo"):
-                    return True, elapsed
-    except Exception:
-        pass
-    return False, 0.0
-
-async def _local_pipeline_main():
-    global _local_t1_queue, _local_t2_queue
-
-    _local_t1_queue = asyncio.Queue(maxsize=30_000)
-    _local_t2_queue = asyncio.Queue(maxsize=5_000)
-
-    tcp_sem = asyncio.Semaphore(LOCAL_T1_CONC)
-    t1_sem  = asyncio.Semaphore(LOCAL_T1_CONC)
-    t2_sem  = asyncio.Semaphore(LOCAL_T2_CONC)
-
-    t1_connector = aiohttp.TCPConnector(limit=LOCAL_T1_CONC + 50, ttl_dns_cache=300)
-    t2_connector = aiohttp.TCPConnector(limit=LOCAL_T2_CONC + 20, ttl_dns_cache=300)
-
-    async def _t1_worker(session):
-        while True:
-            addr = await _local_t1_queue.get()
-            async with tcp_sem:
-                open_ = await _tcp_open_async(addr)
-            if not open_:
-                _inc("t1_tcp_fail")
-                continue
-            async with t1_sem:
-                passed, elapsed = await _local_t1_check(session, addr)
-            if passed:
-                _inc("t1_pass")
-                _record_t1_pass()
-                _log_activity("t1_pass", addr)
-                # immediate push to T2 — no batching
-                target = _t2_target(addr)
-                if not _seen_dup("t2", addr):
-                    if target == ROLE or ROLE in ("fetcher_a", "fetcher_b"):
-                        try:
-                            _local_t2_queue.put_nowait((addr, elapsed))
-                        except asyncio.QueueFull:
-                            _push_downstream(addr, target, elapsed, "t2")
-                    else:
-                        _push_downstream(addr, target, elapsed, "t2")
-            else:
-                _inc("t1_fail")
-
-    async def _t2_worker(session):
-        while True:
-            addr, t1_elapsed = await _local_t2_queue.get()
-            async with t2_sem:
-                passed, t2_elapsed = await _local_t2_check(session, addr)
-            if passed:
-                avg = (t1_elapsed + t2_elapsed) / 2.0
-                cat = _assign_cat(avg)
-                if cat:
-                    _inc(f"t2_pass_{cat}")
-                    _log_activity("t2_pass", f"{addr} → {cat} ({avg:.1f}s)")
-                    _push_downstream(addr, "pool", avg, "pool")
-            else:
-                _inc("t2_fail")
-
-    async def _stats_printer():
-        while True:
-            await asyncio.sleep(15)
-            q1 = _local_t1_queue.qsize()
-            q2 = _local_t2_queue.qsize()
-            with _fstate_lock:
-                fs = _fstate
-            with _counter_lock:
-                cnts = dict(_counters)
-            rate = _get_t1_pass_rate()
-            print(
-                f"[{ROLE}] state={fs} t1_q={q1} t2_q={q2} "
-                f"rate={rate:.2f}/s "
-                f"t1_pass={cnts.get('t1_pass',0)} "
-                f"t2_flash={cnts.get('t2_pass_flash',0)} "
-                f"t2_panther={cnts.get('t2_pass_panther',0)}",
-                flush=True,
-            )
-
-    async with (
-        aiohttp.ClientSession(connector=t1_connector) as t1_sess,
-        aiohttp.ClientSession(connector=t2_connector) as t2_sess,
-    ):
-        tasks = (
-            [asyncio.create_task(_t1_worker(t1_sess)) for _ in range(LOCAL_T1_BATCH)]
-            + [asyncio.create_task(_t2_worker(t2_sess)) for _ in range(LOCAL_T2_CONC)]
-            + [asyncio.create_task(_stats_printer())]
-        )
-        await asyncio.gather(*tasks)
-
-def _local_pipeline_thread():
-    global _local_loop
-    _local_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(_local_loop)
-    _local_loop.run_until_complete(_local_pipeline_main())
-
-def _push_to_local_t1_direct(addr: str):
-    """Push without seen_dup check — used during distribution (already deduped at source)."""
-    if _local_t1_queue and _local_loop and not _local_loop.is_closed():
-        try:
-            asyncio.run_coroutine_threadsafe(
-                _local_t1_queue.put(addr), _local_loop
-            )
-        except RuntimeError:
-            pass
-
-def _push_to_local_t1(addr: str):
-    if _seen_dup("t1", addr):
-        return
-    _push_to_local_t1_direct(addr)
-
-def _push_to_local_t2(addr: str, t1_elapsed: float = 5.0):
-    if _seen_dup("t2", addr):
-        return
-    if _local_t2_queue and _local_loop and not _local_loop.is_closed():
-        try:
-            asyncio.run_coroutine_threadsafe(
-                _local_t2_queue.put((addr, t1_elapsed)), _local_loop
-            )
-        except RuntimeError:
-            pass
-
-def _start_fetcher():
-    repos     = GITHUB_REPOS_A if ROLE == "fetcher_a" else GITHUB_REPOS_B
-    http_srcs = HTTP_SOURCES_A if ROLE == "fetcher_a" else HTTP_SOURCES_B
-
-    # local pipeline handles T1+T2 when in check mode
-    threading.Thread(target=_local_pipeline_thread, daemon=True, name="local-pipeline").start()
-    threading.Thread(target=_outbuf_sender,         daemon=True, name="outbuf").start()
-
-    # phase manager drives the fetch/check cycle
-    threading.Thread(
-        target=_phase_manager,
-        args=(repos, http_srcs),
-        daemon=True,
-        name="phase-manager",
-    ).start()
-
-    print(f"[{ROLE}] fetcher started — sources A={ROLE=='fetcher_a'}", flush=True)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# T1 CHECKER ROLE (dedicated nodes — always checking)
-# ═══════════════════════════════════════════════════════════════════════════════
-async def _t1_check(session: aiohttp.ClientSession, addr: str) -> tuple[bool, float]:
-    url, keyword = _next_t1()
-    t0 = asyncio.get_event_loop().time()
-    try:
-        async with session.get(
-            url,
-            proxy=f"http://{addr}",
-            timeout=aiohttp.ClientTimeout(total=T1_TIMEOUT),
-            ssl=False,
-        ) as r:
-            if r.status == 200:
-                text    = await r.text()
-                elapsed = asyncio.get_event_loop().time() - t0
-                if keyword == "." or keyword in text:
-                    return True, elapsed
-    except Exception:
-        pass
-    return False, 0.0
-
-async def _t1_checker_main():
-    global _t1_queue
-    _t1_queue  = asyncio.Queue(maxsize=20_000)
-    tcp_sem    = asyncio.Semaphore(TCP_PREFILTER_CONC)
-    t1_sem     = asyncio.Semaphore(T1_BATCH_SIZE)
-    connector  = aiohttp.TCPConnector(
-        limit=T1_BATCH_SIZE + 100,
-        ttl_dns_cache=300,
-        enable_cleanup_closed=True,
-    )
-
-    async def _worker(session):
-        while True:
-            addr = await _t1_queue.get()
-            async with tcp_sem:
-                open_ = await _tcp_open_async(addr)
-            if not open_:
-                _inc("t1_tcp_fail")
-                continue
-            async with t1_sem:
-                passed, elapsed = await _t1_check(session, addr)
-            if passed:
-                _inc("t1_pass")
-                _record_t1_pass()
-                _log_activity("t1_pass", addr)
-                # immediate push to T2
-                target = _t2_target(addr)
-                if not _seen_dup("t2", addr):
-                    _push_downstream(addr, target, elapsed, "t2")
-            else:
-                _inc("t1_fail")
-
-    async def _stats_printer():
-        while True:
-            await asyncio.sleep(15)
-            q = _t1_queue.qsize() if _t1_queue else 0
-            with _counter_lock: cnts = dict(_counters)
-            rate = _get_t1_pass_rate()
-            print(
-                f"[{ROLE}] t1_q={q} rate={rate:.2f}/s "
-                f"pass={cnts.get('t1_pass',0)} fail={cnts.get('t1_fail',0)}",
-                flush=True,
-            )
-
-    async with aiohttp.ClientSession(connector=connector) as session:
-        workers    = [asyncio.create_task(_worker(session)) for _ in range(T1_BATCH_SIZE)]
-        stats_task = asyncio.create_task(_stats_printer())
-        await asyncio.gather(*workers, stats_task)
-
-def _t1_checker_thread():
-    global _t1_loop
-    _t1_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(_t1_loop)
-    _t1_loop.run_until_complete(_t1_checker_main())
-
-def _push_to_t1(addr: str):
-    if _seen_dup("t1", addr):
-        return
-    if _t1_queue and _t1_loop and not _t1_loop.is_closed():
-        try:
-            asyncio.run_coroutine_threadsafe(_t1_queue.put(addr), _t1_loop)
-        except RuntimeError:
-            pass
-
-def _start_t1_checker():
-    threading.Thread(target=_t1_checker_thread, daemon=True, name="t1-checker").start()
-    threading.Thread(target=_outbuf_sender,      daemon=True, name="outbuf").start()
-    print(f"[{ROLE}] T1 checker started", flush=True)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# T2 CHECKER ROLE (dedicated nodes — always checking, gets a break when empty)
-# ═══════════════════════════════════════════════════════════════════════════════
-async def _t2_check(session: aiohttp.ClientSession, addr: str) -> tuple[bool, float]:
-    hdr = _meesho_headers()
-    t0  = asyncio.get_event_loop().time()
-    try:
-        async with session.get(
-            f"{MEESHO_API}/api/1.0/anonymous/config",
-            headers=hdr,
-            proxy=f"http://{addr}",
-            timeout=aiohttp.ClientTimeout(total=T2_TIMEOUT),
-            ssl=False,
-        ) as r:
-            if r.status == 200:
-                raw  = await r.read()
-                enc  = r.headers.get("Content-Encoding", "")
-                data = _decode_meesho(raw, enc)
-                xoox = data.get("xoox", {})
-                if isinstance(xoox, str):
-                    try:    xoox = json.loads(xoox)
-                    except: xoox = {}
-                elapsed = asyncio.get_event_loop().time() - t0
-                if isinstance(xoox, dict) and xoox.get("xo"):
-                    return True, elapsed
-    except Exception:
-        pass
-    return False, 0.0
-
-async def _t2_checker_main():
-    global _t2_queue
-    _t2_queue  = asyncio.Queue(maxsize=5_000)
-    t2_sem     = asyncio.Semaphore(T2_CONCURRENT)
-    connector  = aiohttp.TCPConnector(
-        limit=T2_CONCURRENT + 50,
-        ttl_dns_cache=300,
-        enable_cleanup_closed=True,
-    )
-
-    async def _worker(session):
-        while True:
-            # blocks when empty — T2 gets a break naturally
-            addr, t1_elapsed = await _t2_queue.get()
-            async with t2_sem:
-                passed, t2_elapsed = await _t2_check(session, addr)
-            if passed:
-                avg = (t1_elapsed + t2_elapsed) / 2.0
-                cat = _assign_cat(avg)
-                if cat is None:
-                    _inc("t2_rejected")
-                    continue
-                _inc(f"t2_pass_{cat}")
-                _log_activity("t2_pass", f"{addr} → {cat} ({avg:.1f}s)")
-                # immediate push to pool
-                _push_downstream(addr, "pool", avg, "t2")
-            else:
-                _inc("t2_fail")
-
-    async def _stats_printer():
-        while True:
-            await asyncio.sleep(15)
-            q = _t2_queue.qsize() if _t2_queue else 0
-            with _counter_lock: cnts = dict(_counters)
-            print(
-                f"[{ROLE}] t2_q={q} "
-                f"flash={cnts.get('t2_pass_flash',0)} "
-                f"panther={cnts.get('t2_pass_panther',0)} "
-                f"lantern={cnts.get('t2_pass_lantern',0)} "
-                f"fail={cnts.get('t2_fail',0)}",
-                flush=True,
-            )
-
-    async with aiohttp.ClientSession(connector=connector) as session:
-        workers    = [asyncio.create_task(_worker(session)) for _ in range(T2_WORKERS)]
-        stats_task = asyncio.create_task(_stats_printer())
-        await asyncio.gather(*workers, stats_task)
-
-def _t2_checker_thread():
-    global _t2_loop
-    _t2_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(_t2_loop)
-    _t2_loop.run_until_complete(_t2_checker_main())
-
-def _push_to_t2(addr: str, t1_elapsed: float = 5.0):
-    if _seen_dup("t2", addr):
-        return
-    if _t2_queue and _t2_loop and not _t2_loop.is_closed():
-        try:
-            asyncio.run_coroutine_threadsafe(_t2_queue.put((addr, t1_elapsed)), _t2_loop)
-        except RuntimeError:
-            pass
-
-def _start_t2_checker():
-    threading.Thread(target=_t2_checker_thread, daemon=True, name="t2-checker").start()
-    threading.Thread(target=_outbuf_sender,      daemon=True, name="outbuf").start()
-    print(f"[{ROLE}] T2 checker started", flush=True)
+    print(f"[{ROLE}] checker started", flush=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # POOL ROLE
 # ═══════════════════════════════════════════════════════════════════════════════
+def _promote(addr: str, latency_s: float):
+    cat = _assign_cat(latency_s)
+    if cat is None:
+        _inc("pool_rejected_slow")
+        return
+    now = time.time()
+    with _proxies_lock:
+        rec = _proxies.get(addr)
+        if rec is None:
+            rec = {"received_at": now}
+            _proxies[addr] = rec
+        rec["last_checked"] = now
+        rec["latency_ms"]   = int(latency_s * 1000)
+        rec["label"]        = cat
+        rec["next_check"]   = now + POOL_RECHECK_MIN_AGE_S
+    _inc("pool_promoted")
+    _log("promoted", f"{addr} {cat} {latency_s:.1f}s")
+    _persist_event.set()
+
+def _evict(addr: str, reason: str = "dead"):
+    with _proxies_lock:
+        existed = _proxies.pop(addr, None) is not None
+    if existed:
+        _inc("pool_evicted")
+        _log("evicted", f"{addr} — {reason}")
+        _persist_event.set()
+    with _used_lock:
+        _last_used.pop(addr, None)
+
 def _pick(purpose: str = "backend") -> dict:
     now = time.time()
     with _snap_lock:
-        pool = (_snap_fast or _snap_fresh120) if purpose == "fod-hunt" else _snap_fresh30
+        pool = _snap_fresh30 or _snap_fresh120
         if not pool:
             return {}
         addr = random.choice(pool)
-    with _used_lock:
-        if now - _last_used.get(addr, 0) < COOLDOWN_SEC:
-            with _snap_lock:
+        # try to avoid recently used
+        with _used_lock:
+            if now - _last_used.get(addr, 0) < POOL_COOLDOWN_S:
                 for _ in range(6):
-                    if not pool:
-                        break
                     alt = random.choice(pool)
-                    if now - _last_used.get(alt, 0) >= COOLDOWN_SEC:
+                    if now - _last_used.get(alt, 0) >= POOL_COOLDOWN_S:
                         addr = alt
                         break
-        _last_used[addr] = now
+        with _used_lock:
+            _last_used[addr] = now
     with _proxies_lock:
         r = _proxies.get(addr)
         if r:
-            r["next_check_at"] = now + RECHECK_HOT_S
-    _inc("picks_served")
-    _log_activity("pick_served", addr)
+            r["next_check"] = now + POOL_RECHECK_MIN_AGE_S
+    _inc("pool_picks")
+    _log("pick_served", addr)
     return {"http": f"http://{addr}", "https": f"http://{addr}", "addr": addr}
 
 def mark_dead(addr: str):
     addr = addr.replace("http://", "").replace("https://", "").split("/")[0]
-    _evict(addr, "dead (connect/timeout)")
+    _evict(addr, "dead (reported)")
 
 def _snapshot_worker():
     global _snap_fresh30, _snap_fresh120, _snap_fast
@@ -1422,7 +846,7 @@ def _snapshot_worker():
         for a, r in items:
             lc  = r.get("last_checked", 0)
             age = (now - lc) if lc else 1e9
-            if lc and age > STALE_EVICT_S:
+            if lc and now - r.get("received_at", now) > POOL_TTL_S:
                 stale.append(a)
                 continue
             if age <= FRESH_COLD_S:
@@ -1432,35 +856,64 @@ def _snapshot_worker():
                 if age <= FRESH_HOT_S:
                     f30.append(a)
         for a in stale:
-            _evict(a, "stale")
+            _evict(a, "ttl_expired")
         with _snap_lock:
-            _snap_fresh30, _snap_fresh120, _snap_fast = f30, f120, fast
+            _snap_fresh30  = f30
+            _snap_fresh120 = f120
+            _snap_fast     = fast
         time.sleep(SNAP_INTERVAL_S)
 
-def _refresh_worker():
-    time.sleep(10)
-    while True:
-        now = time.time()
-        with _proxies_lock:
-            due = [a for a, r in _proxies.items() if now >= r.get("next_check_at", 0)]
-        random.shuffle(due)
-        for a in due[:REFRESH_BATCH]:
-            if _seen_dup("recheck", a):
-                continue
-            _push_downstream(a, _t2_target(a), 5.0, "t2")
+async def _pool_recheck_worker():
+    """Periodically recheck proxies older than POOL_RECHECK_MIN_AGE_S via meesho."""
+    connector = aiohttp.TCPConnector(limit=POOL_RECHECK_BATCH + 10, ttl_dns_cache=300)
+    sem = asyncio.Semaphore(POOL_RECHECK_BATCH)
+
+    async with aiohttp.ClientSession(connector=connector) as session:
+        while True:
+            await asyncio.sleep(POOL_RECHECK_INTERVAL_S)
+            now = time.time()
             with _proxies_lock:
-                r = _proxies.get(a)
-                if r:
-                    r["next_check_at"] = now + RECHECK_WARM_S
-        time.sleep(REFRESH_TICK_S)
+                due = [
+                    a for a, r in _proxies.items()
+                    if now >= r.get("next_check", 0)
+                ]
+            random.shuffle(due)
+            batch = due[:POOL_RECHECK_BATCH]
+            if not batch:
+                continue
+
+            print(f"[pool] recheck {len(batch)} proxies", flush=True)
+
+            async def _check_one(addr):
+                async with sem:
+                    passed, latency = await _meesho_check(session, addr)
+                if passed:
+                    _promote(addr, latency)
+                    _inc("recheck_pass")
+                else:
+                    _evict(addr, "recheck_fail")
+                    _inc("recheck_fail")
+
+            await asyncio.gather(*[_check_one(a) for a in batch])
+
+def _pool_recheck_thread():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(_pool_recheck_worker())
+
+def _persist_worker():
+    while True:
+        _persist_event.wait(timeout=PERSIST_INTERVAL_S)
+        _persist_event.clear()
+        _save_free()
+        _save_paid()
 
 def _start_pool():
     _load_free()
-    threading.Thread(target=_snapshot_worker, daemon=True, name="snap").start()
-    threading.Thread(target=_refresh_worker,  daemon=True, name="refresh").start()
-    threading.Thread(target=_persist_worker,  daemon=True, name="persist").start()
-    threading.Thread(target=_outbuf_sender,   daemon=True, name="outbuf").start()
-    print(f"[{ROLE}] pool (Yoru) started — {len(_live)} proxies loaded", flush=True)
+    threading.Thread(target=_snapshot_worker,        daemon=True, name="snap").start()
+    threading.Thread(target=_pool_recheck_thread,    daemon=True, name="recheck").start()
+    threading.Thread(target=_persist_worker,         daemon=True, name="persist").start()
+    print(f"[pool] started — {len(_proxies)} proxies loaded", flush=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # VPS ROLE
@@ -1591,9 +1044,8 @@ def _paid_worker():
 
 def _pinger():
     ping_order = [
-        "t2_a", "t2_b", "t2_c",
-        "t1_a", "t1_b", "t1_c", "t1_d", "t1_e",
-        "fetcher_a", "fetcher_b",
+        "checker_1", "checker_2", "checker_3", "checker_4", "checker_5",
+        "checker_6", "checker_7", "checker_8", "checker_9", "checker_10",
         "pool", "dashboard",
     ]
     while True:
@@ -1615,7 +1067,89 @@ def _start_vps():
     threading.Thread(target=_paid_worker,    daemon=True, name="paid").start()
     threading.Thread(target=_pinger,         daemon=True, name="pinger").start()
     threading.Thread(target=_persist_worker, daemon=True, name="persist").start()
-    print(f"[{ROLE}] VPS started", flush=True)
+    print(f"[vps] started", flush=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PERSIST
+# ═══════════════════════════════════════════════════════════════════════════════
+def _save_free():
+    try:
+        with _proxies_lock:
+            data = {
+                a: {
+                    "label":        r.get("label"),
+                    "latency_ms":   r.get("latency_ms"),
+                    "last_checked": r.get("last_checked", 0),
+                    "received_at":  r.get("received_at", 0),
+                }
+                for a, r in _proxies.items()
+            }
+        PERSIST_FREE.write_text(json.dumps(data))
+    except Exception as e:
+        print(f"[persist] free save failed: {e}", flush=True)
+
+def _load_free():
+    if not PERSIST_FREE.exists():
+        return
+    try:
+        data = json.loads(PERSIST_FREE.read_text())
+        now  = time.time()
+        rows = data.items() if isinstance(data, dict) else [(a, {}) for a in data]
+        with _proxies_lock:
+            for addr, r in rows:
+                # skip if too old to trust
+                if now - r.get("received_at", 0) > POOL_TTL_S:
+                    continue
+                _proxies[addr] = {
+                    "received_at":  r.get("received_at", now),
+                    "last_checked": r.get("last_checked", 0),
+                    "latency_ms":   r.get("latency_ms", 0),
+                    "label":        r.get("label"),
+                    "next_check":   now,
+                }
+        print(f"[persist] loaded {len(_proxies)} free proxies", flush=True)
+    except Exception as e:
+        print(f"[persist] free load failed: {e}", flush=True)
+
+def _save_paid():
+    try:
+        with _paid_lock:
+            data = {a: dict(p) for a, p in _paid_proxies.items() if p.get("alive")}
+        PERSIST_PAID.write_text(json.dumps(data))
+    except Exception as e:
+        print(f"[persist] paid save failed: {e}", flush=True)
+
+def _load_paid():
+    if not PERSIST_PAID.exists():
+        return
+    try:
+        data = json.loads(PERSIST_PAID.read_text())
+        with _paid_lock:
+            for addr, p in data.items():
+                if addr not in _paid_proxies:
+                    _paid_proxies[addr] = p
+        print(f"[persist] loaded {len(data)} paid proxies", flush=True)
+    except Exception as e:
+        print(f"[persist] paid load failed: {e}", flush=True)
+
+def _save_keys():
+    try:
+        with _keys_lock:
+            keys = list(_keys)
+        KEYS_FILE.write_text(json.dumps(keys, indent=2))
+    except Exception as e:
+        print(f"[persist] keys save failed: {e}", flush=True)
+
+def _load_keys():
+    if not KEYS_FILE.exists():
+        return
+    try:
+        data = json.loads(KEYS_FILE.read_text())
+        with _keys_lock:
+            _keys.extend(data)
+        print(f"[persist] loaded {len(data)} keys", flush=True)
+    except Exception as e:
+        print(f"[persist] keys load failed: {e}", flush=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STATS
@@ -1631,43 +1165,36 @@ def _get_stats() -> dict:
     for _, r in items:
         if r.get("label"):
             labs[r["label"]] += 1
-    with _raw_pool_lock: rn = _raw_pool_count
     with _paid_lock:
         p_total = len(_paid_proxies)
         p_alive = sum(1 for p in _paid_proxies.values() if p.get("alive"))
-    with _outbuf_lock:  obuf = len(_outbuf)
+    with _outbuf_lock: obuf = len(_outbuf)
     with _counter_lock: cnts = dict(_counters)
     with _activity_lock: acts = list(reversed(_activity_log))
-    with _fstate_lock:  fs = _fstate
-
-    t1_q = 0
-    if _local_t1_queue: t1_q = _local_t1_queue.qsize()
-    elif _t1_queue:     t1_q = _t1_queue.qsize()
-
-    t2_q = 0
-    if _local_t2_queue: t2_q = _local_t2_queue.qsize()
-    elif _t2_queue:     t2_q = _t2_queue.qsize()
+    q_depth = _check_queue.qsize() if _check_queue else 0
 
     return {
-        "role":       ROLE,
-        "phase":      fs,
-        "t1_pass_rate": _get_t1_pass_rate(),
-        "counters":   cnts,
-        "activity":   acts[:50],
-        "queues":     {"t1": t1_q, "t2": t2_q, "outbuf": obuf, "raw_pool": rn},
+        "role":     ROLE,
+        "counters": cnts,
+        "activity": acts[:50],
+        "queues":   {"check": q_depth, "outbuf": obuf},
         "free": {
-            "live": live, "fresh_30s": f30, "fresh_120s": f120,
-            "flash": labs["flash"], "panther": labs["panther"],
-            "lantern": labs["lantern"], "deadass": labs["deadass"],
+            "live":      live,
+            "fresh_30s": f30,
+            "fresh_120s": f120,
+            "flash":     labs["flash"],
+            "panther":   labs["panther"],
+            "lantern":   labs["lantern"],
+            "deadass":   labs["deadass"],
         },
         "paid":  {"total": p_total, "alive": p_alive},
         "peers": {role: url for role, url in PEERS.items()},
     }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# FASTAPI APP
+# FASTAPI
 # ═══════════════════════════════════════════════════════════════════════════════
-app = FastAPI(title=f"ProxyStack [{ROLE}]")
+app = FastAPI(title=f"ProxyStack v2 [{ROLE}]")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 _static = BASE / "static"
@@ -1676,38 +1203,26 @@ if _static.exists():
 
 @app.on_event("startup")
 async def _startup():
-    if ROLE in ("fetcher_a", "fetcher_b"):
-        _start_fetcher()
+    if ROLE.startswith("checker_"):
+        _start_checker()
         deadline = time.time() + 10
-        while _local_t1_queue is None and time.time() < deadline:
-            await asyncio.sleep(0.05)
-
-    elif ROLE in ("t1_a", "t1_b", "t1_c", "t1_d", "t1_e"):
-        _start_t1_checker()
-        deadline = time.time() + 10
-        while _t1_queue is None and time.time() < deadline:
-            await asyncio.sleep(0.05)
-
-    elif ROLE in ("t2_a", "t2_b", "t2_c"):
-        _start_t2_checker()
-        deadline = time.time() + 10
-        while _t2_queue is None and time.time() < deadline:
+        while _check_queue is None and time.time() < deadline:
             await asyncio.sleep(0.05)
 
     elif ROLE == "pool":
         _start_pool()
 
     elif ROLE == "dashboard":
-        print(f"[{ROLE}] Jett dashboard started", flush=True)
+        print(f"[dashboard] Yoru started", flush=True)
 
     elif ROLE == "vps":
         _start_vps()
 
-    print(f"[ProxyStack] {ROLE} booted on port {PORT}", flush=True)
+    print(f"[ProxyStack v2] {ROLE} booted on port {PORT}", flush=True)
 
 @app.get("/health")
 def health():
-    return {"ok": True, "role": ROLE, "phase": _fstate}
+    return {"ok": True, "role": ROLE}
 
 @app.get("/stats")
 async def stats():
@@ -1724,13 +1239,9 @@ async def activity(limit: int = 50):
 def qsize(x_secret: Optional[str] = Header(None)):
     if x_secret != SHARED_SECRET:
         raise HTTPException(403, "invalid secret")
-    t1_q = 0
-    if _local_t1_queue: t1_q = _local_t1_queue.qsize()
-    elif _t1_queue:     t1_q = _t1_queue.qsize()
-    t2_q = 0
-    if _local_t2_queue: t2_q = _local_t2_queue.qsize()
-    elif _t2_queue:     t2_q = _t2_queue.qsize()
-    return {"t1_qsize": t1_q, "t2_qsize": t2_q, "role": ROLE, "phase": _fstate}
+    q = _check_queue.qsize() if _check_queue else 0
+    with _outbuf_lock: ob = len(_outbuf)
+    return {"check_qsize": q, "outbuf": ob, "role": ROLE}
 
 async def _sse_generator():
     loop = asyncio.get_event_loop()
@@ -1774,10 +1285,10 @@ async def stream_stats():
         },
     )
 
+# ── Pool ingest ───────────────────────────────────────────────────────────────
 class IngestItem(BaseModel):
-    addr:       str
-    t1_elapsed: float = 5.0
-    stage:      str   = "t1"
+    addr:      str
+    latency_s: float = 5.0
 
 class IngestRequest(BaseModel):
     proxies: list[IngestItem]
@@ -1786,45 +1297,30 @@ class IngestRequest(BaseModel):
 async def ingest(req: IngestRequest, x_secret: Optional[str] = Header(None)):
     if x_secret != SHARED_SECRET:
         raise HTTPException(403, "invalid secret")
+    if ROLE != "pool":
+        raise HTTPException(400, f"ingest only on pool role, this is {ROLE}")
+    for item in req.proxies:
+        _promote(item.addr, item.latency_s)
+    return {"ingested": len(req.proxies)}
 
-    if ROLE in ("t1_a", "t1_b", "t1_c", "t1_d", "t1_e"):
-        for item in req.proxies:
-            _push_to_t1(item.addr)
-        return {"queued": len(req.proxies)}
-
-    elif ROLE in ("t2_a", "t2_b", "t2_c"):
-        for item in req.proxies:
-            _push_to_t2(item.addr, item.t1_elapsed)
-        return {"queued": len(req.proxies)}
-
-    elif ROLE in ("fetcher_a", "fetcher_b"):
-        for item in req.proxies:
-            if item.stage == "t2":
-                _push_to_local_t2(item.addr, item.t1_elapsed)
-            else:
-                _push_to_local_t1(item.addr)
-        return {"queued": len(req.proxies)}
-
-    elif ROLE == "pool":
-        for item in req.proxies:
-            _promote(item.addr, item.t1_elapsed)
-        return {"queued": len(req.proxies)}
-
-    raise HTTPException(400, f"role {ROLE} does not accept ingest")
-
+# ── Pool pick ─────────────────────────────────────────────────────────────────
 @app.get("/pick")
-async def pick_route(cat: str = "any", purpose: str = "backend",
-                     x_secret: Optional[str] = Header(None)):
+async def pick_route(
+    cat: str = "any",
+    purpose: str = "backend",
+    x_secret: Optional[str] = Header(None),
+):
     if x_secret != SHARED_SECRET:
         raise HTTPException(403, "invalid secret")
     if ROLE != "pool":
-        raise HTTPException(400, "pick only available on pool role")
+        raise HTTPException(400, "pick only on pool role")
     loop = asyncio.get_event_loop()
     p = await loop.run_in_executor(_api_executor, _pick, purpose)
     if not p:
         raise HTTPException(503, "no live proxies available")
     return p
 
+# ── Pool dead ─────────────────────────────────────────────────────────────────
 class DeadReport(BaseModel):
     addr: str
 
@@ -1837,6 +1333,7 @@ async def report_dead(req: DeadReport, x_secret: Optional[str] = Header(None)):
     mark_dead(req.addr)
     return {"ok": True}
 
+# ── VPS /request (unchanged contract) ────────────────────────────────────────
 class ProxyRequest(BaseModel):
     url:      str
     method:   str            = "GET"
@@ -1851,7 +1348,7 @@ class ProxyRequest(BaseModel):
 @app.post("/request")
 async def proxy_request(req: ProxyRequest):
     if ROLE != "vps":
-        raise HTTPException(400, "/request only available on vps role")
+        raise HTTPException(400, "/request only on vps role")
 
     method   = req.method.upper()
     last_err = None
@@ -1908,28 +1405,22 @@ async def proxy_request(req: ProxyRequest):
 
         except asyncio.TimeoutError as e:
             last_err = str(e)
-            print(f"[vps] attempt {attempt+1}/{req.retries} via {proxy_addr} read-timeout", flush=True)
-
         except aiohttp.ClientProxyConnectionError as e:
             last_err = str(e)
             await loop.run_in_executor(_backend_executor, _report_dead_to_pool, proxy_addr)
             if skey:
                 with _sticky_lock: _sticky.pop(skey, None)
-            print(f"[vps] attempt {attempt+1}/{req.retries} via {proxy_addr} proxy-dead", flush=True)
-
         except aiohttp.ClientConnectionError as e:
             last_err = str(e)
             await loop.run_in_executor(_backend_executor, _report_dead_to_pool, proxy_addr)
             if skey:
                 with _sticky_lock: _sticky.pop(skey, None)
-            print(f"[vps] attempt {attempt+1}/{req.retries} via {proxy_addr} connect-fail", flush=True)
-
         except Exception as e:
             last_err = str(e)
-            print(f"[vps] attempt {attempt+1}/{req.retries} err: {e}", flush=True)
 
     raise HTTPException(502, f"all {req.retries} attempts failed. last: {last_err}")
 
+# ── VPS key management (unchanged) ───────────────────────────────────────────
 class AddKeyRequest(BaseModel):
     provider: str
     key:      str
@@ -2006,11 +1497,17 @@ async def list_keys():
             for k in _keys
         ]
 
+# ── Dashboard / pool root ─────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    if ROLE == "dashboard":
+    if ROLE in ("pool", "dashboard"):
         dash = BASE / "static" / "dashboard.html"
         if dash.exists():
             return HTMLResponse(dash.read_text())
-        return HTMLResponse("<h2>ProxyStack — Jett Dashboard</h2><p>dashboard.html not found in /static/</p>")
-    return {"role": ROLE, "status": "running", "phase": _fstate}
+        return HTMLResponse(
+            "<h2>ProxyStack v2</h2>"
+            "<p>dashboard.html not found — drop it in /static/</p>"
+            "<p><a href='/stats'>stats JSON</a> | "
+            "<a href='/stream/stats'>SSE stream</a></p>"
+        )
+    return {"role": ROLE, "status": "running"}
