@@ -46,13 +46,8 @@ body{
   color-scheme:dark;
 }
 
-/* ── CANVAS BG ── */
-#bg-canvas{
-  position:fixed;inset:0;z-index:0;
-  pointer-events:none;opacity:.6;
-}
+#bg-canvas{position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.6;}
 
-/* ── LAYOUT ── */
 .shell{
   position:relative;z-index:1;
   display:flex;flex-direction:column;
@@ -60,7 +55,6 @@ body{
   padding-bottom:env(safe-area-inset-bottom,0px);
 }
 
-/* ── HEADER ── */
 header{
   position:sticky;top:env(safe-area-inset-top,0px);
   background:rgba(5,5,10,.75);
@@ -73,10 +67,7 @@ header{
   z-index:200;
 }
 
-.logo{
-  display:flex;align-items:center;gap:10px;
-  flex-shrink:0;
-}
+.logo{display:flex;align-items:center;gap:10px;flex-shrink:0;}
 .logo-icon{
   width:32px;height:32px;
   background:linear-gradient(135deg,var(--accent),var(--accent2));
@@ -91,10 +82,7 @@ header{
   background:linear-gradient(135deg,rgba(255,255,255,.25),transparent);
   border-radius:inherit;
 }
-.logo-text{
-  font-size:15px;font-weight:700;
-  color:var(--text);letter-spacing:.01em;
-}
+.logo-text{font-size:15px;font-weight:700;color:var(--text);letter-spacing:.01em;}
 .logo-text em{color:var(--accent);font-style:normal;}
 
 .hdr-sep{width:1px;height:24px;background:var(--border2);flex-shrink:0;}
@@ -140,7 +128,6 @@ header{
   letter-spacing:.04em;
 }
 
-/* ── BANNER ── */
 .banner{
   display:none;
   background:rgba(255,107,107,.06);
@@ -153,7 +140,6 @@ header{
 }
 .banner.show{display:block;}
 
-/* ── MAIN GRID ── */
 main{
   padding:20px 24px 28px;
   max-width:1520px;
@@ -162,7 +148,6 @@ main{
   display:flex;flex-direction:column;gap:16px;
 }
 
-/* ── ROW LAYOUT ── */
 .row{display:grid;gap:16px;}
 .row-2{grid-template-columns:1fr 1fr;}
 .row-3{grid-template-columns:1fr 1fr 1fr;}
@@ -171,7 +156,6 @@ main{
 @media(max-width:1100px){.row-hero,.row-3,.row-4{grid-template-columns:1fr 1fr;}}
 @media(max-width:700px){.row-2,.row-hero,.row-3,.row-4{grid-template-columns:1fr;}}
 
-/* ── STAT CARDS ROW ── */
 .stat-strip{
   display:grid;
   grid-template-columns:repeat(6,1fr);
@@ -180,7 +164,6 @@ main{
 @media(max-width:1100px){.stat-strip{grid-template-columns:repeat(3,1fr);}}
 @media(max-width:700px){.stat-strip{grid-template-columns:repeat(2,1fr);}}
 
-/* ── BASE CARD ── */
 .card{
   background:var(--surface);
   border:1px solid var(--border);
@@ -199,7 +182,6 @@ main{
 .card:hover{border-color:rgba(124,110,255,.25);}
 .card:hover::before{opacity:1;}
 
-/* ── STAT CARD ── */
 .stat-card{
   background:var(--surface);
   border:1px solid var(--border);
@@ -245,7 +227,6 @@ main{
 .sc-delta.up{background:rgba(0,229,184,.12);color:var(--accent2);display:block;}
 .sc-delta.dn{background:rgba(255,107,107,.12);color:var(--accent3);display:block;}
 
-/* ── CARD TITLE ── */
 .card-head{
   display:flex;align-items:center;gap:8px;
   margin-bottom:18px;
@@ -255,7 +236,7 @@ main{
   color:var(--muted);
   letter-spacing:.1em;text-transform:uppercase;
 }
-.card-head-right{margin-left:auto;}
+.card-head-right{margin-left:auto;display:flex;gap:6px;}
 .card-badge{
   font-size:9px;padding:3px 10px;border-radius:8px;
   background:rgba(124,110,255,.1);
@@ -265,17 +246,10 @@ main{
   cursor:pointer;transition:background .2s,border-color .2s;
 }
 .card-badge:hover{background:rgba(124,110,255,.2);border-color:rgba(124,110,255,.4);}
+.card-badge.busy{opacity:.5;pointer-events:none;}
 
-/* ── BIG POOL ── */
-.pool-hero{
-  display:flex;flex-direction:column;
-  gap:0;
-  height:100%;
-}
-.pool-big{
-  display:flex;align-items:flex-end;gap:24px;
-  margin-bottom:20px;
-}
+.pool-hero{display:flex;flex-direction:column;gap:0;height:100%;}
+.pool-big{display:flex;align-items:flex-end;gap:24px;margin-bottom:20px;}
 .pool-num-wrap .lbl{
   font-size:10px;color:var(--muted);
   letter-spacing:.08em;text-transform:uppercase;
@@ -290,10 +264,7 @@ main{
   transition:filter .3s;
   letter-spacing:-.02em;
 }
-.pool-sub-col{
-  display:flex;flex-direction:column;gap:7px;
-  padding-bottom:6px;
-}
+.pool-sub-col{display:flex;flex-direction:column;gap:7px;padding-bottom:6px;}
 .pool-sub-row{
   font-size:11px;color:var(--muted);
   display:flex;gap:6px;align-items:center;
@@ -303,7 +274,6 @@ main{
   font-variant-numeric:tabular-nums;min-width:36px;text-align:right;
 }
 
-/* ── LABEL BARS ── */
 .label-bars{display:flex;flex-direction:column;gap:10px;}
 .lb-row{display:flex;align-items:center;gap:10px;}
 .lb-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;}
@@ -320,11 +290,7 @@ main{
 .lb-cnt.lantern{color:var(--lantern);}
 .lb-cnt.deadass{color:var(--deadass);}
 
-/* ── PIPELINE ── */
-.pipeline{
-  display:flex;align-items:stretch;gap:0;
-  margin:4px 0;
-}
+.pipeline{display:flex;align-items:stretch;gap:0;margin:4px 0;}
 .pipe-node{
   flex:1;
   background:var(--surface2);
@@ -382,7 +348,6 @@ main{
 .pe-item{font-size:10px;color:var(--muted);}
 .pe-item span{color:var(--text);font-weight:600;font-variant-numeric:tabular-nums;}
 
-/* ── HEALTH ── */
 .health-grid{
   display:grid;
   grid-template-columns:repeat(auto-fill,minmax(200px,1fr));
@@ -439,7 +404,6 @@ main{
 .hc-chip.down{background:rgba(255,107,107,.1);color:var(--accent3);}
 .hc-chip.pending{background:rgba(255,169,77,.1);color:var(--lantern);}
 
-/* ── CHECKERS ── */
 .checker-grid{
   display:grid;
   grid-template-columns:repeat(auto-fill,minmax(210px,1fr));
@@ -474,9 +438,7 @@ main{
   display:grid;grid-template-columns:1fr 1fr 1fr;
   gap:4px;
 }
-.cc-stat{
-  display:flex;flex-direction:column;gap:2px;
-}
+.cc-stat{display:flex;flex-direction:column;gap:2px;}
 .cc-stat .k{font-size:8px;color:var(--muted);letter-spacing:.06em;text-transform:uppercase;}
 .cc-stat .v{
   font-size:13px;font-weight:700;color:var(--text);
@@ -485,17 +447,13 @@ main{
 .cc-stat .v.pass{color:var(--accent2);}
 .cc-stat .v.fail{color:var(--accent3);}
 
-.cc-divider{
-  margin:8px 0;
-  border:none;border-top:1px solid var(--border);
-}
+.cc-divider{margin:8px 0;border:none;border-top:1px solid var(--border);}
 .cc-cycle-row{
   display:flex;justify-content:space-between;
   font-size:9px;color:var(--muted);
 }
 .cc-cycle-row span{color:var(--accent);font-weight:600;font-variant-numeric:tabular-nums;}
 
-/* ── CALLERS ── */
 .caller-rows{display:flex;flex-direction:column;gap:6px;}
 .caller-row{
   display:flex;align-items:center;gap:10px;
@@ -523,7 +481,6 @@ main{
 }
 .cr-pct{font-size:9px;color:var(--muted);min-width:30px;text-align:right;flex-shrink:0;}
 
-/* ── LOG ── */
 .log-wrap{
   height:260px;overflow-y:auto;
   font-family:'JetBrains Mono',monospace;
@@ -596,12 +553,12 @@ main{
 .keys-msg.ok{color:var(--accent2);}
 .keys-msg.err{color:var(--accent3);}
 
-.keys-list{display:flex;flex-direction:column;gap:6px;max-height:280px;overflow-y:auto;}
+.keys-list{display:flex;flex-direction:column;gap:6px;max-height:320px;overflow-y:auto;}
 .keys-list::-webkit-scrollbar{width:4px;}
 .keys-list::-webkit-scrollbar-thumb{background:var(--muted2);border-radius:2px;}
 .key-row{
   display:grid;
-  grid-template-columns:110px 1fr 60px 130px 90px 30px;
+  grid-template-columns:110px 1fr 60px 60px 130px 90px 30px;
   gap:10px;align-items:center;
   background:var(--surface2);border:1px solid var(--border);
   border-radius:8px;padding:8px 12px;
@@ -613,6 +570,12 @@ main{
 .kr-status{font-weight:700;font-size:9px;letter-spacing:.06em;text-transform:uppercase;}
 .kr-status.ok{color:var(--accent2);}
 .kr-status.err{color:var(--accent3);}
+.kr-source{
+  font-weight:700;font-size:9px;letter-spacing:.06em;text-transform:uppercase;
+  padding:2px 6px;border-radius:5px;text-align:center;
+}
+.kr-source.api{background:rgba(0,229,184,.12);color:var(--accent2);}
+.kr-source.local{background:rgba(124,110,255,.1);color:var(--accent);}
 .kr-credits{color:var(--muted);text-align:right;font-variant-numeric:tabular-nums;}
 .kr-hint{color:var(--muted2);font-size:10px;}
 .kr-rm{
@@ -624,8 +587,29 @@ main{
   transition:all .2s;
 }
 .kr-rm:hover{border-color:var(--accent3);color:var(--accent3);background:rgba(255,107,107,.08);}
+
+.sync-banner{
+  display:none;
+  background:rgba(255,107,107,.06);
+  border:1px solid rgba(255,107,107,.2);
+  border-radius:8px;
+  padding:8px 12px;
+  font-size:10px;
+  font-family:'JetBrains Mono',monospace;
+  color:var(--accent3);
+  margin-bottom:12px;
+  line-height:1.6;
+  max-height:120px;
+  overflow-y:auto;
+}
+.sync-banner.show{display:block;}
+.sync-banner.ok{background:rgba(0,229,184,.06);border-color:rgba(0,229,184,.2);color:var(--accent2);}
+
+@keyframes spin{to{transform:rotate(360deg);}}
+.spin{display:inline-block;animation:spin .8s linear infinite;}
+
 @media(max-width:700px){
-  .key-row{grid-template-columns:1fr 60px 30px;}
+  .key-row{grid-template-columns:1fr 60px 60px 30px;}
   .key-row .kr-provider,.key-row .kr-credits,.key-row .kr-hint{display:none;}
 }
 
@@ -637,7 +621,6 @@ main{
   100%{transform:scale(1);}
 }
 
-/* ── FOOTER ── */
 footer{
   border-top:1px solid var(--border);
   padding:12px 28px;
@@ -646,7 +629,6 @@ footer{
 }
 .foot-dot{width:5px;height:5px;border-radius:50%;background:var(--muted2);}
 
-/* ── ENTRANCE ── */
 .card{animation:cardIn .5s ease both;}
 main .row:nth-child(1) .card,.stat-strip .stat-card{animation-delay:.04s;}
 main .row:nth-child(2) .card{animation-delay:.1s;}
@@ -656,7 +638,6 @@ main .row:nth-child(5) .card{animation-delay:.28s;}
 main .row:nth-child(6) .card{animation-delay:.34s;}
 @keyframes cardIn{from{opacity:0;transform:translateY(14px);}to{opacity:1;transform:translateY(0);}}
 
-/* ── REDUCED MOTION ── */
 @media(prefers-reduced-motion:reduce){
   *,*::before,*::after{animation:none!important;transition:none!important;}
 }
@@ -699,7 +680,6 @@ main .row:nth-child(6) .card{animation-delay:.34s;}
 
 <main>
 
-  <!-- STAT STRIP -->
   <div class="stat-strip">
     <div class="stat-card">
       <div class="sc-label">Live Proxies</div>
@@ -734,10 +714,8 @@ main .row:nth-child(6) .card{animation-delay:.34s;}
     </div>
   </div>
 
-  <!-- HERO ROW -->
   <div class="row row-hero">
 
-    <!-- POOL -->
     <div class="card">
       <div class="card-head">
         <div class="card-title">Pool — Live</div>
@@ -785,7 +763,6 @@ main .row:nth-child(6) .card{animation-delay:.34s;}
       </div>
     </div>
 
-    <!-- PIPELINE -->
     <div class="card">
       <div class="card-head">
         <div class="card-title">Pipeline</div>
@@ -811,7 +788,6 @@ main .row:nth-child(6) .card{animation-delay:.34s;}
       </div>
     </div>
 
-    <!-- CALLERS -->
     <div class="card">
       <div class="card-head">
         <div class="card-title">Callers</div>
@@ -823,7 +799,6 @@ main .row:nth-child(6) .card{animation-delay:.34s;}
 
   </div>
 
-  <!-- HEALTH -->
   <div class="row">
     <div class="card">
       <div class="card-head">
@@ -842,7 +817,6 @@ main .row:nth-child(6) .card{animation-delay:.34s;}
     </div>
   </div>
 
-  <!-- CHECKERS -->
   <div class="row">
     <div class="card">
       <div class="card-head">
@@ -858,9 +832,12 @@ main .row:nth-child(6) .card{animation-delay:.34s;}
       <div class="card-head">
         <div class="card-title">Premium Providers</div>
         <div class="card-head-right">
+          <button class="card-badge" id="sync-btn" onclick="syncCredits()">⟳ Sync Credits</button>
           <button class="card-badge" onclick="loadKeys()">↻ Refresh</button>
         </div>
       </div>
+
+      <div class="sync-banner" id="sync-banner"></div>
 
       <div class="provider-rows" id="provider-rows"></div>
 
@@ -887,7 +864,6 @@ main .row:nth-child(6) .card{animation-delay:.34s;}
     </div>
   </div>
 
-  <!-- LOG -->
   <div class="row">
     <div class="card">
       <div class="card-head">
@@ -908,16 +884,13 @@ main .row:nth-child(6) .card{animation-delay:.34s;}
   <span id="foot-status">connecting...</span>
 </footer>
 
-</div><!-- shell -->
+</div>
 
 <script>
-/* ═══════════════════════════════════════
-   CANVAS PARTICLE BACKGROUND
-═══════════════════════════════════════ */
 (function(){
   const canvas = document.getElementById('bg-canvas');
   const ctx = canvas.getContext('2d');
-  let W, H, particles = [], raf;
+  let W, H, particles = [];
 
   function resize(){
     W = canvas.width  = window.innerWidth;
@@ -925,9 +898,7 @@ main .row:nth-child(6) .card{animation-delay:.34s;}
   }
 
   const COLORS = ['rgba(124,110,255,', 'rgba(0,229,184,', 'rgba(76,201,240,'];
-  function Particle(){
-    this.reset();
-  }
+  function Particle(){ this.reset(); }
   Particle.prototype.reset = function(){
     this.x = Math.random() * W;
     this.y = Math.random() * H;
@@ -940,9 +911,7 @@ main .row:nth-child(6) .card{animation-delay:.34s;}
     this.maxLife = 200 + Math.random() * 300;
   };
   Particle.prototype.step = function(){
-    this.x += this.vx;
-    this.y += this.vy;
-    this.life++;
+    this.x += this.vx; this.y += this.vy; this.life++;
     if(this.life > this.maxLife || this.x < 0 || this.x > W || this.y < 0 || this.y > H) this.reset();
   };
 
@@ -988,7 +957,7 @@ main .row:nth-child(6) .card{animation-delay:.34s;}
       ctx.fillStyle = p.col + p.alpha + ')';
       ctx.fill();
     });
-    raf = requestAnimationFrame(draw);
+    requestAnimationFrame(draw);
   }
 
   window.addEventListener('resize', ()=>{ resize(); init(); });
@@ -996,9 +965,6 @@ main .row:nth-child(6) .card{animation-delay:.34s;}
 })();
 
 
-/* ═══════════════════════════════════════
-   ANIMATED NUMBER COUNTER
-═══════════════════════════════════════ */
 const _numState = {};
 
 function animNum(id, target, fmt){
@@ -1033,12 +999,10 @@ function setVal(id, val){
   const el = document.getElementById(id);
   if(el) el.textContent = val;
 }
-
 function setBar(id, pct){
   const el = document.getElementById(id);
   if(el) el.style.width = Math.max(0,Math.min(100,pct)) + '%';
 }
-
 function fmtNum(n){
   if(n === null || n === undefined) return '—';
   if(n >= 1_000_000) return (n/1_000_000).toFixed(1) + 'M';
@@ -1046,10 +1010,6 @@ function fmtNum(n){
   return String(n);
 }
 
-
-/* ═══════════════════════════════════════
-   PEERS CONFIG
-═══════════════════════════════════════ */
 const PEERS = {
   pool:       'https://ps-omen.onrender.com',
   dashboard:  'https://ps-yoru.onrender.com',
@@ -1075,31 +1035,18 @@ const CHECKER_ROLES = [
   'checker_6','checker_7','checker_8','checker_9','checker_10',
 ];
 
-
-/* ═══════════════════════════════════════
-   SESSION STATE
-═══════════════════════════════════════ */
 const session = {
   startTs:    Date.now(),
   poolSnaps:  [],
-  pickTotal:  0,
-  passTotal:  0,
-  failTotal:  0,
-  fetchTotal: 0,
-  evictTotal: 0,
-  callerMap:  {},
-  checkers:   {},
-  lastPoolLive: null,
+  pickTotal:  0, passTotal: 0, failTotal: 0, fetchTotal: 0, evictTotal: 0,
+  callerMap:  {}, checkers: {}, lastPoolLive: null,
 };
 
-const store = {};
 let lastTs  = 0;
-
 const _prev = {};
 
 function ingestData(data){
   lastTs = data.ts || (Date.now()/1000);
-
   const d = new Date(lastTs * 1000);
   const ts = d.toLocaleTimeString('en',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
   setVal('hdr-ts', ts);
@@ -1111,7 +1058,6 @@ function ingestData(data){
   if(poolNode && !poolNode.error){
     renderPool(poolNode);
     renderLog(poolNode);
-
     const cp = (poolNode.caller_picks || {}).lifetime || {};
     for(const [caller, total] of Object.entries(cp)){
       const prev = _prev['caller_' + caller] || 0;
@@ -1131,24 +1077,19 @@ function ingestData(data){
     const failNow = life.check_fail || 0;
     const prevPass = _prev['cp_' + role] || 0;
     const prevFail = _prev['cf_' + role] || 0;
-
     const deltaPass = Math.max(0, passNow - prevPass);
     const deltaFail = Math.max(0, failNow - prevFail);
-
     _prev['cp_' + role] = passNow;
     _prev['cf_' + role] = failNow;
 
     const s = session.checkers[role] || { pass:0, fail:0, q:0, obuf:0, commits:0, cycles:0, ts:0 };
-    s.pass    += deltaPass;
-    s.fail    += deltaFail;
-    s.q        = (nd.queues || {}).check  || 0;
-    s.obuf     = (nd.queues || {}).outbuf || 0;
-    s.commits  = life.commits_detected || 0;
-    s.cycles   = life.cycle_fetches    || 0;
-    s.ts       = lastTs;
+    s.pass += deltaPass; s.fail += deltaFail;
+    s.q = (nd.queues || {}).check || 0;
+    s.obuf = (nd.queues || {}).outbuf || 0;
+    s.commits = life.commits_detected || 0;
+    s.cycles = life.cycle_fetches || 0;
+    s.ts = lastTs;
     session.checkers[role] = s;
-
-    store[role] = { ts:lastTs, counters: nd.counters };
   });
 
   renderCheckers();
@@ -1156,10 +1097,6 @@ function ingestData(data){
   renderStatStrip(poolNode);
 }
 
-
-/* ═══════════════════════════════════════
-   POOL RENDER
-═══════════════════════════════════════ */
 function renderPool(d){
   const f    = d.free || {};
   const life = (d.counters || {}).lifetime || d.counters || {};
@@ -1168,35 +1105,26 @@ function renderPool(d){
   animNum('h-pool-live', live);
   animNum('h-fresh', f.fresh_30s || 0);
   animNum('h-picks', life.pool_picks || 0);
-
   animNum('pool-big', live);
 
-  animNum('p-f30',   f.fresh_30s  || 0);
+  animNum('p-f30',   f.fresh_30s || 0);
   animNum('p-f120',  f.fresh_120s || 0);
   animNum('p-rpass', life.recheck_pass || 0);
   animNum('p-rfail', life.recheck_fail || 0);
   animNum('p-evict', life.pool_evicted || 0);
 
   const total = Math.max(1, live);
-  const flash   = f.flash   || 0;
-  const panther = f.panther || 0;
-  const lantern = f.lantern || 0;
-  const deadass = f.deadass || 0;
+  const flash = f.flash || 0, panther = f.panther || 0;
+  const lantern = f.lantern || 0, deadass = f.deadass || 0;
 
-  animNum('lc-flash',   flash);
-  animNum('lc-panther', panther);
-  animNum('lc-lantern', lantern);
-  animNum('lc-deadass', deadass);
+  animNum('lc-flash', flash); animNum('lc-panther', panther);
+  animNum('lc-lantern', lantern); animNum('lc-deadass', deadass);
   setBar('lb-flash',   Math.round(flash/total*100));
   setBar('lb-panther', Math.round(panther/total*100));
   setBar('lb-lantern', Math.round(lantern/total*100));
   setBar('lb-deadass', Math.round(deadass/total*100));
 }
 
-
-/* ═══════════════════════════════════════
-   STAT STRIP
-═══════════════════════════════════════ */
 function renderStatStrip(poolNode){
   if(poolNode && !poolNode.error){
     const f    = poolNode.free || {};
@@ -1204,10 +1132,10 @@ function renderStatStrip(poolNode){
     const live = f.live || 0;
     const prev = _prev['sc-live'] || null;
 
-    animNum('sc-live',    live);
-    animNum('sc-flash',   f.flash   || 0);
+    animNum('sc-live', live);
+    animNum('sc-flash', f.flash || 0);
     animNum('sc-panther', f.panther || 0);
-    animNum('sc-picks',   life.pool_picks || 0);
+    animNum('sc-picks', life.pool_picks || 0);
     animNum('sc-evicted', life.pool_evicted || 0);
 
     if(prev !== null){
@@ -1229,10 +1157,6 @@ function renderStatStrip(poolNode){
   if(el) el.innerHTML = onlineCount + '<small style="font-size:14px;opacity:.5">/10</small>';
 }
 
-
-/* ═══════════════════════════════════════
-   PIPELINE (SESSION-BASED)
-═══════════════════════════════════════ */
 function renderPipeline(){
   let totalPass = 0, totalFail = 0;
   let totalCommits = 0, totalCycles = 0, totalObuf = 0, totalQ = 0;
@@ -1240,40 +1164,29 @@ function renderPipeline(){
   CHECKER_ROLES.forEach(role => {
     const s = session.checkers[role];
     if(!s) return;
-    totalPass    += s.pass;
-    totalFail    += s.fail;
-    totalCommits += s.commits;
-    totalCycles  += s.cycles;
-    totalObuf    += s.obuf;
-    totalQ       += s.q;
+    totalPass += s.pass; totalFail += s.fail;
+    totalCommits += s.commits; totalCycles += s.cycles;
+    totalObuf += s.obuf; totalQ += s.q;
   });
 
   const checked  = totalPass + totalFail;
   const passRate = checked > 0 ? Math.round(totalPass / checked * 100) : 0;
 
-  animNum('pp-fetch',   checked);
-  animNum('pp-check',   checked);
-  animNum('pp-pass',    totalPass);
-  animNum('pp-fail',    totalFail);
-  setVal('pass-pct',    passRate + '%');
-  setBar('pass-bar',    passRate);
-  setVal('pp-commits',  totalCommits);
-  setVal('pp-cycles',   totalCycles);
-  setVal('pp-obuf',     totalObuf);
-  setVal('pp-checkq',   totalQ);
-
+  animNum('pp-fetch', checked); animNum('pp-check', checked);
+  animNum('pp-pass', totalPass); animNum('pp-fail', totalFail);
+  setVal('pass-pct', passRate + '%');
+  setBar('pass-bar', passRate);
+  setVal('pp-commits', totalCommits);
+  setVal('pp-cycles', totalCycles);
+  setVal('pp-obuf', totalObuf);
+  setVal('pp-checkq', totalQ);
   setVal('h-passrate', passRate + '%');
 }
 
-
-/* ═══════════════════════════════════════
-   CALLERS (SESSION-BASED)
-═══════════════════════════════════════ */
 function renderCallers(){
-  const rows   = document.getElementById('caller-rows');
+  const rows = document.getElementById('caller-rows');
   const entries = Object.entries(session.callerMap)
-    .filter(([,v]) => v > 0)
-    .sort((a,b) => b[1]-a[1]);
+    .filter(([,v]) => v > 0).sort((a,b) => b[1]-a[1]);
 
   if(!entries.length){
     rows.innerHTML = '<div style="font-size:10px;color:var(--muted);padding:8px 0;">No picks yet this session</div>';
@@ -1298,21 +1211,16 @@ function renderCallers(){
   });
 }
 
-
-/* ═══════════════════════════════════════
-   CHECKER NODES (SESSION-BASED)
-═══════════════════════════════════════ */
 function renderCheckers(){
   const grid = document.getElementById('checker-grid');
   CHECKER_ROLES.forEach((role, i) => {
     const agent = PEER_NAMES[role] || role;
-    const s     = session.checkers[role];
+    const s = session.checkers[role];
 
     let card = document.getElementById('cc-' + role);
     if(!card){
       card = document.createElement('div');
-      card.className = 'cc';
-      card.id = 'cc-' + role;
+      card.className = 'cc'; card.id = 'cc-' + role;
       card.style.animationDelay = (i * 0.04) + 's';
       card.innerHTML = `
         <div class="cc-top">
@@ -1345,24 +1253,20 @@ function renderCheckers(){
     const chip = document.getElementById('cchip-' + role);
     if(chip){
       chip.textContent = online ? 'live' : 'offline';
-      chip.className   = 'cc-chip ' + (online ? 'ok' : 'err');
+      chip.className = 'cc-chip ' + (online ? 'ok' : 'err');
     }
     const bar = document.getElementById('cbar-' + role);
     if(bar) bar.style.width = pct + '%';
 
-    setVal('cpass-'   + role, fmtNum(s.pass));
-    setVal('cfail-'   + role, fmtNum(s.fail));
-    setVal('cq-'      + role, s.q);
+    setVal('cpass-' + role, fmtNum(s.pass));
+    setVal('cfail-' + role, fmtNum(s.fail));
+    setVal('cq-' + role, s.q);
     setVal('ccommit-' + role, s.commits);
-    setVal('ccycle-'  + role, s.cycles);
-    setVal('cobuf-'   + role, s.obuf);
+    setVal('ccycle-' + role, s.cycles);
+    setVal('cobuf-' + role, s.obuf);
   });
 }
 
-
-/* ═══════════════════════════════════════
-   LOG
-═══════════════════════════════════════ */
 function renderLog(poolNode){
   if(!poolNode?.activity) return;
   const wrap = document.getElementById('log-wrap');
@@ -1389,10 +1293,6 @@ function renderLog(poolNode){
   if(wasBottom) wrap.scrollTop = wrap.scrollHeight;
 }
 
-
-/* ═══════════════════════════════════════
-   PEER HEALTH
-═══════════════════════════════════════ */
 const healthState = {};
 Object.keys(PEERS).forEach(r => healthState[r] = { status:'pending', ping:null });
 
@@ -1401,8 +1301,7 @@ Object.keys(PEERS).forEach(r => healthState[r] = { status:'pending', ping:null }
   grid.innerHTML = '';
   Object.entries(PEERS).forEach(([role, url], i) => {
     const card = document.createElement('div');
-    card.className = 'hc';
-    card.id = 'hc-' + role;
+    card.className = 'hc'; card.id = 'hc-' + role;
     card.style.animationDelay = (i * 0.04) + 's';
     const host = url.replace('https://','').replace('http://','');
     card.innerHTML =
@@ -1419,7 +1318,7 @@ Object.keys(PEERS).forEach(r => healthState[r] = { status:'pending', ping:null }
 })();
 
 function updateHealthCard(role){
-  const s  = healthState[role];
+  const s = healthState[role];
   const dot = document.getElementById('hd-' + role);
   const pg  = document.getElementById('hp-' + role);
   const ch  = document.getElementById('hs-' + role);
@@ -1430,7 +1329,6 @@ function updateHealthCard(role){
   ch.className   = 'hc-chip ' + s.status;
   ch.textContent = s.status === 'up' ? 'online' : s.status === 'down' ? 'offline' : 'checking';
 }
-
 function updateHealthSummary(){
   const vals  = Object.values(healthState);
   const up    = vals.filter(s => s.status === 'up').length;
@@ -1442,7 +1340,6 @@ function updateHealthSummary(){
   setVal('hs-total', vals.length);
   setVal('hs-last', new Date().toLocaleTimeString());
 }
-
 async function pingPeer(role, url){
   const t0 = performance.now();
   try{
@@ -1455,7 +1352,6 @@ async function pingPeer(role, url){
   updateHealthCard(role);
   updateHealthSummary();
 }
-
 async function pingAllPeers(){
   Object.keys(PEERS).forEach(r => {
     healthState[r].status = 'pending';
@@ -1463,14 +1359,9 @@ async function pingAllPeers(){
   });
   await Promise.all(Object.entries(PEERS).map(([r, u]) => pingPeer(r, u)));
 }
-
 pingAllPeers();
 setInterval(pingAllPeers, 30_000);
 
-
-/* ═══════════════════════════════════════
-   SSE CONNECTION
-═══════════════════════════════════════ */
 let es;
 function connect(){
   if(es) es.close();
@@ -1509,13 +1400,15 @@ async function loadKeys(){
   }
 }
 
+function fmtNumPlain(n){
+  if(n === null || n === undefined) return '0';
+  return Number(n).toLocaleString();
+}
+
 function renderKeys(data){
   const providers = data.providers || {};
-  const rows      = document.getElementById('provider-rows');
-  rows.innerHTML  = '';
-
-  const order = ['scrapingant','scraperapi','scrapeops'];
-  const seen  = new Set();
+  const rows = document.getElementById('provider-rows');
+  rows.innerHTML = '';
 
   function buildRow(name, p){
     const pct = p.total_credits ? Math.round(p.used_credits / p.total_credits * 100) : 0;
@@ -1527,17 +1420,18 @@ function renderKeys(data){
         <div class="pp-count"><span class="pp-live">${p.live}</span>/${p.keys} live</div>
       </div>
       <div class="pp-bar"><div class="pp-fill" style="width:${pct}%"></div></div>
-      <div class="pp-credits">${p.used_credits.toLocaleString()} / ${p.total_credits.toLocaleString()} credits · ${pct}% used</div>`;
+      <div class="pp-credits">${fmtNumPlain(p.used_credits)} / ${fmtNumPlain(p.total_credits)} credits · ${pct}% used</div>`;
     rows.appendChild(div);
   }
 
+  const order = ['scrapingant','scraperapi','scrapeops'];
+  const seen = new Set();
   order.forEach(name => {
     const p = providers[name];
     if(!p) return;
     seen.add(name);
     buildRow(name, p);
   });
-
   Object.entries(providers).forEach(([name, p]) => {
     if(seen.has(name)) return;
     buildRow(name, p);
@@ -1550,13 +1444,15 @@ function renderKeys(data){
   const list = document.getElementById('keys-list');
   list.innerHTML = '';
   (data.keys || []).forEach(k => {
+    const src = k.credit_source || 'local';
     const div = document.createElement('div');
     div.className = 'key-row';
     div.innerHTML = `
       <div class="kr-provider">${k.provider}</div>
       <div class="kr-label">${k.label || '—'}</div>
       <div class="kr-status ${k.live?'ok':'err'}">${k.live?'live':'dead'}</div>
-      <div class="kr-credits">${k.credits_used.toLocaleString()}/${k.credits_limit.toLocaleString()}</div>
+      <div class="kr-source ${src}">${src}</div>
+      <div class="kr-credits">${fmtNumPlain(k.credits_used)}/${fmtNumPlain(k.credits_limit)}</div>
       <div class="kr-hint">${k.hint || ''}</div>
       <button class="kr-rm" data-label="${k.label}" title="Remove">×</button>`;
     list.appendChild(div);
@@ -1623,6 +1519,49 @@ async function removeKey(label){
     loadKeys();
   } catch(e){
     alert('Failed: ' + e.message);
+  }
+}
+
+async function syncCredits(){
+  const btn = document.getElementById('sync-btn');
+  const banner = document.getElementById('sync-banner');
+  const orig = btn.innerHTML;
+
+  btn.classList.add('busy');
+  btn.innerHTML = '<span class="spin">⟳</span> Syncing…';
+  banner.className = 'sync-banner';
+  banner.textContent = '';
+
+  try{
+    const res = await fetch('/keys/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    const data = await res.json();
+    if(!res.ok){
+      banner.className = 'sync-banner show';
+      banner.textContent = data.detail || data.error || ('http ' + res.status);
+      return;
+    }
+
+    const failed = (data.results || []).filter(r => !r.ok);
+    if(failed.length){
+      banner.className = 'sync-banner show';
+      banner.innerHTML = failed
+        .map(f => `<div>${f.provider}:${f.label} → ${f.error}</div>`)
+        .join('');
+    } else {
+      banner.className = 'sync-banner show ok';
+      banner.textContent = `Synced ${data.ok} key${data.ok === 1 ? '' : 's'} — credits updated`;
+    }
+
+    loadKeys();
+  } catch(e){
+    banner.className = 'sync-banner show';
+    banner.textContent = 'Sync failed: ' + e.message;
+  } finally {
+    btn.classList.remove('busy');
+    btn.innerHTML = orig;
   }
 }
 
