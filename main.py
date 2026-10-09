@@ -175,8 +175,7 @@ STICKY_URL_FRAGMENTS = [
     "/api/3.0/order",
     "/api/4.0/preorders",
     "/api/2.0/orders",
-    "/api/3.0/user/orders",
-    "/api/3.0/user/order-details",
+
     "/api/3.0/addresses",
     "/api/2.0/addresses",
     "/api/1.0/user/delivery-location",
