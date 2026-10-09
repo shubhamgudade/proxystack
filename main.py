@@ -614,8 +614,6 @@ _PROVIDER_CALLS = {
 
 
 # ─── Provider credit fetchers ────────────────────────────────────────────────
-# Each returns (credits_limit, credits_used, reset_at) or raises.
-# Reset times are best-effort: parsed to epoch seconds, 0 if unparseable.
 
 def _parse_iso_epoch(s) -> float:
     if not s:
@@ -696,19 +694,19 @@ def _sync_one_key(key_dict: dict) -> dict:
     fn = _USAGE_FETCHERS.get(provider)
     if not fn:
         return {
-            "label":  key_dict.get("label"),
+            "label":    key_dict.get("label"),
             "provider": provider,
-            "ok":     False,
-            "error":  f"no usage fetcher for {provider}",
+            "ok":       False,
+            "error":    f"no usage fetcher for {provider}",
         }
     try:
         limit, used, reset = fn(key_dict.get("key", ""))
     except Exception as e:
         return {
-            "label":  key_dict.get("label"),
+            "label":    key_dict.get("label"),
             "provider": provider,
-            "ok":     False,
-            "error":  str(e),
+            "ok":       False,
+            "error":    str(e),
         }
     with _keys_lock:
         key_dict["credits_limit"] = limit
