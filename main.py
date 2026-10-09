@@ -344,8 +344,11 @@ _seen: dict[str, float] = {}
 _outbuf_lock = threading.Lock()
 _outbuf: list[tuple[str, float]] = []
 
+# ─── Counters ─────────────────────────────────────────────────────────────────
 _counter_lock = threading.Lock()
-_counters: dict[str, int] = defaultdict(int)
+_counters_lifetime: dict[str, int] = defaultdict(int)
+_counters_cycle:    dict[str, int] = defaultdict(int)
+_cycle_start: float = time.time()
 
 _activity_lock = threading.Lock()
 _activity_log: list[dict] = []
@@ -374,7 +377,14 @@ _backend_executor = ThreadPoolExecutor(max_workers=24, thread_name_prefix="backe
 # ═══════════════════════════════════════════════════════════════════════════════
 def _inc(key: str, n: int = 1):
     with _counter_lock:
-        _counters[key] += n
+        _counters_lifetime[key] += n
+        _counters_cycle[key]    += n
+
+def _reset_cycle():
+    global _cycle_start
+    with _counter_lock:
+        _counters_cycle.clear()
+        _cycle_start = time.time()
 
 def _log(event: str, detail: str = "", count: int = 0):
     entry = {"ts": time.time(), "role": ROLE, "event": event, "detail": detail, "count": count}
@@ -689,11 +699,16 @@ async def _checker_pipeline():
             await asyncio.sleep(15)
             q = _check_queue.qsize() if _check_queue else 0
             with _outbuf_lock: ob = len(_outbuf)
-            with _counter_lock: cnts = dict(_counters)
+            with _counter_lock:
+                life  = dict(_counters_lifetime)
+                cycle = dict(_counters_cycle)
+            cats = ('flash', 'panther', 'lantern', 'deadass')
             print(
-                f"[{ROLE}] q={q} outbuf={ob} "
-                f"pass={sum(cnts.get(f'check_pass_{c}', 0) for c in ('flash','panther','lantern','deadass'))} "
-                f"fail={cnts.get('check_fail', 0)}",
+                f"[{ROLE}] q={q} outbuf={ob} | "
+                f"CYCLE  pass={sum(cycle.get(f'check_pass_{c}', 0) for c in cats)} "
+                f"fail={cycle.get('check_fail', 0)} | "
+                f"TOTAL  pass={sum(life.get(f'check_pass_{c}', 0) for c in cats)} "
+                f"fail={life.get('check_fail', 0)}",
                 flush=True,
             )
 
@@ -746,6 +761,7 @@ def _checker_main():
     while True:
         time.sleep(5)
         now = time.time()
+        _reset_cycle()   # cycle counters = this poll window only
 
         if now - last_commit_poll >= COMMIT_POLL_S:
             last_commit_poll = now
@@ -1296,19 +1312,33 @@ def _get_stats() -> dict:
         p_total = len(_paid_proxies)
         p_alive = sum(1 for p in _paid_proxies.values() if p.get("alive"))
     with _outbuf_lock: obuf = len(_outbuf)
-    with _counter_lock: cnts = dict(_counters)
+    with _counter_lock:
+        cnts_life  = dict(_counters_lifetime)
+        cnts_cycle = dict(_counters_cycle)
+        c_start    = _cycle_start
     with _activity_lock: acts = list(reversed(_activity_log))
     q_depth = _check_queue.qsize() if _check_queue else 0
 
     caller_picks = {
-        k[len("pool_picks_by_"):]: v
-        for k, v in cnts.items()
-        if k.startswith("pool_picks_by_")
+        "lifetime": {
+            k[len("pool_picks_by_"):]: v
+            for k, v in cnts_life.items()
+            if k.startswith("pool_picks_by_")
+        },
+        "cycle": {
+            k[len("pool_picks_by_"):]: v
+            for k, v in cnts_cycle.items()
+            if k.startswith("pool_picks_by_")
+        },
     }
 
     return {
-        "role":         ROLE,
-        "counters":     cnts,
+        "role": ROLE,
+        "counters": {
+            "lifetime": cnts_life,
+            "cycle": cnts_cycle,
+            "cycle_started_ago_s": round(time.time() - c_start, 1),
+        },
         "caller_picks": caller_picks,
         "activity":     acts[:50],
         "queues":       {"check": q_depth, "outbuf": obuf},
@@ -1491,6 +1521,13 @@ async def report_dead(req: DeadReport, x_secret: Optional[str] = Header(None)):
         raise HTTPException(400, "dead report only on pool role")
     mark_dead(req.addr)
     return {"ok": True}
+
+@app.post("/reset-cycle")
+async def reset_cycle_route(x_secret: Optional[str] = Header(None)):
+    if x_secret != SHARED_SECRET:
+        raise HTTPException(403, "invalid secret")
+    _reset_cycle()
+    return {"ok": True, "reset_at": time.time()}
 
 # ── VPS /request ──────────────────────────────────────────────────────────────
 class ProxyRequest(BaseModel):
