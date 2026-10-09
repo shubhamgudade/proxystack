@@ -552,6 +552,83 @@ main{
 .log-entry.race_win .log-event{color:var(--accent);}
 .log-entry.pick_normal .log-event{color:var(--panther);}
 
+/* ── PREMIUM PROVIDERS ── */
+.provider-rows{display:flex;flex-direction:column;gap:14px;}
+.pp-row{
+  background:var(--surface2);border:1px solid var(--border);
+  border-radius:var(--r2);padding:12px 14px;
+  animation:slideUp .35s ease both;
+}
+.pp-top{display:flex;align-items:center;gap:10px;margin-bottom:8px;}
+.pp-name{font-size:12px;font-weight:700;color:var(--text);text-transform:capitalize;}
+.pp-count{margin-left:auto;font-size:10px;color:var(--muted);}
+.pp-live{color:var(--accent2);font-weight:700;}
+.pp-bar{height:6px;background:var(--surface3);border-radius:3px;overflow:hidden;margin-bottom:6px;}
+.pp-fill{height:100%;border-radius:3px;background:linear-gradient(90deg,var(--accent2),var(--accent));transition:width .7s cubic-bezier(.34,1.56,.64,1);}
+.pp-credits{font-size:10px;color:var(--muted);font-variant-numeric:tabular-nums;}
+
+.keys-form{display:flex;gap:8px;flex-wrap:wrap;}
+.keys-form select,.keys-form input{
+  background:var(--surface2);
+  border:1px solid var(--border);
+  border-radius:8px;
+  color:var(--text);
+  font-family:'JetBrains Mono',monospace;
+  font-size:11px;
+  padding:8px 10px;
+  outline:none;
+  transition:border-color .2s;
+}
+.keys-form select{min-width:130px;}
+.keys-form input{flex:1;min-width:120px;}
+.keys-form input#kf-limit{max-width:110px;flex:0 0 110px;}
+.keys-form input:focus,.keys-form select:focus{border-color:rgba(124,110,255,.4);}
+.keys-btn{
+  background:linear-gradient(135deg,var(--accent),var(--accent2));
+  border:none;border-radius:8px;
+  color:#fff;font-family:inherit;font-size:11px;font-weight:700;
+  padding:8px 18px;cursor:pointer;letter-spacing:.04em;
+  transition:transform .2s,filter .2s;
+}
+.keys-btn:hover{transform:translateY(-1px);filter:brightness(1.1);}
+.keys-btn:active{transform:translateY(0);}
+.keys-msg{font-size:10px;margin-top:8px;min-height:14px;font-family:'JetBrains Mono',monospace;}
+.keys-msg.ok{color:var(--accent2);}
+.keys-msg.err{color:var(--accent3);}
+
+.keys-list{display:flex;flex-direction:column;gap:6px;max-height:280px;overflow-y:auto;}
+.keys-list::-webkit-scrollbar{width:4px;}
+.keys-list::-webkit-scrollbar-thumb{background:var(--muted2);border-radius:2px;}
+.key-row{
+  display:grid;
+  grid-template-columns:110px 1fr 60px 130px 90px 30px;
+  gap:10px;align-items:center;
+  background:var(--surface2);border:1px solid var(--border);
+  border-radius:8px;padding:8px 12px;
+  font-size:11px;font-family:'JetBrains Mono',monospace;
+  animation:slideUp .3s ease both;
+}
+.kr-provider{color:var(--accent);font-weight:700;text-transform:capitalize;}
+.kr-label{color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.kr-status{font-weight:700;font-size:9px;letter-spacing:.06em;text-transform:uppercase;}
+.kr-status.ok{color:var(--accent2);}
+.kr-status.err{color:var(--accent3);}
+.kr-credits{color:var(--muted);text-align:right;font-variant-numeric:tabular-nums;}
+.kr-hint{color:var(--muted2);font-size:10px;}
+.kr-rm{
+  background:transparent;border:1px solid var(--border2);
+  color:var(--muted);border-radius:6px;
+  width:22px;height:22px;cursor:pointer;
+  font-size:14px;line-height:1;
+  display:flex;align-items:center;justify-content:center;
+  transition:all .2s;
+}
+.kr-rm:hover{border-color:var(--accent3);color:var(--accent3);background:rgba(255,107,107,.08);}
+@media(max-width:700px){
+  .key-row{grid-template-columns:1fr 60px 30px;}
+  .key-row .kr-provider,.key-row .kr-credits,.key-row .kr-hint{display:none;}
+}
+
 /* ── NUMBER TRANSITION ── */
 .num-flash{animation:numBump .35s cubic-bezier(.34,1.56,.64,1);}
 @keyframes numBump{
@@ -576,6 +653,7 @@ main .row:nth-child(2) .card{animation-delay:.1s;}
 main .row:nth-child(3) .card{animation-delay:.16s;}
 main .row:nth-child(4) .card{animation-delay:.22s;}
 main .row:nth-child(5) .card{animation-delay:.28s;}
+main .row:nth-child(6) .card{animation-delay:.34s;}
 @keyframes cardIn{from{opacity:0;transform:translateY(14px);}to{opacity:1;transform:translateY(0);}}
 
 /* ── REDUCED MOTION ── */
@@ -774,6 +852,41 @@ main .row:nth-child(5) .card{animation-delay:.28s;}
     </div>
   </div>
 
+  <!-- PREMIUM PROVIDERS -->
+  <div class="row">
+    <div class="card">
+      <div class="card-head">
+        <div class="card-title">Premium Providers</div>
+        <div class="card-head-right">
+          <button class="card-badge" onclick="loadKeys()">↻ Refresh</button>
+        </div>
+      </div>
+
+      <div class="provider-rows" id="provider-rows"></div>
+
+      <hr class="cc-divider" style="margin:18px 0;">
+
+      <div class="card-title" style="margin-bottom:12px;">Add Key</div>
+      <div class="keys-form">
+        <select id="kf-provider">
+          <option value="scrapingant">ScrapingAnt</option>
+          <option value="scraperapi">ScraperAPI</option>
+          <option value="scrapeops">ScrapeOps</option>
+        </select>
+        <input id="kf-key"   placeholder="API key" autocomplete="off">
+        <input id="kf-label" placeholder="label (optional)" autocomplete="off">
+        <input id="kf-limit" placeholder="credit limit" type="number" min="1">
+        <button class="keys-btn" onclick="addKey()">Add</button>
+      </div>
+      <div id="kf-msg" class="keys-msg"></div>
+
+      <hr class="cc-divider" style="margin:18px 0;">
+
+      <div class="card-title" style="margin-bottom:12px;">Keys</div>
+      <div class="keys-list" id="keys-list"></div>
+    </div>
+  </div>
+
   <!-- LOG -->
   <div class="row">
     <div class="card">
@@ -838,21 +951,19 @@ main .row:nth-child(5) .card{animation-delay:.28s;}
     const n = Math.min(120, Math.floor(W * H / 14000));
     for(let i = 0; i < n; i++){
       const p = new Particle();
-      p.life = Math.random() * p.maxLife; // stagger
+      p.life = Math.random() * p.maxLife;
       particles.push(p);
     }
   }
 
   function draw(){
     ctx.clearRect(0, 0, W, H);
-    // grid
     ctx.strokeStyle = 'rgba(124,110,255,.025)';
     ctx.lineWidth = 1;
     const g = 48;
     for(let x = 0; x < W; x += g){ ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
     for(let y = 0; y < H; y += g){ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
 
-    // connections
     for(let i = 0; i < particles.length; i++){
       for(let j = i+1; j < particles.length; j++){
         const dx = particles[i].x - particles[j].x;
@@ -870,7 +981,6 @@ main .row:nth-child(5) .card{animation-delay:.28s;}
       }
     }
 
-    // particles
     particles.forEach(p => {
       p.step();
       ctx.beginPath();
@@ -898,7 +1008,6 @@ function animNum(id, target, fmt){
   if(current === target) return;
   _numState[id] = target;
 
-  // flash animation on significant change
   if(Math.abs(target - current) > 0){
     el.classList.remove('num-flash');
     void el.offsetWidth;
@@ -911,7 +1020,6 @@ function animNum(id, target, fmt){
 
   function tick(now){
     const t = Math.min(1, (now - start) / dur);
-    // ease out cubic
     const e = 1 - Math.pow(1 - t, 3);
     const v = Math.round(from + (target - from) * e);
     el.textContent = fmt ? fmt(v) : fmtNum(v);
@@ -970,37 +1078,28 @@ const CHECKER_ROLES = [
 
 /* ═══════════════════════════════════════
    SESSION STATE
-   All counters are per-session (reset on page load).
-   No lifecycle/process totals — only what we observe
-   through the SSE stream this session.
 ═══════════════════════════════════════ */
 const session = {
   startTs:    Date.now(),
-  poolSnaps:  [],           // ring buffer of pool snapshots
+  poolSnaps:  [],
   pickTotal:  0,
   passTotal:  0,
   failTotal:  0,
   fetchTotal: 0,
   evictTotal: 0,
-  callerMap:  {},           // caller → session pick count
-  checkers:   {},           // role → { pass, fail, q, obuf, commits, cycles, ts }
+  callerMap:  {},
+  checkers:   {},
   lastPoolLive: null,
 };
 
-const store = {};  // role → last full node data
+const store = {};
 let lastTs  = 0;
 
-
-/* ═══════════════════════════════════════
-   SESSION-BASED INGESTION
-═══════════════════════════════════════ */
-// Track previous values for delta computation
 const _prev = {};
 
 function ingestData(data){
   lastTs = data.ts || (Date.now()/1000);
 
-  // update header ts
   const d = new Date(lastTs * 1000);
   const ts = d.toLocaleTimeString('en',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
   setVal('hdr-ts', ts);
@@ -1013,7 +1112,6 @@ function ingestData(data){
     renderPool(poolNode);
     renderLog(poolNode);
 
-    // accumulate session caller picks from delta
     const cp = (poolNode.caller_picks || {}).lifetime || {};
     for(const [caller, total] of Object.entries(cp)){
       const prev = _prev['caller_' + caller] || 0;
@@ -1024,7 +1122,6 @@ function ingestData(data){
     renderCallers();
   }
 
-  // Accumulate checker session counters
   CHECKER_ROLES.forEach(role => {
     const nd = nodes[role] || (data.role === role ? data : null);
     if(!nd || nd.error) return;
@@ -1068,22 +1165,18 @@ function renderPool(d){
   const life = (d.counters || {}).lifetime || d.counters || {};
   const live = f.live || 0;
 
-  // header pills
   animNum('h-pool-live', live);
   animNum('h-fresh', f.fresh_30s || 0);
   animNum('h-picks', life.pool_picks || 0);
 
-  // big number
   animNum('pool-big', live);
 
-  // sub stats
   animNum('p-f30',   f.fresh_30s  || 0);
   animNum('p-f120',  f.fresh_120s || 0);
   animNum('p-rpass', life.recheck_pass || 0);
   animNum('p-rfail', life.recheck_fail || 0);
   animNum('p-evict', life.pool_evicted || 0);
 
-  // label bars
   const total = Math.max(1, live);
   const flash   = f.flash   || 0;
   const panther = f.panther || 0;
@@ -1117,7 +1210,6 @@ function renderStatStrip(poolNode){
     animNum('sc-picks',   life.pool_picks || 0);
     animNum('sc-evicted', life.pool_evicted || 0);
 
-    // delta badge
     if(prev !== null){
       const delta = live - prev;
       const el = document.getElementById('delta-live');
@@ -1129,7 +1221,6 @@ function renderStatStrip(poolNode){
     _prev['sc-live'] = live;
   }
 
-  // checker count
   const onlineCount = CHECKER_ROLES.filter(r => {
     const s = session.checkers[r];
     return s && (lastTs - s.ts) < 25;
@@ -1171,7 +1262,6 @@ function renderPipeline(){
   setVal('pp-obuf',     totalObuf);
   setVal('pp-checkq',   totalQ);
 
-  // header pass rate
   setVal('h-passrate', passRate + '%');
 }
 
@@ -1279,7 +1369,6 @@ function renderLog(poolNode){
   const wasBottom = wrap.scrollHeight - wrap.scrollTop <= wrap.clientHeight + 40;
   const items = poolNode.activity.slice(0, 80);
 
-  // build a fingerprint to avoid unnecessary rebuilds
   const fp = items.map(a => a.ts + a.event).join('|');
   if(wrap._fp === fp) return;
   wrap._fp = fp;
@@ -1403,6 +1492,142 @@ function connect(){
   };
 }
 connect();
+
+
+/* ═══════════════════════════════════════
+   PREMIUM PROVIDER KEYS
+═══════════════════════════════════════ */
+async function loadKeys(){
+  try{
+    const res = await fetch('/keys/stats', { signal: AbortSignal.timeout(8000) });
+    if(!res.ok) throw new Error('http ' + res.status);
+    const data = await res.json();
+    renderKeys(data);
+  } catch(e){
+    document.getElementById('provider-rows').innerHTML =
+      `<div style="color:var(--accent3);font-size:11px;padding:8px 0">Failed to load keys: ${e.message}</div>`;
+  }
+}
+
+function renderKeys(data){
+  const providers = data.providers || {};
+  const rows      = document.getElementById('provider-rows');
+  rows.innerHTML  = '';
+
+  const order = ['scrapingant','scraperapi','scrapeops'];
+  const seen  = new Set();
+
+  function buildRow(name, p){
+    const pct = p.total_credits ? Math.round(p.used_credits / p.total_credits * 100) : 0;
+    const div = document.createElement('div');
+    div.className = 'pp-row';
+    div.innerHTML = `
+      <div class="pp-top">
+        <div class="pp-name">${name}</div>
+        <div class="pp-count"><span class="pp-live">${p.live}</span>/${p.keys} live</div>
+      </div>
+      <div class="pp-bar"><div class="pp-fill" style="width:${pct}%"></div></div>
+      <div class="pp-credits">${p.used_credits.toLocaleString()} / ${p.total_credits.toLocaleString()} credits · ${pct}% used</div>`;
+    rows.appendChild(div);
+  }
+
+  order.forEach(name => {
+    const p = providers[name];
+    if(!p) return;
+    seen.add(name);
+    buildRow(name, p);
+  });
+
+  Object.entries(providers).forEach(([name, p]) => {
+    if(seen.has(name)) return;
+    buildRow(name, p);
+  });
+
+  if(!rows.children.length){
+    rows.innerHTML = '<div style="font-size:11px;color:var(--muted);padding:8px 0">No keys yet — add one below</div>';
+  }
+
+  const list = document.getElementById('keys-list');
+  list.innerHTML = '';
+  (data.keys || []).forEach(k => {
+    const div = document.createElement('div');
+    div.className = 'key-row';
+    div.innerHTML = `
+      <div class="kr-provider">${k.provider}</div>
+      <div class="kr-label">${k.label || '—'}</div>
+      <div class="kr-status ${k.live?'ok':'err'}">${k.live?'live':'dead'}</div>
+      <div class="kr-credits">${k.credits_used.toLocaleString()}/${k.credits_limit.toLocaleString()}</div>
+      <div class="kr-hint">${k.hint || ''}</div>
+      <button class="kr-rm" data-label="${k.label}" title="Remove">×</button>`;
+    list.appendChild(div);
+  });
+
+  list.querySelectorAll('.kr-rm').forEach(btn => {
+    btn.addEventListener('click', () => removeKey(btn.dataset.label));
+  });
+}
+
+async function addKey(){
+  const provider = document.getElementById('kf-provider').value;
+  const key      = document.getElementById('kf-key').value.trim();
+  const label    = document.getElementById('kf-label').value.trim();
+  const limitRaw = document.getElementById('kf-limit').value.trim();
+  const msg      = document.getElementById('kf-msg');
+
+  msg.className = 'keys-msg';
+  msg.textContent = '';
+
+  if(!key){ msg.className='keys-msg err'; msg.textContent='key required'; return; }
+
+  const body = { provider, key, label };
+  if(limitRaw) body.credits_limit = parseInt(limitRaw, 10);
+
+  msg.textContent = 'adding…';
+  try{
+    const res = await fetch('/keys/add', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if(!res.ok){
+      msg.className = 'keys-msg err';
+      msg.textContent = data.detail || data.error || 'failed';
+      return;
+    }
+    msg.className = 'keys-msg ok';
+    msg.textContent = 'added → ' + data.label;
+    document.getElementById('kf-key').value = '';
+    document.getElementById('kf-label').value = '';
+    document.getElementById('kf-limit').value = '';
+    loadKeys();
+  } catch(e){
+    msg.className = 'keys-msg err';
+    msg.textContent = e.message;
+  }
+}
+
+async function removeKey(label){
+  if(!confirm('Remove key "' + label + '"?')) return;
+  try{
+    const res = await fetch('/keys/remove', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label }),
+    });
+    if(!res.ok){
+      const d = await res.json().catch(()=>({}));
+      alert('Failed: ' + (d.detail || d.error || res.status));
+      return;
+    }
+    loadKeys();
+  } catch(e){
+    alert('Failed: ' + e.message);
+  }
+}
+
+loadKeys();
+setInterval(loadKeys, 30_000);
 </script>
 </body>
 </html>
