@@ -768,7 +768,7 @@ main .row:nth-child(6) .card{animation-delay:.34s;}
         <div class="card-title">Pipeline</div>
       </div>
       <div class="pipeline">
-        <div class="pipe-node"><div class="pipe-num" id="pp-fetch">0</div><div class="pipe-lbl">fetched</div></div>
+        <div class="pipe-node"><div class="pipe-num" id="pp-fetch">0</div><div class="pipe-lbl">fetch runs</div></div>
         <div class="pipe-arrow">›</div>
         <div class="pipe-node"><div class="pipe-num" id="pp-check">0</div><div class="pipe-lbl">checked</div></div>
         <div class="pipe-arrow">›</div>
@@ -782,7 +782,6 @@ main .row:nth-child(6) .card{animation-delay:.34s;}
       </div>
       <div class="pipe-extra">
         <div class="pe-item">commits <span id="pp-commits">0</span></div>
-        <div class="pe-item">cycles <span id="pp-cycles">0</span></div>
         <div class="pe-item">outbuf <span id="pp-obuf">0</span></div>
         <div class="pe-item">check q <span id="pp-checkq">0</span></div>
       </div>
@@ -1059,10 +1058,15 @@ function ingestData(data){
     renderPool(poolNode);
     renderLog(poolNode);
     const cp = (poolNode.caller_picks || {}).lifetime || {};
-    for(const [caller, total] of Object.entries(cp)){
-      const prev = _prev['caller_' + caller] || 0;
-      const delta = Math.max(0, total - prev);
-      _prev['caller_' + caller] = total;
+    for(const [caller, totalRaw] of Object.entries(cp)){
+      const total = Number(totalRaw) || 0;
+      const key = 'caller_' + caller;
+      if(!Object.prototype.hasOwnProperty.call(_prev, key)){
+        _prev[key] = total; // Baseline only; don't count pre-page-load history.
+        continue;
+      }
+      const delta = Math.max(0, total - _prev[key]);
+      _prev[key] = total;
       session.callerMap[caller] = (session.callerMap[caller] || 0) + delta;
     }
     renderCallers();
@@ -1074,20 +1078,31 @@ function ingestData(data){
 
     const life = (nd.counters || {}).lifetime || nd.counters || {};
     const passNow = (life.check_pass_flash||0)+(life.check_pass_panther||0)+(life.check_pass_lantern||0)+(life.check_pass_deadass||0);
-    const failNow = life.check_fail || 0;
-    const prevPass = _prev['cp_' + role] || 0;
-    const prevFail = _prev['cf_' + role] || 0;
-    const deltaPass = Math.max(0, passNow - prevPass);
-    const deltaFail = Math.max(0, failNow - prevFail);
-    _prev['cp_' + role] = passNow;
-    _prev['cf_' + role] = failNow;
+    const failNow = Number(life.check_fail) || 0;
+    const commitsNow = Number(life.commits_detected) || 0;
+    const cyclesNow = Number(life.cycle_fetches) || 0;
+
+    const passKey = 'cp_' + role, failKey = 'cf_' + role;
+    const commitsKey = 'cm_' + role, cyclesKey = 'cy_' + role;
+    const firstSeen = !Object.prototype.hasOwnProperty.call(_prev, passKey);
+
+    // First SSE snapshot is a baseline, not session activity from before page load.
+    const deltaPass = firstSeen ? 0 : Math.max(0, passNow - _prev[passKey]);
+    const deltaFail = firstSeen ? 0 : Math.max(0, failNow - _prev[failKey]);
+    const deltaCommits = firstSeen ? 0 : Math.max(0, commitsNow - (_prev[commitsKey] || 0));
+    const deltaCycles = firstSeen ? 0 : Math.max(0, cyclesNow - (_prev[cyclesKey] || 0));
+    _prev[passKey] = passNow;
+    _prev[failKey] = failNow;
+    _prev[commitsKey] = commitsNow;
+    _prev[cyclesKey] = cyclesNow;
 
     const s = session.checkers[role] || { pass:0, fail:0, q:0, obuf:0, commits:0, cycles:0, ts:0 };
-    s.pass += deltaPass; s.fail += deltaFail;
+    s.pass += deltaPass;
+    s.fail += deltaFail;
+    s.commits += deltaCommits;
+    s.cycles += deltaCycles;
     s.q = (nd.queues || {}).check || 0;
     s.obuf = (nd.queues || {}).outbuf || 0;
-    s.commits = life.commits_detected || 0;
-    s.cycles = life.cycle_fetches || 0;
     s.ts = lastTs;
     session.checkers[role] = s;
   });
@@ -1172,7 +1187,9 @@ function renderPipeline(){
   const checked  = totalPass + totalFail;
   const passRate = checked > 0 ? Math.round(totalPass / checked * 100) : 0;
 
-  animNum('pp-fetch', checked); animNum('pp-check', checked);
+  // Fetch runs are distinct from individual numbers checked (pass + fail).
+  animNum('pp-fetch', totalCycles);
+  animNum('pp-check', checked);
   animNum('pp-pass', totalPass); animNum('pp-fail', totalFail);
   setVal('pass-pct', passRate + '%');
   setBar('pass-bar', passRate);
