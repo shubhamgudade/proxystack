@@ -1,2653 +1,2354 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
-import './AppPage.css';
-import '../stars/stars.css';
-import LoadingOverlay from './LoadingOverlay.jsx';
-import FodLoader from './FodLoader.jsx';
-import {
-  runFodHunt,
-  fetchAccounts,
-  deleteAccount,
-  sendOtp,
-  verifyOtp,
-  fetchAddresses,
-  resolveLocation,
-  createAddress,
-  searchProducts,
-  fetchAnonForYou,
-  fetchProductStatic,
-  fetchProductDynamic,
-  fetchCartMinview,
-  fetchCartDetails,
-  addToCart,
-  removeFromCart,
-  setCartLocation,
-  bindAddressToCart,
-  processCheckout,
-  fetchOrders,
-  fetchOrderDetails,
-  fetchCancellationReasons,
-  cancelOrder,
-  parseSearchWidgets,
-  parseProductStatic,
-  parseProductDynamic,
-  loadOrderSnapshot,
-  saveOrderSnapshot,
-  diffOrderSnapshot,
-  genUUID,
-  genHex,
-  extractProductId,
-  fetchDashboardStats,
-  fetchRecentUpdates,
-  triggerStatsRefresh,
-  fetchRefreshStatus,
-  fetchAddressCache,
-  clearAddressCache,
-  triggerAddressFetch,
-  fetchAddressFetchStatus,
-} from './lib/api';
+"""
+ProxyStack v2 — Simplified Distributed Proxy Gateway
+=====================================================
+One file. Multiple machines. Change ROLE env var, different behavior.
 
-const ORDERS_CACHE_KEY = 'mesoweb_orders_cache_v1';
+ROLES:
+  checker_1  through checker_10 → fetch from source slice, check meesho, push to pool
+  pool       → Omen  — ingest, pick, dead, recheck, persist, dashboard SSE
+  dashboard  → Yoru  — stats aggregator + dashboard UI
+  vps        → Oracle — /request, pinger, premium providers, main app API
 
-function readOrdersCache() {
-  try {
-    const raw = localStorage.getItem(ORDERS_CACHE_KEY);
-    return raw ? JSON.parse(raw) : { updatedAt: 0, accounts: {} };
-  } catch {
-    return { updatedAt: 0, accounts: {} };
-  }
+Pipeline (per checker):
+  Boot → fetch latest 500 from my sources → check meesho → push live → pool
+  Loop:
+    Poll repos every 60s for new commits
+      new commit  → fetch up to 1000 proxies → check → push pool
+      no commit   → grab next 500 from known list (pointer advances) → check → push pool
+  Dedup: per-instance seen set, 1hr TTL — never recheck same addr in cycle
+
+Pool:
+  /ingest    → store with timestamp + latency label
+  /pick      → serve freshest proxy (flash/panther preferred)
+  /dead      → immediate evict
+  recheck    → every 8min, proxies older than 5min → meesho check → evict if dead
+  hard TTL   → 15min evict regardless
+  dashboard  → served here, SSE /stream/stats
+
+VPS (premium providers):
+  read    → free race (3s, 6 parallel) → premium fallback (ScraperAPI → ScrapeOps → ScrapingAnt)
+  write   → premium only (ScrapingAnt serial → ScraperAPI → ScrapeOps)
+  sticky  → premium sticky pin (ScraperAPI → ScrapeOps); login + checkout
+  free_only → single free proxy, no race, no fallback (FOD free shots)
+  premium → premium rotating, no race, no free (FOD premium shots, anon session xo)
+
+Credit sync:
+  POST /keys/sync  → pulls real credits from each provider API, updates keys.json
+                     credit_source becomes "api" for synced keys, "local" otherwise
+"""
+
+import asyncio
+import gzip
+import hashlib
+import json
+import os
+import random
+import re
+import socket
+import threading
+import time
+import uuid
+import zlib
+from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+from urllib.parse import urlsplit
+
+import aiohttp
+import requests
+import urllib3
+from bs4 import BeautifulSoup
+from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+urllib3.disable_warnings()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROLE CONFIG
+# ═══════════════════════════════════════════════════════════════════════════════
+ROLE          = os.getenv("ROLE", "pool").lower()
+SHARED_SECRET = os.getenv("SHARED_SECRET", "changeme")
+PORT          = int(os.getenv("PORT", "8080"))
+GITHUB_TOKEN  = os.getenv("GITHUB_TOKEN", "")
+
+PEERS = {
+    "checker_1":  os.getenv("PEER_CHECKER_1",  "https://ps-brimstone.onrender.com"),
+    "checker_2":  os.getenv("PEER_CHECKER_2",  "https://ps-viper.onrender.com"),
+    "checker_3":  os.getenv("PEER_CHECKER_3",  "https://ps-sage.onrender.com"),
+    "checker_4":  os.getenv("PEER_CHECKER_4",  "https://ps-sova.onrender.com"),
+    "checker_5":  os.getenv("PEER_CHECKER_5",  "https://ps-astra.onrender.com"),
+    "checker_6":  os.getenv("PEER_CHECKER_6",  "https://ps-harbor.onrender.com"),
+    "checker_7":  os.getenv("PEER_CHECKER_7",  "https://ps-phoenix.onrender.com"),
+    "checker_8":  os.getenv("PEER_CHECKER_8",  "https://ps-breach.onrender.com"),
+    "checker_9":  os.getenv("PEER_CHECKER_9",  "https://ps-neon.onrender.com"),
+    "checker_10": os.getenv("PEER_CHECKER_10", "https://ps-killjoy.onrender.com"),
+    "pool":       os.getenv("PEER_POOL",       "https://ps-omen.onrender.com"),
+    "dashboard":  os.getenv("PEER_DASHBOARD",  "https://ps-yoru.onrender.com"),
+    "vps":        os.getenv("PEER_VPS",        "http://130.210.16.206:8080"),
 }
 
-function writeOrdersCache(cache) {
-  try { localStorage.setItem(ORDERS_CACHE_KEY, JSON.stringify(cache)); } catch {}
+CHECKER_ROLES = [f"checker_{i}" for i in range(1, 11)]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CALLER IDENTIFICATION
+# ═══════════════════════════════════════════════════════════════════════════════
+CALLER_PORT_MAP: dict[int, str] = {
+    8001: "MesoWebBackend",
+    8090: "pinger_dashboard",
+    8080: "proxystack-internal",
 }
 
-function orderCacheKey(order) {
-  return String(order?.order_num ?? order?.sub_order_num ?? order?.id ?? '');
+def _identify_caller(request: Request) -> str:
+    if request.client is None:
+        return "unknown"
+    port = request.client.port
+    return CALLER_PORT_MAP.get(port, f"unknown:{port}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PATHS
+# ═══════════════════════════════════════════════════════════════════════════════
+BASE         = Path(__file__).parent
+PERSIST_FREE = BASE / "proxy_live.json"
+KEYS_FILE    = BASE / "keys.json"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TUNING
+# ═══════════════════════════════════════════════════════════════════════════════
+BOOT_FETCH_COUNT    = 500
+COMMIT_FETCH_COUNT  = 1000
+CYCLE_FETCH_COUNT   = 500
+COMMIT_POLL_S       = 60
+CHECK_CONCURRENCY   = 150
+CHECK_TIMEOUT_S     = 12
+FETCH_WORKERS       = 20
+SEEN_TTL_S          = 3600
+INGEST_BATCH_SIZE   = 100
+INGEST_INTERVAL_S   = 1.0
+
+POOL_RECHECK_INTERVAL_S = 480
+POOL_RECHECK_MIN_AGE_S  = 300
+POOL_RECHECK_BATCH      = 80
+POOL_TTL_S              = 900
+POOL_COOLDOWN_S         = 8
+
+PICK_WAIT_S          = 0.0
+PICK_FAST_MAX_S      = 4.0
+PICK_FALLBACK_COUNT  = 10
+
+SNAP_INTERVAL_S         = 2
+PERSIST_INTERVAL_S      = 60
+CAT_FLASH   = 3.0
+CAT_PANTHER = 5.0
+CAT_LANTERN = 7.0
+CAT_DEAD    = 10.0
+
+FRESH_HOT_S  = 30
+FRESH_COLD_S = 120
+
+MEESHO_API  = "https://prod.meeshoapi.com"
+MEESHO_AUTH = "32c4d8137cn9eb493a1921f203173080"
+APP_ID      = "com.meesho.supply"
+
+STICKY_TTL_S = 900
+PING_INTERVAL = 240
+
+FOD_HUNT_PATHS = (
+    "/api/1.0/anonymous/config",
+    "/api/1.0/anonymous/referral-app-install",
+    "/api/1.0/anonymous/fod-personalisation",
+)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# URL ROUTING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+RACE_WAIT_S      = 3.0
+RACE_FRESH_MAX_S = 4.0
+RACE_PROXY_COUNT = 6
+
+STICKY_URL_FRAGMENTS = [
+    "/api/2.0/user/login",
+    "/api/1.0/cart/paymentinfo",
+    "/api/4.0/preorders",
+]
+STICKY_EXACT_PATHS = [
+    "/api/3.0/order",
+]
+
+WRITE_URL_FRAGMENTS = [
+    "/api/1.0/cart/add",
+    "/api/1.0/cart/remove",
+    "/api/1.0/cart/location",
+    "/api/2.0/addresses",
+    "/api/1.0/user/delivery-location",
+    "/api/2.0/orders/",
+]
+
+# FOD URLs are NOT raceable — index.py fires them in parallel with explicit
+# tier="free_only" or tier="premium". Anon session (search/recs) uses these
+# same URLs but sends tier="premium" explicitly. If tier="any" arrives for
+# a FOD URL, default to free_only (never race, never burn premium).
+RACEABLE_URL_FRAGMENTS = [
+    "/api/3.0/search/suggest",
+    "/api/3.0/anonymous/search/suggest",
+    "/api/1.0/widget-groups/fetch",
+    "/api/1.0/anonymous/widget-groups/fetch",
+    "/api/3.0/product/static",
+    "/api/3.0/product/dynamic",
+    "/api/2.0/catalogs/",
+    "/api/2.0/anonymous/catalogs/",
+    "/api/1.0/catalogs/recommendations",
+    "/api/1.0/anonymous/catalogs/recommendations",
+    "/api/4.0/anonymous/for-you",
+    "/api/3.0/user/orders",
+    "/api/3.0/user/order-details",
+]
+
+
+def _url_path(url: str) -> str:
+    try:
+        return urlsplit(url).path.rstrip("/") or "/"
+    except Exception:
+        return ""
+
+
+def _is_sticky_url(url: str) -> bool:
+    for frag in STICKY_URL_FRAGMENTS:
+        if frag in url:
+            return True
+    return _url_path(url) in STICKY_EXACT_PATHS
+
+
+def _is_write_url(url: str) -> bool:
+    if _is_sticky_url(url):
+        return False
+    return any(frag in url for frag in WRITE_URL_FRAGMENTS)
+
+
+def _is_raceable_url(url: str) -> bool:
+    if _is_sticky_url(url) or _is_write_url(url):
+        return False
+    return any(frag in url for frag in RACEABLE_URL_FRAGMENTS)
+
+
+def _plan_for_url(url: str) -> str:
+    if _is_sticky_url(url):
+        return "sticky"
+    if _is_write_url(url):
+        return "write"
+    return "read"
+
+
+def _is_fod_url(url: str) -> bool:
+    path = _url_path(url)
+    return any(path.startswith(p) for p in FOD_HUNT_PATHS)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SOURCES
+# ═══════════════════════════════════════════════════════════════════════════════
+ALL_GITHUB_REPOS = [
+    ("monosans",           "proxy-list",          "proxies/http.txt"),
+    ("monosans",           "proxy-list",          "proxies_anonymous/http.txt"),
+    ("TheSpeedX",          "PROXY-List",          "http.txt"),
+    ("proxifly",           "free-proxy-list",     "proxies/protocols/http/data.txt"),
+    ("proxifly",           "free-proxy-list",     "proxies/all/data.txt"),
+    ("roosterkid",         "openproxylist",       "HTTPS_RAW.txt"),
+    ("mmpx12",             "proxy-list",          "http.txt"),
+    ("clarketm",           "proxy-list",          "proxy-list-raw.txt"),
+    ("ShiftyTR",           "Proxy-List",          "http.txt"),
+    ("rdavydov",           "proxy-list",          "proxies/http.txt"),
+    ("rdavydov",           "proxy-list",          "proxies_anonymous/http.txt"),
+    ("zevtyardt",          "proxy-list",          "http.txt"),
+    ("proxy4parsing",      "proxy-list",          "http.txt"),
+    ("sunny9577",          "proxy-scraper",       "proxies.txt"),
+    ("zloi-user",          "hideip.me",           "http.txt"),
+    ("bq2015",             "FreeProxies",         "http.txt"),
+    ("Ian-Lusule",         "Proxies",             "http.txt"),
+    ("fate0",              "proxylist",           "proxy.list"),
+    ("jetkai",             "proxy-list",          "online-proxies/txt/proxies-http.txt"),
+    ("HyperBeats",         "Free-Proxies",        "http.txt"),
+    ("elliottophellia",    "proxylist",           "http/HTTP_ALL.txt"),
+    ("prxchk",             "proxy-list",          "http.txt"),
+    ("Anonym0usWork1221",  "free-proxy-list",     "free-proxy/http.txt"),
+    ("officialputuid",     "open-proxy-scrapper", "lists/http.txt"),
+    ("ErcinDedeoglu",      "proxylists",          "lists/http.txt"),
+    ("ObcbO",              "free-proxy",          "http.txt"),
+    ("Vann-Dev",           "free-proxy-list",     "proxy-list/http.txt"),
+    ("almroot",            "proxylist",           "list.txt"),
+    ("aslisk",             "public_socks5_lists", "http.txt"),
+    ("MuRongPIG",          "Free-Proxies",        "TheBiggerPicture.txt"),
+    ("casals",             "hma-proxy-list",      "http.txt"),
+    ("BlackSnowDot",       "proxy-list",          "http-proxies.txt"),
+    ("im-razvan",          "http-proxy",          "http.txt"),
+    ("UserR00T",           "Proxy-List",          "Proxylists/http.txt"),
+    ("UptimerBot",         "proxy-list",          "proxies/http.txt"),
+    ("yuceltoluyag",       "socks4-socks5-http-proxylist", "http.txt"),
+    ("TundzhaSarl",        "free-proxy-list",     "lists/http.txt"),
+    ("mertguvencli",       "http-proxy-list",     "list.txt"),
+    ("proxylist2022",      "proxy-list",          "http.txt"),
+    ("saisuiu",            "free-public-proxy",   "http.txt"),
+    ("Zaeem20",            "free-proxies-scraper","Proxies/Http/http-proxies.txt"),
+    ("roma8ka",            "free-proxy-list",     "http.txt"),
+    ("MathiasMillingdale", "free-http-proxy-list","http.txt"),
+    ("Fkunn1326",          "opz-proxies",         "http.txt"),
+    ("hookzof",            "socks5_list",         "proxy/socks5.txt"),
+    ("calpt",              "glitch-socks",        "http.txt"),
+    ("iplocate",           "free-proxy-list",     "protocols/http.txt"),
+    ("adasd223",           "checked-proxy-list",  "http.txt"),
+    ("gfpcom",             "free-proxy-list",     "lists/http.txt"),
+]
+
+ALL_HTTP_SOURCES = [
+    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=ipport&format=text",
+    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=ipport&format=text&anonymity=elite",
+    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=ipport&format=text&anonymity=anonymous",
+    "https://www.proxy-list.download/api/v1/get?type=http",
+    "https://www.proxy-list.download/api/v1/get?type=https",
+    "https://api.openproxylist.xyz/http.txt",
+    "https://proxyspace.pro/http.txt",
+    "https://proxyspace.pro/https.txt",
+    "https://proxyscan.io/download?type=http",
+    "https://spys.me/proxy.txt",
+    "https://multiproxy.org/txt_all/proxy.txt",
+    "https://www.freeproxychecker.com/result/http_proxies.txt",
+    "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/protocols/http/data.txt",
+    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt",
+    "https://sockslist.us/Api?request=display&country=all&level=all&token=free",
+    "http://pubproxy.com/api/proxy?limit=20&format=txt&type=http",
+]
+
+GEONODE_PAGES = [
+    "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&protocols=http",
+    "https://proxylist.geonode.com/api/proxy-list?limit=500&page=2&sort_by=lastChecked&sort_type=desc&protocols=http",
+    "https://proxylist.geonode.com/api/proxy-list?limit=500&page=3&sort_by=lastChecked&sort_type=desc&protocols=http",
+]
+
+HTML_SOURCES = [
+    "https://free-proxy-list.net",
+    "https://sslproxies.org",
+    "https://us-proxy.org",
+    "https://free-proxy-list.net/anonymous-proxy.html",
+]
+
+def _split_sources(lst: list, n: int, idx: int) -> list:
+    chunk = len(lst) // n
+    start = idx * chunk
+    end   = start + chunk if idx < n - 1 else len(lst)
+    return lst[start:end]
+
+def _get_my_sources():
+    idx = int(ROLE.split("_")[1]) - 1
+    n   = 10
+    return (
+        _split_sources(ALL_GITHUB_REPOS, n, idx),
+        _split_sources(ALL_HTTP_SOURCES, n, idx),
+        _split_sources(GEONODE_PAGES,   n, idx),
+        _split_sources(HTML_SOURCES,    n, idx),
+    )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SHARED STATE
+# ═══════════════════════════════════════════════════════════════════════════════
+_IP_PORT = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})\b")
+
+def _parse(text: str) -> list[str]:
+    return [m.group(0) for m in _IP_PORT.finditer(text)]
+
+_proxies_lock = threading.Lock()
+_proxies: dict[str, dict] = {}
+
+_used_lock  = threading.Lock()
+_last_used: dict[str, float] = {}
+
+_snap_lock     = threading.Lock()
+_snap_fresh30:  list[str] = []
+_snap_fresh120: list[str] = []
+_snap_fast:     list[str] = []
+
+_keys_lock = threading.Lock()
+_keys: list[dict] = []
+
+_sticky_lock = threading.Lock()
+_sticky_sessions: dict[str, dict] = {}
+
+_seen_lock = threading.Lock()
+_seen: dict[str, float] = {}
+
+_outbuf_lock = threading.Lock()
+_outbuf: list[tuple[str, float]] = []
+
+_counter_lock = threading.Lock()
+_counters_lifetime: dict[str, int] = defaultdict(int)
+_counters_cycle:    dict[str, int] = defaultdict(int)
+_cycle_start: float = time.time()
+
+_activity_lock = threading.Lock()
+_activity_log: list[dict] = []
+ACTIVITY_MAX = 200
+
+_persist_event = threading.Event()
+
+_sha_lock  = threading.Lock()
+_repo_sha: dict[str, str] = {}
+
+_etag_lock = threading.Lock()
+_http_etag: dict[str, str] = {}
+_http_lmod: dict[str, str] = {}
+
+_check_queue: asyncio.Queue = None
+_check_loop:  asyncio.AbstractEventLoop = None
+
+_api_executor     = ThreadPoolExecutor(max_workers=8,  thread_name_prefix="api")
+_backend_executor = ThreadPoolExecutor(max_workers=24, thread_name_prefix="backend")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PREMIUM PROVIDERS — ScrapingAnt / ScraperAPI / ScrapeOps
+# ═══════════════════════════════════════════════════════════════════════════════
+PROVIDERS = ("scrapingant", "scraperapi", "scrapeops")
+
+DEFAULT_CREDIT_LIMITS = {
+    "scrapingant": 10_000,
+    "scraperapi":  1_000,
+    "scrapeops":   1_000,
 }
 
-function mergeCachedOrders(cache, accountId, phone, orders) {
-  const account = cache.accounts[accountId] ?? { phone, orders: [], details: {} };
-  const previousDetails = account.details ?? {};
-  const existingOrders = account.orders ?? [];
-  const merged = new Map();
+SCRAPINGANT_ENDPOINT = "https://api.scrapingant.com/v2/general"
+SCRAPERAPI_ENDPOINT  = "https://api.scraperapi.com/"
+SCRAPEOPS_ENDPOINT   = "https://proxy.scrapeops.io/v1/"
 
-  existingOrders.forEach(order => {
-    const key = orderCacheKey(order);
-    if (key) merged.set(key, order);
-  });
+SCRAPINGANT_USAGE_URL = "https://api.scrapingant.com/v2/usage"
+SCRAPERAPI_USAGE_URL  = "https://api.scraperapi.com/account"
+SCRAPEOPS_USAGE_URL   = "https://backend.scrapeops.io/v1/proxy/account/usage"
 
-  orders.forEach(order => {
-    const normalized = { ...order, phone: phone ?? order.phone ?? '', accountId };
-    const key = orderCacheKey(normalized);
-    if (key) merged.set(key, { ...merged.get(key), ...normalized });
-  });
+PREMIUM_TIMEOUT_S = 5
+USAGE_TIMEOUT_S   = 8
 
-  account.phone = phone ?? account.phone ?? '';
-  account.orders = Array.from(merged.values()).sort(
-    (a, b) => (b.created_date ?? 0) - (a.created_date ?? 0)
-  );
-  account.details = previousDetails;
-  cache.accounts[accountId] = account;
-  cache.updatedAt = Date.now();
-  return cache;
-}
+_scrapingant_sem = threading.Semaphore(1)
 
-function getCachedOrdersForAccounts(cache, accounts, accountId) {
-  const selected = accountId === 'all' ? accounts : accounts.filter(a => a.account_id === accountId);
-  return selected.flatMap(acc => (cache.accounts[acc.account_id]?.orders ?? []).map(order => ({
-    ...order, phone: acc.phone, accountId: acc.account_id,
-  }))).sort((a, b) => (b.created_date ?? 0) - (a.created_date ?? 0));
-}
 
-// ─── Nav ─────────────────────────────────────────────────────────────────────
+def _key_is_live(k: dict) -> bool:
+    reset = float(k.get("reset_at") or 0)
+    if reset and time.time() >= reset:
+        k["credits_used"] = 0
+        k["reset_at"]     = 0
+    limit = int(k.get("credits_limit")
+                or DEFAULT_CREDIT_LIMITS.get(k.get("provider", ""), 0))
+    used  = int(k.get("credits_used") or 0)
+    return used < limit
 
-const navItems = [
-  { id: 'home',    label: 'Home'    },
-  { id: 'search',  label: 'Search'  },
-  { id: 'cart',    label: 'Cart'    },
-  { id: 'orders',  label: 'Orders'  },
-  { id: 'profile', label: 'Profile' },
-];
 
-// ─── FlipCard ────────────────────────────────────────────────────────────────
+def _pick_premium_key(provider: str) -> Optional[dict]:
+    with _keys_lock:
+        candidates = [k for k in _keys if k.get("provider") == provider]
+        live       = [k for k in candidates if _key_is_live(k)]
+    if not live:
+        return None
+    live.sort(key=lambda k: float(k.get("last_used") or 0))
+    return live[0]
 
-function FlipCard({ card, pageReady, onOpen, delay }) {
-  const [flipped, setFlipped] = useState(false);
-  const [interacted, setInteracted] = useState(false);
-  const tapTimer = useRef(null);
 
-  const handleTap = () => {
-    setInteracted(true);
-    if (tapTimer.current) {
-      window.clearTimeout(tapTimer.current);
-      tapTimer.current = null;
-      onOpen(card.id);
-      return;
-    }
-    tapTimer.current = window.setTimeout(() => {
-      tapTimer.current = null;
-      setFlipped((c) => !c);
-    }, 240);
-  };
+def _get_key_by_label(provider: str, label: str) -> Optional[dict]:
+    with _keys_lock:
+        for k in _keys:
+            if k.get("provider") == provider and k.get("label") == label:
+                return k if _key_is_live(k) else None
+    return None
 
-  return (
-    <article
-      className={`meso-card meso-card--${card.id}${pageReady ? ' is-ready' : ''}${interacted ? ' is-interacted' : ''}`}
-      style={{ '--card-delay': `${delay}s` }}
-      onClick={handleTap}
-      onDoubleClick={(e) => e.preventDefault()}
-      role="button" tabIndex={0}
-      aria-label={`${card.label}. Tap to flip, double tap to open`}
-      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handleTap(); } }}
-    >
-      <div className={`meso-card__content${flipped ? ' is-flipped' : ''}`}>
-        <div className="meso-card__face meso-card__back">
-          <div className="meso-card__back-glow" aria-hidden="true" />
-          <div className="meso-card__back-content">
-            <div className={`meso-card__icon meso-card__icon--${card.id}`} aria-hidden="true">{card.icon}</div>
-            <strong>{card.label}</strong>
-            <span>{card.backText || 'Tap to view'}</span>
-          </div>
-        </div>
-        <div className="meso-card__face meso-card__front">
-          <div className="meso-card__orb" aria-hidden="true" />
-          <div className="meso-card__front-content">
-            <small>{card.label}</small>
-            <div>
-              <strong>{card.value}</strong>
-              <p>{card.detail}</p>
-            </div>
-            <span>Double tap to open</span>
-          </div>
-        </div>
-      </div>
-    </article>
-  );
-}
 
-// ─── AccountPicker ───────────────────────────────────────────────────────────
+def _mark_key_used(key_dict: dict, credits: int = 1):
+    with _keys_lock:
+        key_dict["credits_used"] = int(key_dict.get("credits_used") or 0) + credits
+        key_dict["last_used"]    = time.time()
 
-function AccountPicker({ value, onChange, accounts, label = 'Account', includeAnonymous = false, includeAll = false }) {
-  const [open, setOpen] = useState(false);
-  const options = [
-    ...(includeAll ? [{ account_id: 'all', phone: 'All Accounts' }] : []),
-    ...(includeAnonymous ? [{ account_id: 'anonymous', phone: 'Anonymous' }] : []),
-    ...accounts,
-  ];
-  const selected = options.find((account) => account.account_id === value) || options[0];
-  const selectedValue = selected?.account_id ?? '';
 
-  return (
-    <div className="fyp-account-dropdown meso-account-picker">
-      <span className="meso-account-picker__label">{label}</span>
-      <button
-        type="button"
-        className="fyp-account-dropdown__trigger"
-        onClick={() => setOpen((current) => !current)}
-        aria-expanded={open}
-        aria-haspopup="listbox"
-      >
-        <span className="fyp-account-dropdown__current">
-          <span className="fyp-account-dropdown__avatar">
-            {selectedValue === 'anonymous' ? 'A' : selectedValue === 'all' ? 'ALL' : selected?.phone?.slice(-2) ?? '?'}
-          </span>
-          <span>
-            <small>{label}</small>
-            <strong>{selected?.phone ?? 'Select Account'}</strong>
-          </span>
-        </span>
-        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m7 9 5 5 5-5"/></svg>
-      </button>
-      {open && (
-        <div className="fyp-account-dropdown__menu is-open" role="listbox">
-          {options.map((account) => (
-            <button
-              type="button"
-              key={account.account_id}
-              className={`fyp-account-dropdown__option${selectedValue === account.account_id ? ' is-selected' : ''}`}
-              onClick={() => { onChange(account.account_id); setOpen(false); }}
-              role="option"
-              aria-selected={selectedValue === account.account_id}
-            >
-              <span className="fyp-account-dropdown__avatar">
-                {account.account_id === 'anonymous' ? 'A' : account.account_id === 'all' ? 'ALL' : account.phone?.slice(-2)}
-              </span>
-              <span><strong>{account.phone}</strong></span>
-              <i>{selectedValue === account.account_id ? '✓' : ''}</i>
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
+def _exhaust_key(key_dict: dict):
+    limit = int(key_dict.get("credits_limit")
+                or DEFAULT_CREDIT_LIMITS.get(key_dict.get("provider", ""), 0))
+    with _keys_lock:
+        key_dict["credits_used"] = limit
+        key_dict["last_used"]    = time.time()
 
-function CartAccountPicker({ value, onChange, accounts }) {
-  const [open, setOpen] = useState(false);
-  const selected = accounts.find(a => a.account_id === value);
 
-  return (
-    <div className="cart-account-picker">
-      <span className="cart-account-picker__label">Account</span>
-      <button
-        type="button"
-        className="cart-account-picker__trigger"
-        onClick={() => setOpen(current => !current)}
-        aria-expanded={open}
-        aria-haspopup="listbox"
-      >
-        <span className="cart-account-picker__current">
-          <span className="cart-account-picker__avatar">{selected?.phone?.slice(-2) ?? '?'}</span>
-          <span>
-            <small>Account</small>
-            <strong>{selected?.phone ?? 'Select account'}</strong>
-          </span>
-        </span>
-        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m7 9 5 5 5-5"/></svg>
-      </button>
-
-      {open && (
-        <div className="cart-account-picker__menu" role="listbox">
-          <button
-            type="button"
-            className={`cart-account-picker__option${!value ? ' is-selected' : ''}`}
-            onClick={() => { onChange(''); setOpen(false); }}
-            role="option"
-            aria-selected={!value}
-          >
-            <span className="cart-account-picker__avatar">?</span>
-            <strong>Select account</strong>
-            <i>{!value ? '✓' : ''}</i>
-          </button>
-
-          {accounts.map(account => (
-            <button
-              type="button"
-              key={account.account_id}
-              className={`cart-account-picker__option${value === account.account_id ? ' is-selected' : ''}`}
-              onClick={() => { onChange(account.account_id); setOpen(false); }}
-              role="option"
-              aria-selected={value === account.account_id}
-            >
-              <span className="cart-account-picker__avatar">{account.phone?.slice(-2)}</span>
-              <strong>{account.phone}</strong>
-              <i>{value === account.account_id ? '✓' : ''}</i>
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ─── ProductCard ─────────────────────────────────────────────────────────────
-
-function ProductCard({ product, pageReady, delay, onOpenDetail }) {
-  const [threeDReady, setThreeDReady] = useState(false);
-  const [flipped, setFlipped]         = useState(false);
-  const tapTimer                      = useRef(null);
-
-  const handleOpen = () => {
-    if (!threeDReady) { setThreeDReady(true); requestAnimationFrame(() => setFlipped(true)); return; }
-    setFlipped((c) => !c);
-  };
-
-  const handleCardClick = () => {
-    if (tapTimer.current) {
-      window.clearTimeout(tapTimer.current);
-      tapTimer.current = null;
-      onOpenDetail?.(product);
-      return;
-    }
-    tapTimer.current = window.setTimeout(() => {
-      tapTimer.current = null;
-      handleOpen();
-    }, 240);
-  };
-
-  useEffect(() => () => { if (tapTimer.current) window.clearTimeout(tapTimer.current); }, []);
-
-  return (
-    <article
-      className={`product-card${pageReady ? ' is-ready' : ''}${threeDReady ? ' is-3d' : ''}${flipped ? ' is-flipped' : ''}`}
-      style={{ '--product-delay': `${delay}s` }}
-      onClick={handleCardClick}
-      onDoubleClick={(e) => { e.preventDefault(); if (tapTimer.current) { window.clearTimeout(tapTimer.current); tapTimer.current = null; } onOpenDetail?.(product); }}
-      role="button" tabIndex={0}
-      aria-label={`${product.name}. Single tap to flip, double tap to open product details`}
-      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpenDetail?.(product); } }}
-    >
-      <div className="product-card__content">
-        <div className="product-card__face product-card__front">
-          <img src={product.image} alt={product.name} loading="lazy" />
-          <div className="product-card__image-shade" aria-hidden="true" />
-          <div className="product-card__front-content">
-            <div className="product-card__top-badges">
-              {product.nextDayDispatch
-                ? <span className="product-badge product-badge--ship"><svg className="product-badge__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M13.2 2 5 13h6l-.8 9L19 10h-6z"/></svg><span>Next Day</span></span>
-                : null}
-              {(product.trustMarkers ?? []).map(t => (
-                <span key={t} className="product-badge product-badge--mall">{t}</span>
-              ))}
-            </div>
-            <div className="product-card__info">
-              <div className="product-card__name-row">
-                <strong>{product.name}</strong>
-                <span className="product-card__save" aria-label="Save product"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.8 8.7c0 5.2-8.8 10-8.8 10s-8.8-4.8-8.8-10A4.7 4.7 0 0 1 12 6.2a4.7 4.7 0 0 1 8.8 2.5Z"/></svg></span>
-              </div>
-              <div className="product-card__meta">
-                <strong>{product.price}</strong>
-                <span className="product-card__rating"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-2.9-5.6 2.9 1.1-6.2L3 9.6l6.2-.9z"/></svg>{product.rating} <em>({product.reviews})</em></span>
-              </div>
-            </div>
-          </div>
-        </div>
-        {threeDReady && (
-          <div className="product-card__face product-card__back">
-            <div className="product-card__back-top">
-              <span>{product.name}</span>
-              <small>Pricing & Delivery</small>
-            </div>
-            <div className="product-card__prices">
-              <div><span>COD PRICE</span><strong>{product.codPrice}</strong></div>
-              <div><span>UPI PRICE</span><strong>{product.upiPrice}</strong></div>
-            </div>
-            <div className="product-card__badges">
-              {product.nextDayDispatch
-                ? <span className="product-badge product-badge--ship product-badge--next-ship"><svg className="product-badge__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M13.2 2 5 13h6l-.8 9L19 10h-6z"/></svg><span>NXT SHIP</span></span>
-                : null}
-              {product.seller && product.seller !== 'Meesho Seller'
-                ? <span className="product-badge product-badge--mall">{product.seller}</span>
-                : null}
-            </div>
-            <small className="product-card__flip-hint">Single tap to return · Double tap for details</small>
-          </div>
-        )}
-      </div>
-    </article>
-  );
-}
-
-function LazyProductCard({ product, pageReady, delay, onOpenDetail }) {
-  const slotRef       = useRef(null);
-  const [visible, setVisible] = useState(false);
-  useEffect(() => {
-    const node = slotRef.current;
-    if (!node || typeof IntersectionObserver === 'undefined') { setVisible(true); return; }
-    const obs = new IntersectionObserver(([e]) => setVisible(e.isIntersecting), { threshold: 0.01 });
-    obs.observe(node);
-    return () => obs.disconnect();
-  }, []);
-  return (
-    <div ref={slotRef} className="product-card-slot">
-      {visible ? <ProductCard product={product} pageReady={pageReady} delay={delay} onOpenDetail={onOpenDetail} /> : null}
-    </div>
-  );
-}
-
-function ProductGrid({ pageReady, products = [], onOpenDetail }) {
-  if (!products.length) return <div className="product-grid-empty">No products found.</div>;
-  return (
-    <div className="product-grid" aria-label="Products">
-      {products.map((p, i) => (
-        <LazyProductCard key={p.id ?? i} product={p} pageReady={pageReady} delay={i * 0.08} onOpenDetail={onOpenDetail} />
-      ))}
-    </div>
-  );
-}
-
-// ─── Product Detail Page ─────────────────────────────────────────────────────
-
-function ProductDetailPage({ product, onClose, onAddToCart, onBuyNow }) {
-  const [selectedImage, setSelectedImage] = useState(0);
-  const [quantity, setQuantity] = useState(1);
-  const [adding,   setAdding]  = useState(false);
-  const [saved,    setSaved]   = useState(false);
-  const [selectedVariation, setSelectedVariation] = useState(null);
-
-  const sizeOptions = (product.sizes ?? []).map(s => ({
-    id: s.id, name: s.name ?? String(s), price: s.price, inStock: s.inStock !== false,
-  }));
-  const effectiveVariation = selectedVariation ?? sizeOptions.find(s => s.inStock) ?? null;
-
-  const gallery = product.gallery?.length ? product.gallery : [product.image];
-  const priceNumber = Number((product.codPrice ?? product.price ?? '').replace(/[^0-9]/g, '')) || 0;
-  const upiNumber   = Number((product.upiPrice || '').replace(/[^0-9]/g, '')) || Math.max(priceNumber - 50, 0);
-  const mrpNumber   = Number((product.mrpPrice || '').replace(/[^0-9]/g, '')) || Math.ceil((priceNumber * 1.25) / 10) * 10;
-  const discountPct = mrpNumber ? Math.round(((mrpNumber - priceNumber) / mrpNumber) * 100) : 0;
-
-  const attributes = product.attributes ?? [];
-  const ndd = !!product.nextDayDispatch;
-
-  const specs = [
-    ['Product ID',  `#${String(product.productId || product.id || '').padStart(8, '0')}`],
-    ['Catalog ID',  `#${String(product.catalogId || product.id || '').padStart(8, '0')}`],
-    ['Supplier',    product.seller || 'Meesho Seller'],
-    ['Type',        product.category || '—'],
-    ['Country',     'India'],
-  ];
-
-  const runCartAnimation = (action) => {
-    if (adding) return;
-    setAdding(true);
-    window.setTimeout(() => action(product, quantity, effectiveVariation), 850);
-  };
-
-  return (
-    <div className="product-detail-overlay" role="dialog" aria-modal="true" aria-label={`Product details for ${product.name}`}>
-      <div className="product-detail">
-        <header className="product-detail__header">
-          <button type="button" className="product-detail__back" onClick={onClose}>← Back</button>
-          <strong>Product Details</strong>
-          <button type="button" className="product-detail__close" onClick={onClose} aria-label="Close">Close</button>
-        </header>
-        <div className="product-detail__scroll">
-          {product.enriching && (<div className="product-detail__enriching">Loading sizes, material & delivery…</div>)}
-          <section className="product-detail__gallery">
-            <div className="product-detail__hero"><img src={gallery[selectedImage]} alt={product.name} /></div>
-            <div className="product-detail__thumbnails">
-              {gallery.map((img, i) => (
-                <button type="button" key={i} className={`product-detail__thumbnail${selectedImage === i ? ' is-selected' : ''}`} onClick={() => setSelectedImage(i)}>
-                  <img src={img} alt="" />
-                </button>
-              ))}
-            </div>
-          </section>
-          <section className="product-detail__summary">
-            <div className="product-detail__title-row">
-              <div>
-                <p className="product-detail__seller">Seller: <strong>{(product.seller || 'MEESHO SELLER').toUpperCase()}</strong></p>
-                <h2>{product.name}</h2>
-              </div>
-              <button type="button" className={`product-detail__save${saved ? ' is-saved' : ''}`} onClick={() => setSaved(v => !v)}>
-                {saved ? <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.8 8.7c0 5.2-8.8 10-8.8 10s-8.8-4.8-8.8-10A4.7 4.7 0 0 1 12 6.2a4.7 4.7 0 0 1 8.8 2.5Z"/></svg> : <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.8 8.7c0 5.2-8.8 10-8.8 10s-8.8-4.8-8.8-10A4.7 4.7 0 0 1 12 6.2a4.7 4.7 0 0 1 8.8 2.5Z"/></svg>}
-              </button>
-            </div>
-            <div className="product-detail__rating-row">
-              <span className="product-detail__rating"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-2.9-5.6 2.9 1.1-6.2L3 9.6l6.2-.9z"/></svg>{product.rating}</span>
-              <span>{product.reviews} Ratings & Reviews</span>
-            </div>
-            <div className="product-detail__price-card">
-              <div className="product-detail__price-row">
-                <del className="product-detail__mrp">₹{mrpNumber.toLocaleString('en-IN')}</del>
-                <strong className="product-detail__cod">₹{priceNumber.toLocaleString('en-IN')}</strong>
-                <span className="product-detail__discount-badge">{discountPct}% OFF</span>
-              </div>
-              <div className="product-detail__upi-row">
-                <span className="product-detail__upi-price"><svg className="product-detail__upi-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M13.2 2 5 13h6l-.8 9L19 10h-6z"/></svg><strong>₹{upiNumber.toLocaleString('en-IN')}</strong><span>with UPI</span></span>
-                <span className="product-detail__upi-save">Save ₹{Math.max(priceNumber - upiNumber, 0)} with UPI</span>
-              </div>
-              {(ndd || product.shippingTime || product.edd) && (
-                <div className="product-detail__delivery-row">
-                  {ndd && <span className="product-badge product-badge--ship"><svg className="product-badge__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M13.2 2 5 13h6l-.8 9L19 10h-6z"/></svg><span>Next Day Dispatch</span></span>}
-                  {product.shippingTime && <span>{product.shippingTime}</span>}
-                  {product.edd && <span>· Delivery by {product.edd}</span>}
-                </div>
-              )}
-              {sizeOptions.length > 0 ? (
-                <>
-                  <div className="product-detail__size-header">
-                    <strong>Select Size:</strong>
-                    <span>● {effectiveVariation?.name ?? '—'} <b>{effectiveVariation && !effectiveVariation.inStock ? '(Out of stock)' : '(In Stock)'}</b></span>
-                  </div>
-                  <div className="product-detail__sizes">
-                    {sizeOptions.map(s => (
-                      <button type="button" key={s.id ?? s.name} className={effectiveVariation?.id === s.id ? 'is-selected' : ''} onClick={() => setSelectedVariation(s)}>
-                        {s.name}
-                      </button>
-                    ))}
-                  </div>
-                </>
-              ) : (
-                <div className="product-detail__size-header"><strong>Size:</strong><span>● Free Size</span></div>
-              )}
-            </div>
-            {attributes.length > 0 && (
-              <section className="product-detail__specs">
-                <h3>Material & Specifications</h3>
-                <div className="product-detail__spec-grid">
-                  {attributes.map((a, i) => (
-                    <div key={a.field_name ?? a.display_name ?? i}>
-                      <span>{a.display_name ?? a.field_name}</span>
-                      <strong>{a.value}</strong>
-                    </div>
-                  ))}
-                </div>
-              </section>
-            )}
-            <section className="product-detail__specs">
-              <h3>Product Details</h3>
-              <div className="product-detail__spec-grid">
-                {specs.map(([label, value]) => (<div key={label}><span>{label}</span><strong>{value}</strong></div>))}
-              </div>
-            </section>
-            <div className="product-detail__actions">
-              <button type="button" className={`cart-add-button product-detail__add${adding ? ' is-added' : ''}`} onClick={() => runCartAnimation(onAddToCart)} disabled={adding}>
-                <span className="cart-add-button__circle" aria-hidden="true">
-                  <span className="cart-add-button__cart"><svg viewBox="0 0 24 24"><path d="M3 4h2l2.2 10.2a2 2 0 0 0 2 1.6h7.7a2 2 0 0 0 1.9-1.4L21 8H7.1M10 20h.01M18 20h.01"/></svg></span>
-                  <span className="cart-add-button__wind" />
-                </span>
-                <span className="cart-add-button__text">{adding ? 'Added' : 'Add to Cart'}</span>
-              </button>
-              <button type="button" className="product-detail__buy" onClick={() => runCartAnimation(onBuyNow)} disabled={adding}>Buy Now</button>
-            </div>
-          </section>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ─── Order Details Page ──────────────────────────────────────────────────────
-
-function OrderDetailsSkeleton() {
-  return (
-    <div className="order-detail__skeleton" aria-hidden="true">
-      <section className="order-detail__card order-detail__skeleton-card order-detail__skeleton-product">
-        <div className="order-detail__skeleton-image" />
-        <div className="order-detail__skeleton-copy">
-          <span className="order-detail__skeleton-line is-label" />
-          <span className="order-detail__skeleton-line is-title" />
-          <span className="order-detail__skeleton-line is-meta" />
-        </div>
-        <span className="order-detail__skeleton-price" />
-      </section>
-      <section className="order-detail__card order-detail__skeleton-card">
-        <span className="order-detail__skeleton-line is-label" />
-        <span className="order-detail__skeleton-line is-wide" />
-      </section>
-      <section className="order-detail__card order-detail__skeleton-card order-detail__skeleton-status">
-        <div><span className="order-detail__skeleton-line is-label" /><span className="order-detail__skeleton-line is-medium" /></div>
-        <span className="order-detail__skeleton-line is-small" />
-      </section>
-      <section className="order-detail__card order-detail__skeleton-card order-detail__skeleton-tracking">
-        <div className="order-detail__skeleton-heading"><span className="order-detail__skeleton-line is-label" /><span className="order-detail__skeleton-line is-medium" /></div>
-        <span className="order-detail__skeleton-line is-carrier" />
-        <div className="order-detail__skeleton-stepper"><span /><span /><span /><span /></div>
-        <span className="order-detail__skeleton-line is-activity" />
-      </section>
-      <section className="order-detail__card order-detail__skeleton-card order-detail__skeleton-payment">
-        <div><span className="order-detail__skeleton-line is-label" /><span className="order-detail__skeleton-line is-medium" /></div>
-        <span className="order-detail__skeleton-line is-small" />
-      </section>
-      <section className="order-detail__card order-detail__skeleton-card">
-        <span className="order-detail__skeleton-line is-label" />
-        <span className="order-detail__skeleton-line is-medium" />
-      </section>
-      <section className="order-detail__card order-detail__skeleton-card order-detail__skeleton-address">
-        <span className="order-detail__skeleton-line is-label" />
-        <span className="order-detail__skeleton-line is-medium" />
-        <span className="order-detail__skeleton-line is-wide" />
-        <span className="order-detail__skeleton-line is-small" />
-      </section>
-    </div>
-  );
-}
-
-function OrderDetailsPage({ order, accountId, onClose }) {
-  const [details,        setDetails]        = useState(null);
-  const [loadingDetails, setLoadingDetails] = useState(!!accountId);
-  const [cancelReasonsOpen, setCancelReasonsOpen] = useState(false);
-  const [reasons,        setReasons]        = useState([]);
-  const [selectedReason, setSelectedReason] = useState(null);
-  const [cancelling,     setCancelling]     = useState(false);
-  const [cancelDone,     setCancelDone]     = useState(false);
-
-  useEffect(() => {
-    if (!accountId || !order.order_num) { setLoadingDetails(false); return; }
-    const key = orderCacheKey(order);
-    const cache = readOrdersCache();
-    const cached = cache.accounts?.[accountId]?.details?.[key];
-    if (cached) { setDetails(cached); setLoadingDetails(false); }
-    else { setLoadingDetails(true); }
-
-    fetchOrderDetails(accountId, order.order_num, order.sub_order_num)
-      .then(r => {
-        const detail = r?.data ?? r;
-        if (detail) {
-          setDetails(detail);
-          const nextCache = readOrdersCache();
-          const accountCache = nextCache.accounts?.[accountId];
-          if (accountCache) {
-            accountCache.details = accountCache.details ?? {};
-            accountCache.details[key] = detail;
-            nextCache.updatedAt = Date.now();
-            writeOrdersCache(nextCache);
-          }
+def _premium_response(r: requests.Response, key: dict, provider: str) -> dict:
+    if r.status_code in (401, 403, 429):
+        _exhaust_key(key)
+        return {
+            "success": False,
+            "error":   f"{provider}: http {r.status_code}",
+            "rotate":  True,
         }
-        setLoadingDetails(false);
-      })
-      .catch(() => setLoadingDetails(false));
-  }, [accountId, order]);
 
-  useEffect(() => {
-    if (!order) return;
-    const body = document.body;
-    const prev = body.style.overflow;
-    body.style.overflow = 'hidden';
-    return () => { body.style.overflow = prev; };
-  }, [order]);
+    _mark_key_used(key, credits=1)
 
-  const handleOpenCancel = async () => {
-    setCancelReasonsOpen(true);
-    if (!reasons.length && accountId) {
-      try {
-        const r = await fetchCancellationReasons(accountId, order.order_num, order.sub_order_num);
-        setReasons(r?.data?.cancellation_reasons ?? r?.cancellation_reasons ?? []);
-      } catch {}
-    }
-  };
-
-  const handleCancel = async () => {
-    if (!selectedReason || !accountId) return;
-    setCancelling(true);
-    try {
-      await cancelOrder(accountId, order.order_num, order.sub_order_num, selectedReason);
-      setCancelDone(true);
-    } catch {}
-    setCancelling(false);
-  };
-
-  const display = details ?? order;
-  const updates = (display?.shipment_updates ?? []).map(u => Array.isArray(u) ? u : [u.title ?? '', u.time ?? '']);
-  const status = typeof display?.status === 'string' ? display.status : display?.status?.title?.text ?? '—';
-  const tracking = { expected_delivery: display?.expected_delivery ?? '' };
-  const canCancelOrder = !/delivered|cancelled/i.test(status);
-  const stageIdx = /delivered/i.test(status) ? 3 : /out.?for.?delivery/i.test(status) ? 2 : /shipped/i.test(status) ? 1 : 0;
-  const isCancelled = /cancel/i.test(status);
-
-  return (
-    <div className="order-detail-overlay" role="dialog" aria-modal="true">
-      <div className="order-detail-page">
-        <header className="order-detail__topbar">
-          <button type="button" onClick={onClose}>← Back</button>
-          <strong>Order Details</strong>
-          <button type="button" onClick={onClose}>Close</button>
-        </header>
-        <div className="order-detail__scroll">
-          {loadingDetails && !details ? (<OrderDetailsSkeleton />) : (
-            <>
-              <section className="order-detail__card order-detail__product-card">
-                <div>
-                  <span className="order-detail__label">Product</span>
-                  {(display?.product_image || display?.product_details?.image) && (
-                    <img src={display.product_image ?? display.product_details?.image} alt="" style={{width:64,height:64,borderRadius:8,objectFit:'cover',marginBottom:8}}/>
-                  )}
-                  <h2>{display?.product_name ?? display?.product_details?.name ?? '—'}</h2>
-                  <p>Size: {display?.product_size ?? display?.product_details?.size ?? 'Free Size'} <span>•</span> Qty: {display?.product_qty ?? display?.product_details?.quantity ?? 1}</p>
-                </div>
-                <strong>{display?.product?.price ?? `₹${display?.amount ?? '—'}`}</strong>
-              </section>
-
-              <section className="order-detail__card order-detail__order-id">
-                <span className="order-detail__label">Order ID</span>
-                <strong>{display.sub_order_num ?? display.id}</strong>
-              </section>
-
-              <section className="order-detail__card order-detail__status-card">
-                <div><span className="order-detail__label">Order Status</span><strong>{status}</strong></div>
-                <span>{tracking?.expected_delivery ?? display.delivery ?? ''}</span>
-              </section>
-
-              <section className="order-detail__card order-detail__tracking">
-                <div className="order-detail__section-heading">
-                  <div><span className="order-detail__label">Tracking</span><h3>Shipment</h3></div>
-                  <span>Carrier: {display.carrier ?? '—'}</span>
-                </div>
-
-                <div className="order-detail__stepper">
-                  <div className="order-detail__stepper-track">
-                    <span className="order-detail__stepper-progress" style={{
-                      width: isCancelled ? '0%' : stageIdx === 3 ? '100%' : stageIdx === 2 ? '66.67%' : stageIdx === 1 ? '33.33%' : '0%'
-                    }} />
-                  </div>
-                  {[['Order Placed','placed'],['Shipped','shipped'],['Out for Delivery','ofd'],['Delivered','delivered']].map(([label, key], i) => {
-                    const isCompleted = isCancelled ? i === 0 : i < stageIdx;
-                    const isCurrent   = !isCancelled && i === stageIdx;
-                    const isCxlStep   = isCancelled && i === 1;
-                    return (
-                      <div className={`order-detail__step${isCompleted ? ' is-completed' : ''}${isCurrent ? ' is-current' : ''}${isCxlStep ? ' is-cancelled' : ''}`} key={key}>
-                        <span className="order-detail__step-counter">{isCxlStep ? '×' : isCompleted || isCurrent ? '✓' : i + 1}</span>
-                        <span className="order-detail__step-name">{isCxlStep ? 'Cancelled' : label}</span>
-                      </div>
-                    );
-                  })}
-                </div>
-
-                {updates.length > 0 && (
-                  <>
-                    <button type="button" className="order-detail__tracking-toggle"
-                      onClick={(e) => {
-                        const open = e.currentTarget.getAttribute('aria-expanded') !== 'true';
-                        e.currentTarget.setAttribute('aria-expanded', String(open));
-                        e.currentTarget.classList.toggle('is-open', open);
-                        e.currentTarget.nextElementSibling?.classList.toggle('is-open', open);
-                      }} aria-expanded="false">
-                      <span className="order-detail__tracking-toggle-left">
-                        <strong>Tracking Activity</strong>
-                        <span>{updates.length} updates</span>
-                      </span>
-                      <svg className="order-detail__tracking-arrow" viewBox="0 0 24 24" fill="none"><path d="m6 9 6 6 6-6"/></svg>
-                    </button>
-                    <div className="order-detail__activity-wrapper">
-                      <div className="order-detail__activity-inner">
-                        <div className="order-detail__activity-list">
-                          {updates.map(([title, time], i) => {
-                            const isDanger = /cancel|refund/i.test(title);
-                            const isLatest = i === updates.length - 1;
-                            return (
-                              <div className="order-detail__activity-group" key={i}>
-                                {i === 0 && <div className="order-detail__activity-date">Latest</div>}
-                                <div className="order-detail__activity-timeline">
-                                  <div className={`order-detail__activity-item${isLatest ? ' is-latest' : ''}${isDanger ? ' is-danger' : ''}`}>
-                                    <span className="order-detail__activity-dot" />
-                                    <div className="order-detail__activity-content">
-                                      <div className="order-detail__activity-main">
-                                        <strong>{title}</strong>
-                                        <span>{isDanger ? 'Order status or refund update' : 'Order tracking update'}</span>
-                                      </div>
-                                      <time>{time}</time>
-                                    </div>
-                                  </div>
-                                </div>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      </div>
-                    </div>
-                  </>
-                )}
-              </section>
-
-              <section className="order-detail__card order-detail__payment">
-                <div><span className="order-detail__label">Payment</span><strong>{display?.payment_mode ?? display?.payment_details?.final_payment_mode?.toUpperCase() ?? '—'}</strong></div>
-                <strong>{display?.amount ? `₹${Number(display.amount).toLocaleString('en-IN')}` : '—'}</strong>
-              </section>
-
-              <section className="order-detail__card order-detail__seller">
-                <span className="order-detail__label">Seller</span>
-                <strong>{display.supplier_name ?? display.seller ?? '—'}</strong>
-              </section>
-
-              <section className="order-detail__card order-detail__address">
-                <span className="order-detail__label">Delivery Address</span>
-                <strong>{display.address?.name ?? '—'}</strong>
-                <span>{display.address?.city ?? ''}</span>
-                <span>Phone: {display.address?.phone ?? '—'}</span>
-              </section>
-
-              {canCancelOrder && !cancelDone && (
-                <div className="order-detail__cancel-section">
-                  {!cancelReasonsOpen ? (
-                    <button type="button" className="order-detail__cancel-button" onClick={handleOpenCancel}>Cancel Order</button>
-                  ) : (
-                    <div className="order-detail__cancel-reasons">
-                      <strong>Select a reason</strong>
-                      {reasons.length === 0 && <p>Loading reasons…</p>}
-                      {reasons.map(r => (
-                        <button type="button" key={r.id ?? r.reason_id}
-                          className={`order-detail__reason${selectedReason === (r.id ?? r.reason_id) ? ' is-selected' : ''}`}
-                          onClick={() => setSelectedReason(r.id ?? r.reason_id)}>
-                          {r.label ?? r.reason ?? r.text}
-                        </button>
-                      ))}
-                      <button type="button" className="order-detail__cancel-confirm" onClick={handleCancel} disabled={!selectedReason || cancelling}>
-                        {cancelling ? 'Cancelling…' : 'Confirm Cancel'}
-                      </button>
-                    </div>
-                  )}
-                </div>
-              )}
-              {cancelDone && (<div className="order-detail__cancel-done">Cancellation requested ✓</div>)}
-            </>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ─── Payment Print Animation ─────────────────────────────────────────────────
-
-function PaymentPrintAnimation({ paymentOrder }) {
-  const isUpi   = paymentOrder?.paymentMethod === 'UPI';
-  const amount  = Number(paymentOrder?.total || 0).toLocaleString('en-IN');
-  return (
-    <section className="payment-print-page">
-      <div className="payment-print-intro">
-        <p className="app-page__eyebrow">MesoWeb</p>
-        <h2>Payment</h2>
-        <p>{isUpi ? 'Scan the QR and complete your UPI payment.' : 'Your order is ready for cash on delivery.'}</p>
-      </div>
-      <div className="payment-print-stage">
-        <div className="payment-print-printer-extension" />
-        <div className="payment-print-printer">
-          <div className="payment-print-printer__top"><span>MESO</span><i /></div>
-          <div className="payment-print-printer__slot" />
-        </div>
-        <div className="payment-print-receipt-wrap">
-          <article className="payment-print-receipt">
-            <div className="payment-print-receipt__front">
-              <header>
-                <strong>MESO</strong>
-                <span>{isUpi ? paymentOrder?.id : 'ORDER DETAILS'}</span>
-              </header>
-              {isUpi ? (
-                <>
-                  {paymentOrder?.qrImage ? (
-                    <div className="payment-print-qr payment-print-qr--real"><img src={paymentOrder.qrImage} alt="UPI QR code" /></div>
-                  ) : (
-                    <div className="payment-print-qr">{Array.from({ length: 49 }, (_, i) => <i key={i} />)}</div>
-                  )}
-                  <div className="payment-print-upi-amount"><small>UPI PAYMENT · AMOUNT</small><strong>₹{amount}</strong></div>
-                </>
-              ) : (
-                <div className="payment-print-order-details">
-                  <div><small>ORDER ID</small><strong>{paymentOrder?.id}</strong></div>
-                  <div><small>PAYMENT</small><strong>Cash on Delivery</strong></div>
-                  <div><small>ITEMS</small><strong>{paymentOrder?.items?.length || 0}</strong></div>
-                  {paymentOrder?.items?.map(item => (
-                    <div key={item.id}><small>{item.quantity} × {item.name}</small><strong>₹{(Number((item.price||'').replace(/[^0-9]/g,'')) * item.quantity).toLocaleString('en-IN')}</strong></div>
-                  ))}
-                  <div className="payment-print-order-details__total"><small>TOTAL</small><strong>₹{amount}</strong></div>
-                </div>
-              )}
-            </div>
-            <div className="payment-print-receipt__back">
-              <header><strong>{isUpi ? 'UPI PAYMENT' : 'CASH ON DELIVERY'}</strong><span>{paymentOrder?.id}</span></header>
-              {isUpi ? (
-                paymentOrder?.qrImage
-                  ? <div className="payment-print-qr payment-print-qr--real"><img src={paymentOrder.qrImage} alt="UPI QR" /></div>
-                  : <div className="payment-print-qr">{Array.from({ length: 49 }, (_, i) => <i key={i} />)}</div>
-              ) : (
-                <div className="payment-print-cod"><small>AMOUNT TO PAY</small><strong>₹{amount}</strong></div>
-              )}
-              <p>{isUpi ? 'Scan to pay securely' : 'Pay when your order arrives'}</p>
-            </div>
-          </article>
-        </div>
-      </div>
-    </section>
-  );
-}
-
-// ─── Cart Address Add Overlay ────────────────────────────────────────────────
-
-function CartAddressAddOverlay({ accountId, onClose, onSaved }) {
-  const [form, setForm] = useState({ name:'', mobile:'', pincode:'', city:'', state:'', line1:'', line2:'' });
-  const [saving, setSaving] = useState(false);
-  const [resolving, setResolving] = useState(false);
-
-  const handlePincodeBlur = async () => {
-    if (form.pincode.length !== 6 || !accountId) return;
-    setResolving(true);
-    try {
-      const r = await resolveLocation(accountId, form.pincode);
-      const loc = r?.data?.user_delivery_location ?? {};
-      if (loc.city)  setForm(f => ({ ...f, city:  loc.city  }));
-      if (loc.state) setForm(f => ({ ...f, state: loc.state }));
-    } catch {}
-    setResolving(false);
-  };
-
-  const canSave = accountId && form.name && form.mobile && form.pincode && form.city && form.state && form.line1;
-
-  const handleSave = async () => {
-    if (!canSave) return;
-    setSaving(true);
-    try {
-      await createAddress({
-        account_id:     accountId,
-        name:           form.name,
-        mobile:         form.mobile,
-        pincode:        form.pincode,
-        city:           form.city,
-        state:          form.state,
-        address_line_1: form.line1,
-        address_line_2: form.line2,
-        address_type:   'Home',
-      });
-      clearAddressCache();
-      onSaved?.();
-    } catch (e) {
-      alert('Failed to save address.');
-    }
-    setSaving(false);
-  };
-
-  return (
-    <div className="cart-addr-overlay" role="dialog" aria-modal="true">
-      <div className="cart-addr-overlay__sheet">
-        <header className="cart-addr-overlay__head">
-          <strong>Add New Address</strong>
-          <button type="button" onClick={onClose}>×</button>
-        </header>
-        <div className="cart-addr-overlay__body">
-          <label><span>Full Name</span><input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} /></label>
-          <label><span>Mobile Number</span><input inputMode="tel" value={form.mobile} onChange={e => setForm(f => ({ ...f, mobile: e.target.value }))} /></label>
-          <label>
-            <span>Pincode {resolving ? '(resolving…)' : ''}</span>
-            <input inputMode="numeric" value={form.pincode}
-              onChange={e => setForm(f => ({ ...f, pincode: e.target.value.replace(/\D/g,'').slice(0,6) }))}
-              onBlur={handlePincodeBlur} />
-          </label>
-          <div className="cart-addr-overlay__split">
-            <label><span>City</span><input value={form.city} onChange={e => setForm(f => ({ ...f, city: e.target.value }))} /></label>
-            <label><span>State</span><input value={form.state} onChange={e => setForm(f => ({ ...f, state: e.target.value }))} /></label>
-          </div>
-          <label><span>Address Line 1</span><input value={form.line1} onChange={e => setForm(f => ({ ...f, line1: e.target.value }))} /></label>
-          <label><span>Address Line 2 (optional)</span><input value={form.line2} onChange={e => setForm(f => ({ ...f, line2: e.target.value }))} /></label>
-        </div>
-        <footer className="cart-addr-overlay__foot">
-          <button type="button" className="cart-addr-overlay__cancel" onClick={onClose}>Cancel</button>
-          <button type="button" className="cart-addr-overlay__save" disabled={!canSave || saving} onClick={handleSave}>
-            {saving ? 'Saving…' : 'Save'}
-          </button>
-        </footer>
-      </div>
-    </div>
-  );
-}
-
-// ─── Main AppPage ────────────────────────────────────────────────────────────
-
-export default function AppPage() {
-  const [active,      setActive]      = useState('home');
-  const [pageReady,   setPageReady]   = useState(false);
-
-  // accounts
-  const [accounts,    setAccounts]    = useState([]);
-  const [accountsLoading, setAccountsLoading] = useState(false);
-  const [copiedId,    setCopiedId]    = useState(null);
-  const [deleteConfirmId, setDeleteConfirmId] = useState(null);
-
-  // home stats
-  const [homeStats, setHomeStats] = useState({ total: 0, success: 0, cancelled: 0 });
-  const [recentUpdates, setRecentUpdates] = useState([]);
-
-  // dash stats
-  const [dashStats, setDashStats]             = useState(null);
-  const [statsReady, setStatsReady]           = useState(false);
-  const [statsRefreshing, setStatsRefreshing] = useState(false);
-  const refreshPollRef                        = useRef(null);
-
-  // addresses page
-  const [addressAccountId,  setAddressAccountId]  = useState('');
-  const [addressList,       setAddressList]        = useState([]);
-  const [addressLoading,    setAddressLoading]     = useState(false);
-  const [addressForm,       setAddressForm]        = useState({ name:'', mobile:'', pincode:'', city:'', state:'', line1:'', line2:'', isDefault: false });
-  const [addressSaved,      setAddressSaved]       = useState(false);
-  const [addressSaving,     setAddressSaving]      = useState(false);
-  const [pincodeResolving,  setPincodeResolving]   = useState(false);
-  const [addrCacheRefreshing, setAddrCacheRefreshing] = useState(false);
-  const addrPollRef = useRef(null);
-
-  // add-account / FOD / OTP
-  const [phoneNumber,      setPhoneNumber]      = useState('');
-  const [accountSubmitted, setAccountSubmitted] = useState(false);
-  const [fodLoading,       setFodLoading]       = useState(false);
-  const [fodReady,         setFodReady]         = useState(false);
-  const [fodResult,        setFodResult]        = useState(null);
-  const [fodLoader,        setFodLoader]        = useState(0);
-  const [fodLoaderVisible, setFodLoaderVisible] = useState(true);
-  const [referralEditAttempt, setReferralEditAttempt] = useState(false);
-  const [mshoStatus,       setMshoStatus]       = useState('bad');
-
-  const [otpState,     setOtpState]     = useState(null);
-  const [otpCode,      setOtpCode]      = useState('');
-  const [otpSending,   setOtpSending]   = useState(false);
-  const [otpVerifying, setOtpVerifying] = useState(false);
-  const [otpError,     setOtpError]     = useState('');
-  const [loginSuccess, setLoginSuccess] = useState(false);
-
-  // search
-  const [searchQuery,     setSearchQuery]     = useState('');
-  const [searchAccountId, setSearchAccountId] = useState('');
-  const [searchSubmitted, setSearchSubmitted] = useState(false);
-  const [searchResults,   setSearchResults]   = useState([]);
-  const [searchLoading,   setSearchLoading]   = useState(false);
-
-  // fyp
-  const [fypAccountId,  setFypAccountId]  = useState('anonymous');
-  const [fypProducts,   setFypProducts]   = useState([]);
-  const [fypLoading,    setFypLoading]    = useState(false);
-
-  // product detail
-  const [selectedProduct, setSelectedProduct] = useState(null);
-
-  // cart
-  const [cartAccountId,   setCartAccountId]   = useState('');
-  const [cartItems,       setCartItems]        = useState([]);
-  const [cartJustAddedId, setCartJustAddedId]  = useState(null);
-  const [fetchedProduct,  setFetchedProduct]   = useState(null);
-  const [productLink,     setProductLink]       = useState('');
-  const [fetchingProduct, setFetchingProduct]  = useState(false);
-  const [productAdded,    setProductAdded]      = useState(false);
-  const [productMovingToCart, setProductMovingToCart] = useState(false);
-  const [productDisappearing, setProductDisappearing] = useState(false);
-
-  // cart address binding
-  const [cartAddresses,     setCartAddresses]     = useState([]);
-  const [cartAddressId,     setCartAddressId]     = useState(null);
-  const [cartBoundSession,  setCartBoundSession]  = useState(null);
-  const [cartAddressLoading, setCartAddressLoading] = useState(false);
-  const [showCartAddressOverlay, setShowCartAddressOverlay] = useState(false);
-
-  // checkout
-  const [checkoutStep,    setCheckoutStep]     = useState(false);
-  const [savedAddresses,  setSavedAddresses]   = useState([]);
-  const [selectedAddressId, setSelectedAddressId] = useState(null);
-
-  // payment
-  const [paymentMethod,   setPaymentMethod]   = useState('UPI');
-  const [paymentPage,     setPaymentPage]     = useState(false);
-  const [paymentOrder,    setPaymentOrder]    = useState(null);
-  const [paymentChecking, setPaymentChecking] = useState(false);
-  const [orderPlacedOverlay, setOrderPlacedOverlay] = useState(false);
-
-  // orders
-  const [ordersAccountId, setOrdersAccountId] = useState('all');
-  const [ordersList,      setOrdersList]      = useState([]);
-  const [ordersLoading,   setOrdersLoading]   = useState(false);
-  const [ordersRetrying,  setOrdersRetrying]  = useState(false);
-  const [selectedOrder,   setSelectedOrder]   = useState(null);
-
-  // profile giphy
-  const [profileAvatarUrl,     setProfileAvatarUrl]     = useState('https://media0.giphy.com/media/v1.Y2lkPTZjMDliOTUyYms4NDNneHE1cjB4anJmYmZsMjE0cXE1MTA0cWVsZzhxcWpkMnV1OSZlcD12MV9zdGlja2Vyc19zZWFyY2gmY3Q9cw/rHG8ao0mYEKdlKvb8T/source.gif');
-  const [profileAvatarVisible, setProfileAvatarVisible] = useState(true);
-  const [homeCreditAvatarUrl,  setHomeCreditAvatarUrl]  = useState('https://media0.giphy.com/media/v1.Y2lkPTZjMDliOTUyYms4NDNneHE1cjB4anJmYmZsMjE0cXE1MTA0cWVsZzhxcWpkMnV1OSZlcD12MV9zdGlja2Vyc19zZWFyY2gmY3Q9cw/rHG8ao0mYEKdlKvb8T/source.gif');
-  const [homeCreditAvatarVisible, setHomeCreditAvatarVisible] = useState(true);
-
-  // Reset payment on tab switch
-  useEffect(() => { setPaymentPage(false); setPaymentOrder(null); }, [active]);
-
-  // Load accounts
-  const loadAccounts = useCallback(async () => {
-    setAccountsLoading(true);
-    try {
-      const res = await fetchAccounts();
-      const list = res.accounts ?? [];
-      setAccounts(list);
-
-      const total     = list.length;
-      const success   = list.filter(a => ['Delivered','Shipped','Out for Delivery'].includes(a.last_order_status)).length;
-      const cancelled = list.filter(a => a.last_order_status === 'Cancelled').length;
-      setHomeStats({ total, success, cancelled });
-
-      const snapshot = loadOrderSnapshot();
-      const changes  = [];
-      for (const acc of list) {
-        const key  = acc.account_id;
-        const prev = snapshot[key];
-        const next = acc.last_order_status ?? '—';
-        if (prev && prev !== next) {
-          changes.push({ phone: acc.phone, prev, next, time: 'Just now' });
+    if r.status_code >= 400:
+        return {
+            "success": False,
+            "error":   f"{provider}: http {r.status_code}",
+            "raw":     r.text[:300],
         }
-        snapshot[key] = next;
-      }
-      saveOrderSnapshot(snapshot);
-      if (changes.length) setRecentUpdates(prev => [...changes, ...prev].slice(0, 10));
-    } catch (e) { console.error('[accounts]', e); }
-    setAccountsLoading(false);
-  }, []);
 
-  useEffect(() => { loadAccounts(); }, [loadAccounts]);
+    try:
+        data = r.json()
+    except Exception:
+        data = r.text
 
-  // Dashboard stats
-  const loadDashboardStats = useCallback(async () => {
-    try {
-      const res = await fetchDashboardStats();
-      if (res.ready) { setDashStats(res.stats); setStatsReady(true); }
-    } catch (e) { console.error('[dashStats]', e); }
-  }, []);
+    return {"success": True, "data": data}
 
-  const loadRecentUpdates = useCallback(async () => {
-    try {
-      const res = await fetchRecentUpdates();
-      if (res.success && res.events?.length) {
-        setRecentUpdates(res.events.map(ev => ({
-          phone: ev.phone, prev: ev.old_status, next: ev.new_status,
-          time:  new Date(ev.timestamp).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }),
-        })).slice(0, 5));
-      }
-    } catch (e) { console.error('[recentUpdates]', e); }
-  }, []);
 
-  const handleStatsRefresh = useCallback(async () => {
-    if (statsRefreshing) return;
-    setStatsRefreshing(true);
-    try {
-      await triggerStatsRefresh();
-      if (refreshPollRef.current) window.clearInterval(refreshPollRef.current);
-      refreshPollRef.current = window.setInterval(async () => {
-        try {
-          const s = await fetchRefreshStatus();
-          if (!s.running) {
-            window.clearInterval(refreshPollRef.current);
-            refreshPollRef.current = null;
-            setStatsRefreshing(false);
-            await loadDashboardStats();
-            await loadRecentUpdates();
-          }
-        } catch {}
-      }, 3000);
-    } catch (e) {
-      console.error('[statsRefresh]', e);
-      setStatsRefreshing(false);
+def _call_scrapingant(method: str, url: str, headers: dict, body=None,
+                     session=None, key_label=None) -> dict:
+    if key_label:
+        key = _get_key_by_label("scrapingant", key_label)
+    else:
+        key = _pick_premium_key("scrapingant")
+    if not key:
+        return {"success": False, "error": "scrapingant: no live keys"}
+
+    ant_headers = {"x-api-key": key["key"]}
+    for k, v in (headers or {}).items():
+        ant_headers[f"ant-{k}"] = v
+
+    params = {
+        "url":                url,
+        "browser":            "false",
+        "return_page_source": "true",
     }
-  }, [statsRefreshing, loadDashboardStats, loadRecentUpdates]);
 
-  useEffect(() => {
-    if (active !== 'home') return;
-    loadDashboardStats();
-    loadRecentUpdates();
-    return () => {
-      if (refreshPollRef.current) { window.clearInterval(refreshPollRef.current); refreshPollRef.current = null; }
-    };
-  }, [active, loadDashboardStats, loadRecentUpdates]);
+    with _scrapingant_sem:
+        try:
+            if method.upper() == "GET":
+                r = requests.get(
+                    SCRAPINGANT_ENDPOINT, params=params,
+                    headers=ant_headers, timeout=PREMIUM_TIMEOUT_S,
+                )
+            else:
+                r = requests.post(
+                    SCRAPINGANT_ENDPOINT, params=params,
+                    headers=ant_headers, json=body, timeout=PREMIUM_TIMEOUT_S,
+                )
+        except Exception as e:
+            return {"success": False, "error": f"scrapingant: {e}"}
 
-  // Addresses page load
-  useEffect(() => {
-    if (!addressAccountId) return;
-    let cancelled = false;
-    setAddressLoading(true);
-    setAddressList([]);
+    return _premium_response(r, key, "scrapingant")
 
-    const applyAddresses = (items) => {
-      if (cancelled) return;
-      const addrs = Array.isArray(items) ? items : [];
-      setAddressList(addrs);
-      if (addrs.length) setSelectedAddressId(addrs.find(a => a.is_default)?.id ?? addrs[0].id);
-    };
 
-    fetchAddressCache()
-      .then(res => {
-        const accountsMap = res?.accounts ?? res?.data?.accounts;
-        const entry = accountsMap?.[addressAccountId];
-        const cached = entry?.addresses;
-        if (Array.isArray(cached) && cached.length) { applyAddresses(cached); return; }
-        return fetchAddresses(addressAccountId).then(r => applyAddresses(r?.data?.addresses ?? r?.addresses ?? []));
-      })
-      .catch(() => fetchAddresses(addressAccountId).then(r => applyAddresses(r?.data?.addresses ?? r?.addresses ?? [])).catch(() => {}))
-      .finally(() => { if (!cancelled) setAddressLoading(false); });
+def _call_scraperapi(method: str, url: str, headers: dict, body=None,
+                    session=None, key_label=None) -> dict:
+    if key_label:
+        key = _get_key_by_label("scraperapi", key_label)
+    else:
+        key = _pick_premium_key("scraperapi")
+    if not key:
+        return {"success": False, "error": "scraperapi: no live keys"}
 
-    return () => { cancelled = true; };
-  }, [addressAccountId]);
+    params = {
+        "api_key":      key["key"],
+        "url":          url,
+        "keep_headers": "true",
+    }
+    if session:
+        params["session_number"] = str(session)
 
-  const handleAddressRefresh = useCallback(async () => {
-    if (addrCacheRefreshing) return;
-    setAddrCacheRefreshing(true);
-    clearAddressCache();
-    try {
-      await triggerAddressFetch();
-      if (addrPollRef.current) window.clearInterval(addrPollRef.current);
-      addrPollRef.current = window.setInterval(async () => {
-        try {
-          const status = await fetchAddressFetchStatus();
-          if (status?.running === false || status?.data?.running === false) {
-            window.clearInterval(addrPollRef.current);
-            addrPollRef.current = null;
-            clearAddressCache();
-            if (addressAccountId) {
-              setAddressLoading(true);
-              try {
-                const res = await fetchAddressCache();
-                const accountsMap = res?.accounts ?? res?.data?.accounts;
-                const addrs = accountsMap?.[addressAccountId]?.addresses ?? [];
-                setAddressList(Array.isArray(addrs) ? addrs : []);
-                if (addrs.length) setSelectedAddressId(addrs.find(a => a.is_default)?.id ?? addrs[0].id);
-              } catch {} finally { setAddressLoading(false); }
+    try:
+        if method.upper() == "GET":
+            r = requests.get(
+                SCRAPERAPI_ENDPOINT, params=params,
+                headers=headers or {}, timeout=PREMIUM_TIMEOUT_S,
+            )
+        else:
+            r = requests.post(
+                SCRAPERAPI_ENDPOINT, params=params,
+                headers=headers or {}, json=body, timeout=PREMIUM_TIMEOUT_S,
+            )
+    except Exception as e:
+        return {"success": False, "error": f"scraperapi: {e}"}
+
+    return _premium_response(r, key, "scraperapi")
+
+
+def _call_scrapeops(method: str, url: str, headers: dict, body=None,
+                   session=None, key_label=None) -> dict:
+    if key_label:
+        key = _get_key_by_label("scrapeops", key_label)
+    else:
+        key = _pick_premium_key("scrapeops")
+    if not key:
+        return {"success": False, "error": "scrapeops: no live keys"}
+
+    params = {
+        "api_key":      key["key"],
+        "url":          url,
+        "keep_headers": "true",
+    }
+    if session:
+        params["session_number"] = str(session)
+
+    try:
+        if method.upper() == "GET":
+            r = requests.get(
+                SCRAPEOPS_ENDPOINT, params=params,
+                headers=headers or {}, timeout=PREMIUM_TIMEOUT_S,
+            )
+        else:
+            r = requests.post(
+                SCRAPEOPS_ENDPOINT, params=params,
+                headers=headers or {}, json=body, timeout=PREMIUM_TIMEOUT_S,
+            )
+    except Exception as e:
+        return {"success": False, "error": f"scrapeops: {e}"}
+
+    return _premium_response(r, key, "scrapeops")
+
+
+_PROVIDER_CALLS = {
+    "scrapingant": _call_scrapingant,
+    "scraperapi":  _call_scraperapi,
+    "scrapeops":   _call_scrapeops,
+}
+
+
+# ─── Provider credit fetchers ────────────────────────────────────────────────
+
+def _parse_iso_epoch(s) -> float:
+    if not s:
+        return 0.0
+    try:
+        s2 = str(s).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s2)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return 0.0
+
+
+def _fetch_scrapingant_credits(api_key: str) -> tuple[int, int, float]:
+    r = requests.get(
+        SCRAPINGANT_USAGE_URL,
+        params={"x-api-key": api_key},
+        timeout=USAGE_TIMEOUT_S,
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"http {r.status_code}: {r.text[:120]}")
+    j = r.json()
+    total = int(j.get("plan_total_credits") or 0)
+    rem   = int(j.get("remained_credits") or 0)
+    used  = max(0, total - rem)
+    reset = _parse_iso_epoch(j.get("end_date"))
+    return total, used, reset
+
+
+def _fetch_scraperapi_credits(api_key: str) -> tuple[int, int, float]:
+    r = requests.get(
+        SCRAPERAPI_USAGE_URL,
+        params={"api_key": api_key},
+        timeout=USAGE_TIMEOUT_S,
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"http {r.status_code}: {r.text[:120]}")
+    j = r.json()
+    limit = int(j.get("requestLimit") or 0)
+    used  = int(j.get("requestCount") or 0)
+    reset = _parse_iso_epoch(j.get("nextBillingDate"))
+    return limit, used, reset
+
+
+def _fetch_scrapeops_credits(api_key: str) -> tuple[int, int, float]:
+    r = requests.get(
+        SCRAPEOPS_USAGE_URL,
+        params={"api_key": api_key},
+        timeout=USAGE_TIMEOUT_S,
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"http {r.status_code}: {r.text[:120]}")
+    j = r.json()
+    inner = j.get("results") or j
+
+    def _int(v) -> int:
+        try:
+            return int(float(str(v)))
+        except Exception:
+            return 0
+
+    limit = _int(inner.get("plan_api_credits"))
+    used  = _int(inner.get("used_api_credits"))
+    reset = _parse_iso_epoch(inner.get("plan_renewal_date"))
+    return limit, used, reset
+
+
+_USAGE_FETCHERS = {
+    "scrapingant": _fetch_scrapingant_credits,
+    "scraperapi":  _fetch_scraperapi_credits,
+    "scrapeops":   _fetch_scrapeops_credits,
+}
+
+
+def _sync_one_key(key_dict: dict) -> dict:
+    provider = key_dict.get("provider", "")
+    fn = _USAGE_FETCHERS.get(provider)
+    if not fn:
+        return {
+            "label":    key_dict.get("label"),
+            "provider": provider,
+            "ok":       False,
+            "error":    f"no usage fetcher for {provider}",
+        }
+    try:
+        limit, used, reset = fn(key_dict.get("key", ""))
+    except Exception as e:
+        return {
+            "label":    key_dict.get("label"),
+            "provider": provider,
+            "ok":       False,
+            "error":    str(e),
+        }
+    with _keys_lock:
+        key_dict["credits_limit"] = limit
+        key_dict["credits_used"]  = used
+        key_dict["reset_at"]      = reset
+        key_dict["credit_source"] = "api"
+        key_dict["last_sync"]     = time.time()
+    return {
+        "label":         key_dict.get("label"),
+        "provider":      provider,
+        "ok":            True,
+        "credits_limit": limit,
+        "credits_used":  used,
+        "reset_at":      reset,
+    }
+
+
+def _sync_all_keys() -> dict:
+    with _keys_lock:
+        snapshot = list(_keys)
+    results = []
+    for k in snapshot:
+        results.append(_sync_one_key(k))
+    _save_keys()
+    ok_count   = sum(1 for r in results if r["ok"])
+    fail_count = len(results) - ok_count
+    return {
+        "ok":      ok_count,
+        "failed":  fail_count,
+        "total":   len(results),
+        "results": results,
+    }
+
+
+def _provider_priority(plan: str) -> list[str]:
+    if plan == "sticky":
+        return ["scraperapi", "scrapeops"]
+    if plan == "write":
+        return ["scrapingant", "scraperapi", "scrapeops"]
+    return ["scraperapi", "scrapeops", "scrapingant"]
+
+
+def _provider_call_sync(provider: str, method: str, url: str,
+                       headers: dict, body, session, key_label=None) -> dict:
+    fn = _PROVIDER_CALLS.get(provider)
+    if not fn:
+        return {"success": False, "error": f"unknown provider {provider}"}
+    return fn(method, url, headers, body, session=session, key_label=key_label)
+
+
+def _derive_sticky_id(req) -> int:
+    headers = req.headers or {}
+    low = {str(k).lower(): v for k, v in headers.items()}
+    sid = low.get("app-session-id") or low.get("instance-id") or ""
+    if not sid:
+        sid = req.url + json.dumps(req.body or {}, sort_keys=True)
+    h = hashlib.md5(sid.encode()).hexdigest()
+    return int(h[:8], 16) % 1_000_000
+
+
+def _sticky_pin(flow_key: int) -> Optional[dict]:
+    now = time.time()
+    with _sticky_lock:
+        entry = _sticky_sessions.get(str(flow_key))
+        if entry and entry.get("expires_at", 0) > now:
+            entry["expires_at"] = now + STICKY_TTL_S
+            return entry
+
+    for provider in ("scraperapi", "scrapeops"):
+        key = _pick_premium_key(provider)
+        if key:
+            entry = {
+                "provider":       provider,
+                "key_label":      key.get("label"),
+                "session_number": flow_key,
+                "expires_at":     now + STICKY_TTL_S,
             }
-            setAddrCacheRefreshing(false);
-          }
-        } catch {}
-      }, 3000);
-    } catch { setAddrCacheRefreshing(false); }
-  }, [addrCacheRefreshing, addressAccountId]);
+            with _sticky_lock:
+                _sticky_sessions[str(flow_key)] = entry
+            return entry
+    return None
 
-  useEffect(() => () => {
-    if (addrPollRef.current) { window.clearInterval(addrPollRef.current); addrPollRef.current = null; }
-  }, []);
 
-  const handlePincodeBlur = async () => {
-    if (addressForm.pincode.length !== 6 || !addressAccountId) return;
-    setPincodeResolving(true);
-    try {
-      const r = await resolveLocation(addressAccountId, addressForm.pincode);
-      const loc = r?.data?.user_delivery_location ?? {};
-      if (loc.city)  setAddressForm(f => ({ ...f, city:  loc.city  }));
-      if (loc.state) setAddressForm(f => ({ ...f, state: loc.state }));
-    } catch {}
-    setPincodeResolving(false);
-  };
+# ═══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+def _inc(key: str, n: int = 1):
+    with _counter_lock:
+        _counters_lifetime[key] += n
+        _counters_cycle[key]    += n
 
-  // FOD hunt
-  useEffect(() => {
-    if (active !== 'add-account' || phoneNumber.length !== 10 || !accountSubmitted) return;
-    setMshoStatus('bad');
-    setFodLoading(true);
-    setFodReady(false);
-    setFodLoader(0);
-    setFodResult(null);
-    setOtpState(null);
-    setLoginSuccess(false);
+def _reset_cycle():
+    global _cycle_start
+    with _counter_lock:
+        _counters_cycle.clear()
+        _cycle_start = time.time()
 
-    let cancelled = false;
-    const loaderTimer = window.setInterval(() => {
-      setFodLoaderVisible(false);
-      window.setTimeout(() => { setFodLoader(c => c + 1); setFodLoaderVisible(true); }, 180);
-    }, 1000);
+def _log(event: str, detail: str = "", count: int = 0):
+    entry = {"ts": time.time(), "role": ROLE, "event": event, "detail": detail, "count": count}
+    with _activity_lock:
+        _activity_log.append(entry)
+        if len(_activity_log) > ACTIVITY_MAX:
+            del _activity_log[:-ACTIVITY_MAX]
 
-    runFodHunt('2560ev').then(result => {
-      if (cancelled) return;
-      setFodResult(result);
-      setFodLoading(false);
-      setFodReady(true);
-      window.clearInterval(loaderTimer);
-      window.setTimeout(() => document.querySelector('.fod-results')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 60);
-    }).catch(err => {
-      if (cancelled) return;
-      console.error('[FOD]', err);
-      setFodLoading(false);
-      window.clearInterval(loaderTimer);
-    });
+def _assign_cat(avg_s: float) -> Optional[str]:
+    if avg_s < CAT_FLASH:   return "flash"
+    if avg_s < CAT_PANTHER: return "panther"
+    if avg_s < CAT_LANTERN: return "lantern"
+    if avg_s < CAT_DEAD:    return "deadass"
+    return None
 
-    return () => { cancelled = true; window.clearInterval(loaderTimer); };
-  }, [active, phoneNumber, accountSubmitted]);
-
-  const handleSendOtp = async () => {
-    if (!fodResult || !phoneNumber) return;
-    setOtpSending(true); setOtpError('');
-    const iid  = genHex(32);
-    const sid  = genUUID();
-    const gaid = genUUID();
-    const shid = genUUID();
-    const anon_xo = fodResult.best_xo ?? '';
-    try {
-      const r = await sendOtp({
-        phone: phoneNumber, instance_id: iid, app_session_id: sid,
-        gaid, shield_session_id: shid, anon_xo,
-        fod_bucket: fodResult.max_fod_bucket ?? 0, via: '2560ev',
-      });
-      if (!r.success) throw new Error(r.error ?? 'OTP send failed');
-      setOtpState({ ...r, iid, sid, gaid, shid, anon_xo });
-    } catch (e) { setOtpError(String(e.message)); }
-    setOtpSending(false);
-  };
-
-  const handleVerifyOtp = async () => {
-    if (!otpState || !otpCode) return;
-    setOtpVerifying(true); setOtpError('');
-    try {
-      const r = await verifyOtp({
-        phone: phoneNumber, otp: otpCode, state: otpState.state,
-        channel_auth_token: otpState.channel_auth_token, uid: otpState.uid,
-        ts_id: otpState.ts_id, in_id: otpState.in_id, as_id: otpState.as_id,
-        instance_id: otpState.iid, app_session_id: otpState.sid,
-        gaid: otpState.gaid, shield_session_id: otpState.shid,
-        anon_xo: otpState.anon_xo,
-        fod_bucket: fodResult?.max_fod_bucket ?? 0, via: '2560ev',
-      });
-      if (!r.success) throw new Error(r.error ?? 'OTP verification failed');
-      setLoginSuccess(true);
-      loadAccounts();
-    } catch (e) { setOtpError(String(e.message)); }
-    setOtpVerifying(false);
-  };
-
-  const handleSearch = async (e) => {
-    e.preventDefault();
-    if (!searchQuery.trim()) return;
-    setSearchLoading(true);
-    setSearchSubmitted(true);
-    setSearchResults([]);
-    try {
-      const r    = await searchProducts(searchQuery, { accountId: searchAccountId || null });
-      const list = parseSearchWidgets(r);
-      setSearchResults(list);
-    } catch (err) { console.error('[search]', err); }
-    setSearchLoading(false);
-  };
-
-  // FYP
-  useEffect(() => {
-    if (active !== 'fyp') return;
-    setFypLoading(true);
-    setFypProducts([]);
-    const accId = fypAccountId === 'anonymous' ? null : fypAccountId;
-    const feed = accId ? searchProducts('women fashion', { accountId: accId, mallEnabled: true }) : fetchAnonForYou(40);
-    feed.then(r => setFypProducts(parseSearchWidgets(r))).catch(() => {}).finally(() => setFypLoading(false));
-  }, [active, fypAccountId]);
-
-  // Cart address: load when account changes
-  useEffect(() => {
-    if (!cartAccountId) { setCartAddresses([]); setCartAddressId(null); setCartBoundSession(null); return; }
-    let cancelled = false;
-    setCartAddressLoading(true);
-
-    fetchAddresses(cartAccountId)
-      .then(r => {
-        if (cancelled) return;
-        const addrs = r?.data?.addresses ?? r?.addresses ?? [];
-        setCartAddresses(Array.isArray(addrs) ? addrs : []);
-        const def = addrs.find(a => a.is_default) ?? addrs[0];
-        if (def) setCartAddressId(def.id);
-      })
-      .catch(() => { if (!cancelled) setCartAddresses([]); })
-      .finally(() => { if (!cancelled) setCartAddressLoading(false); });
-
-    // Reset session so it re-binds
-    setCartBoundSession(null);
-    return () => { cancelled = true; };
-  }, [cartAccountId]);
-
-  // Cart: fetch product from link
-  const handleFetchProduct = async () => {
-    const pid = extractProductId(productLink);
-    if (!pid) { alert('Could not parse product ID from link. Try pasting the full meesho.com URL.'); return; }
-    setFetchingProduct(true);
-    setFetchedProduct(null);
-    try {
-      const raw    = await fetchProductDynamic(pid, cartAccountId || null);
-      const parsed = parseProductDynamic(raw);
-      if (parsed) setFetchedProduct(parsed);
-      else alert('Product not found.');
-    } catch { alert('Failed to fetch product.'); }
-    setFetchingProduct(false);
-  };
-
-  const handleFetchMyCart = async () => {
-    if (!cartAccountId) { alert('Select an account first.'); return; }
-    try {
-      const session = cartBoundSession || null;
-      const full   = await fetchCartDetails(cartAccountId, { cartSession: session });
-      const result = full?.result ?? full?.data?.result ?? {};
-      const splits = result?.splits ?? [];
-      const returnedSession = full?.cart_session ?? full?.data?.cart_session ?? session;
-
-      if (returnedSession && returnedSession !== cartBoundSession) {
-        setCartBoundSession(returnedSession);
-      }
-
-      if (!splits.length) { alert('Cart is empty.'); setCartItems([]); return; }
-
-      const items = splits.flatMap(split =>
-        (split.products ?? []).map(p => ({
-          id:          p.product_id,
-          identifier:  p.identifier,
-          catalogId:   p.catalog?.id ?? p.product_id,
-          productId:   p.product_id,
-          supplierId:  split.supplier?.id,
-          variationId: p.variation_id ?? 167,
-          name:        p.name ?? p.catalog?.name ?? 'Product',
-          category:    p.category?.sub_sub_category_name ?? '',
-          price:       `₹${Number(p.price ?? 0).toLocaleString('en-IN')}`,
-          image:       (p.images ?? [])[0] ?? '',
-          quantity:    p.quantity ?? 1,
-          cartSession: returnedSession,
-        }))
-      );
-      setCartItems(items);
-    } catch (e) {
-      console.error('[fetchMyCart]', e);
-      alert('Failed to fetch cart.');
-    }
-  };
-
-  const handleBindCartAddress = async (addressId, pin) => {
-    if (!cartAccountId || !addressId) return;
-    try {
-      const r = await bindAddressToCart(cartAccountId, addressId, pin);
-      if (r?.success && r.cart_session) {
-        setCartBoundSession(r.cart_session);
-        setCartAddressId(r.address_id ?? addressId);
-      }
-    } catch (e) { console.error('[bindAddress]', e); }
-  };
-
-  const removeCartItem = async (item) => {
-    if (cartAccountId && item.identifier) {
-      try { await removeFromCart(cartAccountId, [item.identifier], cartBoundSession ?? item.cartSession ?? null); } catch (e) { console.error('[removeCartItem]', e); }
-    }
-    setCartItems(items => items.filter(i => i.id !== item.id));
-  };
-
-  const changeCartQuantity = async (item, delta) => {
-    const next = item.quantity + delta;
-    if (next <= 0) { await removeCartItem(item); return; }
-
-    if (delta < 0 && cartAccountId && item.identifier) {
-      try { await removeFromCart(cartAccountId, [item.identifier], cartBoundSession ?? item.cartSession ?? null); } catch (e) { console.error('[changeQty remove]', e); }
-      if (item.productId && item.supplierId) {
-        try {
-          const r = await addToCart(cartAccountId, {
-            product_id: item.productId, supplier_id: item.supplierId,
-            variation_id: item.variationId ?? 167, variation: 'Free Size',
-            quantity: next, price_type_id: 'basic_return_price',
-            cart_session: cartBoundSession ?? item.cartSession ?? null,
-          });
-          const newIdentifier = r?.result?.splits?.[0]?.products?.[0]?.identifier ?? item.identifier;
-          const newSession = r?.cart_session ?? cartBoundSession ?? item.cartSession;
-          setCartItems(items => items.map(i => i.id === item.id ? { ...i, quantity: next, identifier: newIdentifier, cartSession: newSession } : i));
-          return;
-        } catch (e) { console.error('[changeQty re-add]', e); }
-      }
+def _meesho_headers() -> dict:
+    return {
+        "authorization":       MEESHO_AUTH,
+        "app-version":         "29.3",
+        "app-version-code":    "864",
+        "app-client-id":       "android",
+        "app-sdk-version":     "36",
+        "application-id":      APP_ID,
+        "country-iso":         "in",
+        "instance-id":         uuid.uuid4().hex,
+        "app-session-id":      str(uuid.uuid4()),
+        "app-session-count":   "1",
+        "app-gaid":            str(uuid.uuid4()),
+        "shield-session-id":   str(uuid.uuid4()),
+        "meesho-user-context": "anonymous",
+        "content-type":        "application/json; charset=UTF-8",
+        "user-agent":          "okhttp/4.9.0",
+        "accept-encoding":     "gzip",
     }
 
-    if (delta > 0 && cartAccountId && item.productId && item.supplierId) {
-      try {
-        const r = await addToCart(cartAccountId, {
-          product_id: item.productId, supplier_id: item.supplierId,
-          variation_id: item.variationId ?? 167, variation: 'Free Size',
-          quantity: 1, price_type_id: 'basic_return_price',
-          cart_session: cartBoundSession ?? item.cartSession ?? null,
-        });
-        const newIdentifier = r?.result?.splits?.[0]?.products?.[0]?.identifier ?? item.identifier;
-        const newSession = r?.cart_session ?? cartBoundSession ?? item.cartSession;
-        setCartItems(items => items.map(i => i.id === item.id ? { ...i, quantity: next, identifier: newIdentifier, cartSession: newSession } : i));
-        return;
-      } catch (e) { console.error('[changeQty add]', e); }
+def _decode_meesho(raw: bytes, enc: str) -> dict:
+    try:
+        if "gzip"    in enc: raw = gzip.decompress(raw)
+        elif "deflate" in enc: raw = zlib.decompress(raw)
+    except Exception:
+        pass
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+def _seen_dup(addr: str) -> bool:
+    now = time.time()
+    with _seen_lock:
+        t = _seen.get(addr)
+        if t is not None and now - t < SEEN_TTL_S:
+            return True
+        _seen[addr] = now
+        if len(_seen) > 50_000:
+            for k, v in list(_seen.items()):
+                if now - v >= SEEN_TTL_S:
+                    _seen.pop(k, None)
+        return False
+
+def _gh_headers() -> dict:
+    h = {"Accept": "application/vnd.github.v3+json"}
+    if GITHUB_TOKEN:
+        h["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    return h
+
+def _sticky_key(headers) -> str:
+    if not headers:
+        return ""
+    low = {str(k).lower(): v for k, v in headers.items()}
+    k = low.get("app-session-id") or low.get("instance-id")
+    return f"fod:{k}" if k else ""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SOURCE FETCHERS
+# ═══════════════════════════════════════════════════════════════════════════════
+def _fetch_github_raw(owner: str, repo: str, path: str, sha: str = "main") -> list[str]:
+    try:
+        r = requests.get(
+            f"https://raw.githubusercontent.com/{owner}/{repo}/{sha}/{path}",
+            headers=_gh_headers(), timeout=10,
+        )
+        if r.status_code == 200:
+            return _parse(r.text)
+    except Exception as e:
+        print(f"[gh] {owner}/{repo} raw fetch failed: {e}", flush=True)
+    return []
+
+def _fetch_github_latest(owner: str, repo: str, path: str) -> tuple[list[str], str]:
+    try:
+        r = requests.get(
+            f"https://api.github.com/repos/{owner}/{repo}/commits",
+            params={"path": path, "per_page": 1},
+            headers=_gh_headers(), timeout=8,
+        )
+        if r.status_code in (403, 429):
+            _inc("gh_ratelimited")
+            return [], ""
+        if r.status_code != 200:
+            return [], ""
+        commits = r.json()
+        if not isinstance(commits, list) or not commits:
+            return [], ""
+        sha = commits[0].get("sha", "")
+        if not sha:
+            return [], ""
+    except Exception:
+        return [], ""
+    proxies = _fetch_github_raw(owner, repo, path, sha)
+    return proxies, sha
+
+def _fetch_github_commit(owner: str, repo: str, path: str) -> tuple[list[str], str]:
+    key = f"{owner}/{repo}/{path}"
+    proxies, sha = _fetch_github_latest(owner, repo, path)
+    if not sha:
+        return [], ""
+    with _sha_lock:
+        old_sha = _repo_sha.get(key, "")
+        if sha == old_sha:
+            return [], ""
+        _repo_sha[key] = sha
+    return proxies[:COMMIT_FETCH_COUNT], sha
+
+def _fetch_http_url(url: str) -> list[str]:
+    hdrs = {}
+    with _etag_lock:
+        if url in _http_etag: hdrs["If-None-Match"]     = _http_etag[url]
+        if url in _http_lmod: hdrs["If-Modified-Since"] = _http_lmod[url]
+    try:
+        r = requests.get(url, headers=hdrs, timeout=10)
+        if r.status_code == 304:
+            return []
+        with _etag_lock:
+            if "ETag"          in r.headers: _http_etag[url] = r.headers["ETag"]
+            if "Last-Modified" in r.headers: _http_lmod[url] = r.headers["Last-Modified"]
+        return _parse(r.text)
+    except Exception:
+        return []
+
+def _fetch_geonode_page(url: str) -> list[str]:
+    try:
+        r    = requests.get(url, timeout=10)
+        data = r.json()
+        return [f"{p['ip']}:{p['port']}" for p in data.get("data", [])]
+    except Exception:
+        return []
+
+def _fetch_html_page(url: str) -> list[str]:
+    try:
+        r    = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        soup = BeautifulSoup(r.text, "html.parser")
+        out  = []
+        for table in soup.find_all("table"):
+            for row in table.find_all("tr")[1:]:
+                cols = row.find_all("td")
+                if len(cols) >= 2:
+                    ip   = cols[0].get_text(strip=True)
+                    port = cols[1].get_text(strip=True)
+                    if re.match(r"\d{1,3}(?:\.\d{1,3}){3}", ip) and port.isdigit():
+                        out.append(f"{ip}:{port}")
+        return out
+    except Exception:
+        return []
+
+def _fetch_checkerproxy() -> list[str]:
+    try:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        r     = requests.get(f"https://checkerproxy.net/api/archive/{today}", timeout=10)
+        data  = r.json()
+        return [
+            p["addr"] for p in data
+            if p.get("addr") and re.match(r"\d+\.\d+\.\d+\.\d+:\d+", p["addr"])
+        ]
+    except Exception:
+        return []
+
+def _bulk_fetch(repos: list, http_srcs: list, geonode: list, html: list, limit: int) -> list[str]:
+    collected: set[str] = set()
+    results: list[str]  = []
+
+    def _add(proxies: list[str]):
+        for p in proxies:
+            if p not in collected:
+                collected.add(p)
+                results.append(p)
+
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
+        futs = {}
+        for o, r, p in repos:
+            futs[ex.submit(_fetch_github_raw, o, r, p)] = f"gh:{o}/{r}"
+        for url in http_srcs:
+            futs[ex.submit(_fetch_http_url, url)] = f"http:{url[:40]}"
+        for url in geonode:
+            futs[ex.submit(_fetch_geonode_page, url)] = f"geo:{url[:40]}"
+        for url in html:
+            futs[ex.submit(_fetch_html_page, url)] = f"html:{url[:40]}"
+        futs[ex.submit(_fetch_checkerproxy)] = "checkerproxy"
+
+        for fut in as_completed(futs):
+            try:
+                _add(fut.result() or [])
+            except Exception:
+                pass
+            if len(results) >= limit:
+                break
+
+    return results[:limit]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MEESHO CHECK
+# ═══════════════════════════════════════════════════════════════════════════════
+async def _meesho_check(session: aiohttp.ClientSession, addr: str) -> tuple[bool, float]:
+    hdr = _meesho_headers()
+    t0  = asyncio.get_event_loop().time()
+    try:
+        async with session.get(
+            f"{MEESHO_API}/api/1.0/anonymous/config",
+            headers=hdr,
+            proxy=f"http://{addr}",
+            timeout=aiohttp.ClientTimeout(total=CHECK_TIMEOUT_S),
+            ssl=False,
+        ) as r:
+            if r.status == 200:
+                raw  = await r.read()
+                enc  = r.headers.get("Content-Encoding", "")
+                data = _decode_meesho(raw, enc)
+                xoox = data.get("xoox", {})
+                if isinstance(xoox, str):
+                    try:    xoox = json.loads(xoox)
+                    except: xoox = {}
+                elapsed = asyncio.get_event_loop().time() - t0
+                if isinstance(xoox, dict) and xoox.get("xo"):
+                    return True, elapsed
+    except Exception:
+        pass
+    return False, 0.0
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# OUTBOUND SENDER (checker → pool)
+# ═══════════════════════════════════════════════════════════════════════════════
+def _push_to_pool(addr: str, latency_s: float):
+    with _outbuf_lock:
+        _outbuf.append((addr, latency_s))
+
+def _outbuf_sender():
+    pool_url = PEERS.get("pool", "")
+    while True:
+        with _outbuf_lock:
+            pending = len(_outbuf)
+        sleep_s = 0.1 if pending > 50 else INGEST_INTERVAL_S
+        time.sleep(sleep_s)
+        with _outbuf_lock:
+            if not _outbuf:
+                continue
+            batch = list(_outbuf[:INGEST_BATCH_SIZE])
+            del _outbuf[:INGEST_BATCH_SIZE]
+        if not pool_url:
+            continue
+        try:
+            payload = [{"addr": a, "latency_s": l} for a, l in batch]
+            r = requests.post(
+                f"{pool_url}/ingest",
+                json={"proxies": payload},
+                headers={"X-Secret": SHARED_SECRET},
+                timeout=10,
+            )
+            print(f"[{ROLE}] pushed {len(batch)} → pool ({r.status_code})", flush=True)
+        except Exception as e:
+            print(f"[{ROLE}] push failed: {e}", flush=True)
+            with _outbuf_lock:
+                for item in batch:
+                    _outbuf.insert(0, item)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ASYNC CHECK PIPELINE
+# ═══════════════════════════════════════════════════════════════════════════════
+async def _checker_pipeline():
+    global _check_queue
+    _check_queue = asyncio.Queue(maxsize=10_000)
+    sem          = asyncio.Semaphore(CHECK_CONCURRENCY)
+    connector    = aiohttp.TCPConnector(
+        limit=CHECK_CONCURRENCY + 50,
+        ttl_dns_cache=300,
+        enable_cleanup_closed=True,
+    )
+
+    async def _worker(session: aiohttp.ClientSession):
+        while True:
+            addr = await _check_queue.get()
+            async with sem:
+                passed, latency = await _meesho_check(session, addr)
+            if passed:
+                cat = _assign_cat(latency)
+                if cat:
+                    _inc(f"check_pass_{cat}")
+                    _log("check_pass", f"{addr} {cat} {latency:.1f}s")
+                    _push_to_pool(addr, latency)
+                else:
+                    _inc("check_too_slow")
+            else:
+                _inc("check_fail")
+
+    async def _stats_printer():
+        while True:
+            await asyncio.sleep(15)
+            q = _check_queue.qsize() if _check_queue else 0
+            with _outbuf_lock: ob = len(_outbuf)
+            with _counter_lock:
+                life  = dict(_counters_lifetime)
+                cycle = dict(_counters_cycle)
+            cats = ('flash', 'panther', 'lantern', 'deadass')
+            print(
+                f"[{ROLE}] q={q} outbuf={ob} | "
+                f"CYCLE  pass={sum(cycle.get(f'check_pass_{c}', 0) for c in cats)} "
+                f"fail={cycle.get('check_fail', 0)} | "
+                f"TOTAL  pass={sum(life.get(f'check_pass_{c}', 0) for c in cats)} "
+                f"fail={life.get('check_fail', 0)}",
+                flush=True,
+            )
+
+    async with aiohttp.ClientSession(connector=connector) as session:
+        workers = [asyncio.create_task(_worker(session)) for _ in range(CHECK_CONCURRENCY)]
+        stats   = asyncio.create_task(_stats_printer())
+        await asyncio.gather(*workers, stats)
+
+def _checker_pipeline_thread():
+    global _check_loop
+    _check_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_check_loop)
+    _check_loop.run_until_complete(_checker_pipeline())
+
+def _enqueue(addr: str):
+    if _seen_dup(addr):
+        return
+    if _check_queue and _check_loop and not _check_loop.is_closed():
+        try:
+            asyncio.run_coroutine_threadsafe(_check_queue.put(addr), _check_loop)
+        except RuntimeError:
+            pass
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHECKER MAIN LOOP
+# ═══════════════════════════════════════════════════════════════════════════════
+def _checker_main():
+    repos, http_srcs, geonode, html = _get_my_sources()
+    print(f"[{ROLE}] sources: {len(repos)} github repos, {len(http_srcs)} http, "
+          f"{len(geonode)} geonode, {len(html)} html", flush=True)
+
+    print(f"[{ROLE}] boot fetch — targeting {BOOT_FETCH_COUNT} proxies", flush=True)
+    boot_batch = _bulk_fetch(repos, http_srcs, geonode, html, BOOT_FETCH_COUNT)
+    print(f"[{ROLE}] boot fetch got {len(boot_batch)} — queuing for check", flush=True)
+    for addr in boot_batch:
+        _enqueue(addr)
+
+    def _init_sha_cache():
+        for owner, repo, path in repos:
+            key = f"{owner}/{repo}/{path}"
+            _, sha = _fetch_github_latest(owner, repo, path)
+            if sha:
+                with _sha_lock:
+                    _repo_sha[key] = sha
+    threading.Thread(target=_init_sha_cache, daemon=True, name="sha-init").start()
+
+    last_commit_poll = time.time()
+    cycle_offset = BOOT_FETCH_COUNT
+
+    while True:
+        time.sleep(5)
+        now = time.time()
+        _reset_cycle()
+
+        if now - last_commit_poll >= COMMIT_POLL_S:
+            last_commit_poll = now
+            commit_found = False
+            for owner, repo, path in repos:
+                new_proxies, sha = _fetch_github_commit(owner, repo, path)
+                if new_proxies:
+                    commit_found = True
+                    print(f"[{ROLE}] new commit {owner}/{repo} → {len(new_proxies)} proxies", flush=True)
+                    _log("new_commit", f"{owner}/{repo} sha={sha[:8]} count={len(new_proxies)}")
+                    _inc("commits_detected")
+                    for addr in new_proxies:
+                        _enqueue(addr)
+            if commit_found:
+                continue
+
+        q_depth = _check_queue.qsize() if _check_queue else 0
+        if q_depth > 2000:
+            continue
+
+        print(f"[{ROLE}] cycle fetch — offset={cycle_offset} target={CYCLE_FETCH_COUNT}", flush=True)
+        batch = _bulk_fetch(repos, http_srcs, geonode, html, CYCLE_FETCH_COUNT)
+        queued = 0
+        for addr in batch:
+            _enqueue(addr)
+            queued += 1
+        cycle_offset += queued
+        _inc("cycle_fetches")
+        print(f"[{ROLE}] cycle queued {queued} for check", flush=True)
+
+def _start_checker():
+    t = threading.Thread(target=_checker_pipeline_thread, daemon=True, name="pipeline")
+    t.start()
+    deadline = time.time() + 10
+    while _check_queue is None and time.time() < deadline:
+        time.sleep(0.05)
+    threading.Thread(target=_outbuf_sender, daemon=True, name="outbuf").start()
+    threading.Thread(target=_checker_main, daemon=True, name="checker").start()
+    print(f"[{ROLE}] checker started", flush=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# POOL ROLE
+# ═══════════════════════════════════════════════════════════════════════════════
+def _promote(addr: str, latency_s: float):
+    cat = _assign_cat(latency_s)
+    if cat is None:
+        _inc("pool_rejected_slow")
+        return
+    now = time.time()
+    with _proxies_lock:
+        rec = _proxies.get(addr)
+        if rec is None:
+            rec = {"received_at": now}
+            _proxies[addr] = rec
+        rec["last_checked"] = now
+        rec["latency_ms"]   = int(latency_s * 1000)
+        rec["label"]        = cat
+        rec["next_check"]   = now + POOL_RECHECK_MIN_AGE_S
+    _inc("pool_promoted")
+    _log("promoted", f"{addr} {cat} {latency_s:.1f}s")
+    _persist_event.set()
+
+def _evict(addr: str, reason: str = "dead"):
+    with _proxies_lock:
+        existed = _proxies.pop(addr, None) is not None
+    if existed:
+        _inc("pool_evicted")
+        _log("evicted", f"{addr} — {reason}")
+        _persist_event.set()
+    with _used_lock:
+        _last_used.pop(addr, None)
+
+
+def _pick(purpose: str = "backend", caller: str = "unknown") -> dict:
+    now = time.time()
+
+    with _proxies_lock:
+        items = list(_proxies.items())
+
+    if not items:
+        return {}
+
+    live_sorted = sorted(
+        items,
+        key=lambda x: x[1].get("last_checked", 0),
+        reverse=True,
+    )
+
+    selected = None
+    with _used_lock:
+        for addr, rec in live_sorted:
+            if now - _last_used.get(addr, 0) >= POOL_COOLDOWN_S:
+                selected = (addr, rec)
+                break
+
+    if selected is None:
+        selected = live_sorted[0]
+
+    addr, rec = selected
+
+    with _used_lock:
+        _last_used[addr] = now
+
+    with _proxies_lock:
+        current = _proxies.get(addr)
+        if current:
+            current["next_check"] = now + POOL_RECHECK_MIN_AGE_S
+
+    _inc("pool_picks")
+    _inc(f"pool_picks_by_{caller}")
+    _inc("pool_picks_normal")
+
+    _log(
+        "pick_normal",
+        f"{addr} latency={rec.get('latency_ms', 0)/1000:.2f}s "
+        f"caller={caller} purpose={purpose}",
+    )
+
+    return {
+        "http": f"http://{addr}",
+        "https": f"http://{addr}",
+        "addr": addr,
     }
 
-    setCartItems(items => items.map(i => i.id === item.id ? { ...i, quantity: next } : i));
-  };
 
-  const addFetchedToCart = async () => {
-    if (!fetchedProduct) return;
-    if (!cartAccountId) { alert('Select an account first.'); return; }
+def _pick_race_candidates(
+    caller: str = "unknown",
+    count: int = RACE_PROXY_COUNT,
+) -> list[dict]:
+    window_start = time.time()
+    now = time.time()
 
-    setProductAdded(true);
+    with _proxies_lock:
+        items = list(_proxies.items())
 
-    try {
-      const r = await addToCart(cartAccountId, {
-        product_id: fetchedProduct.productId,
-        supplier_id: fetchedProduct.supplierId,
-        variation_id: fetchedProduct.variationId ?? 167,
-        variation: 'Free Size',
-        quantity: 1,
-        price_type_id: 'basic_return_price',
-        cart_session: cartBoundSession,
-      });
-      const newSession = r?.cart_session ?? cartBoundSession;
-      if (newSession) setCartBoundSession(newSession);
-    } catch (e) { console.error('[addFetchedToCart]', e); }
+    if not items:
+        return []
 
-    window.setTimeout(() => {
-      setProductMovingToCart(true);
-      setCartItems(items =>
-        items.some(i => i.id === fetchedProduct.id)
-          ? items
-          : [...items, { ...fetchedProduct, quantity: 1, cartSession: cartBoundSession }]
-      );
-      setCartJustAddedId(fetchedProduct.id);
-      window.setTimeout(() => setCartJustAddedId(null), 1100);
-    }, 1000);
+    fresh = []
+    for addr, rec in items:
+        checked_at = rec.get("last_checked", 0)
+        latency_s = rec.get("latency_ms", 0) / 1000.0
 
-    window.setTimeout(() => setProductDisappearing(true), 1000);
-    window.setTimeout(() => {
-      setFetchedProduct(null);
-      setProductAdded(false);
-      setProductMovingToCart(false);
-      setProductDisappearing(false);
-      setProductLink('');
-    }, 1700);
-  };
+        if window_start - 30 <= checked_at <= now and 0 < latency_s < RACE_FRESH_MAX_S:
+            fresh.append((checked_at, addr, rec))
 
-  const openProductDetail = useCallback(async (lean) => {
-    if (!lean) return;
-    setSelectedProduct({ ...lean, enriching: true });
-    const pid = String(lean.productId ?? lean.catalogId ?? '');
-    if (!pid) { setSelectedProduct(prev => (prev ? { ...prev, enriching: false } : prev)); return; }
-    const accId = searchAccountId || (fypAccountId && fypAccountId !== 'anonymous' ? fypAccountId : null);
-    try {
-      const [s, d] = await Promise.allSettled([
-        fetchProductStatic(pid, accId),
-        fetchProductDynamic(pid, accId),
-      ]);
-      const rich = s.status === 'fulfilled' ? parseProductStatic(s.value) : null;
-      const dyn  = d.status === 'fulfilled' ? parseProductDynamic(d.value) : null;
-      setSelectedProduct(prev => {
-        if (!prev || prev.catalogId !== lean.catalogId) return prev;
-        return { ...prev, ...(rich ?? {}), ...(dyn ?? {}), enriching: false };
-      });
-    } catch (e) {
-      console.error('[openProductDetail]', e);
-      setSelectedProduct(prev => (prev ? { ...prev, enriching: false } : prev));
-    }
-  }, [searchAccountId, fypAccountId]);
+    fresh.sort(key=lambda x: x[0], reverse=True)
 
-  const addProductToCart = async (product, quantity = 1, goToCart = false, variation = null) => {
-    if (cartAccountId) {
-      try {
-        const r = await addToCart(cartAccountId, {
-          product_id: product.productId,
-          supplier_id: product.supplierId,
-          variation_id: variation?.id ?? product.variationId ?? 167,
-          variation: variation?.name ?? 'Free Size',
-          quantity,
-          price_type_id: product.priceTypeId || 'basic_return_price',
-          cart_session: cartBoundSession,
-        });
-        const newSession = r?.cart_session ?? cartBoundSession;
-        if (newSession) setCartBoundSession(newSession);
-      } catch (e) { console.error('[addProductToCart]', e); }
-    }
+    if fresh:
+        selected = [(addr, rec) for _, addr, rec in fresh[:count]]
+        source = "fresh_window"
+    else:
+        selected = sorted(
+            items,
+            key=lambda x: x[1].get("last_checked", 0),
+            reverse=True,
+        )[:count]
+        source = "latest_10"
 
-    setCartItems(items => {
-      const existing = items.find(i => i.id === product.id);
-      if (existing) return items.map(i => i.id === product.id ? { ...i, quantity: i.quantity + quantity } : i);
-      return [...items, { ...product, quantity, cartSession: cartBoundSession }];
-    });
+    if not selected:
+        return []
 
-    setCartJustAddedId(product.id);
-    window.setTimeout(() => setCartJustAddedId(c => c === product.id ? null : c), 1100);
-    setSelectedProduct(null);
-    if (goToCart) setActive('cart');
-  };
+    with _used_lock:
+        for addr, _ in selected:
+            _last_used[addr] = now
 
-  // Checkout: address list snapshot (read only)
-  useEffect(() => {
-    if (!checkoutStep || !cartAccountId) return;
-    let cancelled = false;
-    const applyAddresses = (items) => {
-      if (cancelled) return;
-      const addrs = Array.isArray(items) ? items : [];
-      setSavedAddresses(addrs);
-      if (addrs.length) {
-        // Prefer the one already bound to the cart
-        const bound = addrs.find(a => a.id === cartAddressId);
-        setSelectedAddressId(bound?.id ?? addrs.find(a => a.is_default)?.id ?? addrs[0].id);
-      }
-    };
-    fetchAddresses(cartAccountId)
-      .then(r => applyAddresses(r?.data?.addresses ?? r?.addresses ?? []))
-      .catch(() => {});
-    return () => { cancelled = true; };
-  }, [checkoutStep, cartAccountId, cartAddressId]);
+    with _proxies_lock:
+        for addr, _ in selected:
+            current = _proxies.get(addr)
+            if current:
+                current["next_check"] = now + POOL_RECHECK_MIN_AGE_S
 
-  const selectedAddress = savedAddresses.find(a => a.id === selectedAddressId) ?? savedAddresses[0] ?? null;
+    _inc("pool_race_sets")
+    _inc(f"pool_race_sets_{source}")
+    _inc("pool_race_candidates", len(selected))
 
-  const cartSubtotal = cartItems.reduce((t, i) => t + Number((i.price||'').replace(/[^0-9]/g,'')) * i.quantity, 0);
-  const fodDiscount  = cartItems.length ? 300 : 0;
-  const codTotal     = Math.max(cartSubtotal - fodDiscount, 0) + 50;
-  const upiTotal     = Math.max(cartSubtotal - fodDiscount, 0);
+    _log(
+        "race_candidates",
+        f"source={source} count={len(selected)} caller={caller} "
+        f"addrs={','.join(a for a, _ in selected)}",
+        len(selected),
+    )
 
-  const startPaymentPage = async () => {
-    const orderId = `MW-${Date.now().toString().slice(-8)}`;
-    setPaymentChecking(false);
-
-    if (cartAccountId && cartItems.length && cartAddressId) {
-      const item = cartItems[0];
-      try {
-        const res = await processCheckout({
-          account_id:              cartAccountId,
-          product_id:              item.productId,
-          supplier_id:             item.supplierId,
-          variation_id:            item.variationId ?? 167,
-          variation:               'Free Size',
-          quantity:                item.quantity,
-          selected_price_type_id:  'basic_return_price',
-          address_id:              cartAddressId,
-          pincode:                 String(selectedAddress?.pin ?? selectedAddress?.pincode ?? '445202'),
-          payment_mode:            paymentMethod.toLowerCase(),
-          cancel_after_place:      false,
-          cart_session:            cartBoundSession,
-        });
-        setPaymentOrder({
-          id:            res.order_num ?? orderId,
-          subOrderNum:   res.sub_order_num ?? '',
-          items:         cartItems.map(i => ({ ...i })),
-          total:         paymentMethod === 'UPI' ? upiTotal : codTotal,
-          paymentMethod,
-          address:       selectedAddress,
-          qrImage:       res.qr_image ?? null,
-          intentUrl:     res.intent_url ?? null,
-          paymentLightColor: Math.random() < 0.5 ? 'red' : 'green',
-        });
-      } catch {
-        setPaymentOrder({
-          id: orderId, items: cartItems.map(i => ({ ...i })),
-          total: paymentMethod === 'UPI' ? upiTotal : codTotal,
-          paymentMethod, address: selectedAddress,
-          qrImage: null, paymentLightColor: 'green',
-        });
-      }
-    } else {
-      setPaymentOrder({
-        id: orderId, items: cartItems.map(i => ({ ...i })),
-        total: paymentMethod === 'UPI' ? upiTotal : codTotal,
-        paymentMethod, address: selectedAddress,
-        qrImage: null, paymentLightColor: 'green',
-      });
-    }
-
-    setCheckoutStep(false);
-    setPaymentPage(true);
-  };
-
-  const completeOrder = () => {
-    if (!paymentOrder) return;
-    setOrderPlacedOverlay(true);
-    window.setTimeout(() => {
-      setOrderPlacedOverlay(false);
-      setPaymentPage(false);
-      setPaymentOrder(null);
-      setCartItems([]);
-      setActive('home');
-    }, 1600);
-  };
-
-  // Orders
-  useEffect(() => {
-    if (active !== 'orders' || !accounts.length) return;
-    let cancelled = false;
-    let cache = readOrdersCache();
-
-    const showCached = () => {
-      if (!cancelled) {
-        const cached = getCachedOrdersForAccounts(cache, accounts, ordersAccountId);
-        setOrdersList(cached);
-        setOrdersLoading(cached.length === 0);
-      }
-    };
-
-    const refreshAll = async () => {
-      if (cancelled) return;
-      setOrdersRetrying(true);
-      const accountJobs = accounts.map(async (acc) => {
-        try {
-          const r = await fetchOrders(acc.account_id);
-          const freshOrders = (r.orders ?? []).map(o => ({ ...o, phone: acc.phone, accountId: acc.account_id }));
-          cache = mergeCachedOrders(cache, acc.account_id, acc.phone, freshOrders);
-          writeOrdersCache(cache);
-          if (!cancelled) {
-            const nextOrders = getCachedOrdersForAccounts(cache, accounts, ordersAccountId);
-            setOrdersList(nextOrders);
-            setOrdersLoading(nextOrders.length === 0);
-          }
-          for (const order of freshOrders) {
-            if (cancelled) return;
-            const key = orderCacheKey(order);
-            if (!key) continue;
-            try {
-              const detailResponse = await fetchOrderDetails(acc.account_id, order.order_num, order.sub_order_num);
-              const detail = detailResponse?.data ?? detailResponse;
-              if (detail) {
-                const accountCache = cache.accounts[acc.account_id] ?? { phone: acc.phone, orders: [], details: {} };
-                accountCache.details = accountCache.details ?? {};
-                accountCache.details[key] = detail;
-                cache.accounts[acc.account_id] = accountCache;
-                cache.updatedAt = Date.now();
-                writeOrdersCache(cache);
-              }
-            } catch {}
-          }
-        } catch (e) { console.error('[orders refresh]', acc.account_id, e); }
-      });
-      await Promise.all(accountJobs);
-      if (!cancelled) {
-        const finalOrders = getCachedOrdersForAccounts(cache, accounts, ordersAccountId);
-        setOrdersList(finalOrders);
-        setOrdersLoading(finalOrders.length === 0);
-        setOrdersRetrying(false);
-      }
-    };
-
-    showCached();
-    void refreshAll();
-
-    const retryTimer = window.setInterval(() => {
-      if (cancelled) return;
-      const current = getCachedOrdersForAccounts(readOrdersCache(), accounts, ordersAccountId);
-      if (!current.length) void refreshAll();
-    }, 15000);
-
-    const timer = window.setInterval(() => {
-      cache = readOrdersCache();
-      void refreshAll();
-    }, 5 * 60 * 1000);
-
-    return () => {
-      cancelled = true;
-      window.clearInterval(retryTimer);
-      window.clearInterval(timer);
-    };
-  }, [active, accounts]);
-
-  useEffect(() => {
-    if (active !== 'orders' || !accounts.length) return;
-    const cache = readOrdersCache();
-    const cached = getCachedOrdersForAccounts(cache, accounts, ordersAccountId);
-    setOrdersList(cached);
-    if (cached.length) setOrdersLoading(false);
-  }, [active, ordersAccountId, accounts]);
-
-  // Giphy home
-  useEffect(() => {
-    if (active !== 'home') return;
-    let cancelled = false, offset = Math.floor(Math.random() * 12) * 10, fetching = false, timer = null;
-    const seen = new Set(), queue = [];
-    const KEY  = 'SSFO9NLIyMofQe24akeyd88xjSMV3jl5';
-    const fetchBatch = async () => {
-      if (cancelled || fetching) return; fetching = true;
-      try {
-        const r = await fetch(`https://api.giphy.com/v1/stickers/search?api_key=${KEY}&q=Clash+Royale+emotes&limit=10&offset=${offset}&rating=pg&fields=id,images`);
-        const d = await r.json();
-        (d.data ?? []).filter(s => s?.id && !seen.has(s.id) && (s?.images?.fixed_height?.url || s?.images?.downsized?.url)).forEach(s => { seen.add(s.id); queue.push(s.images.fixed_height?.url || s.images.downsized.url); });
-        offset += 10;
-      } catch {} finally { fetching = false; }
-    };
-    const rotate = () => {
-      if (cancelled) return;
-      if (queue.length) { setHomeCreditAvatarVisible(false); const u = queue.shift(); window.setTimeout(() => { if (!cancelled) setHomeCreditAvatarUrl(u); }, 180); }
-      if (queue.length <= 5) void fetchBatch();
-    };
-    void fetchBatch();
-    timer = window.setInterval(rotate, 5000);
-    return () => { cancelled = true; if (timer) window.clearInterval(timer); };
-  }, [active]);
-
-  useEffect(() => {
-    if (!homeCreditAvatarUrl) return;
-    const img = new Image(); img.src = homeCreditAvatarUrl;
-    img.onload = () => setHomeCreditAvatarVisible(true);
-    return () => { img.onload = null; };
-  }, [homeCreditAvatarUrl]);
-
-  useEffect(() => {
-    if (active !== 'profile') return;
-    let cancelled = false;
-    let offset = 0;
-    let batch = [];
-    let batchIndex = 0;
-    let totalCount = Infinity;
-    let fetching = false;
-    let rotateTimer = null;
-    let batchTimer = null;
-    const seen = new Set();
-    const KEY = 'SSFO9NLIyMofQe24akeyd88xjSMV3jl5';
-    const BATCH_SIZE = 500;
-    const ROTATE_MS = 5000;
-    const BATCH_WINDOW_MS = 2 * 60 * 60 * 1000;
-
-    const showNext = () => {
-      if (cancelled || !batch.length) return;
-      const u = batch[batchIndex % batch.length];
-      batchIndex += 1;
-      setProfileAvatarVisible(false);
-      window.setTimeout(() => { if (!cancelled) setProfileAvatarUrl(u); }, 180);
-    };
-
-    const fetchBatch = async () => {
-      if (cancelled || fetching || offset >= totalCount) return;
-      fetching = true;
-      try {
-        const nextBatch = [];
-        let pagesFetched = 0;
-        while (!cancelled && nextBatch.length < BATCH_SIZE && offset < totalCount && pagesFetched < 20) {
-          const remaining = BATCH_SIZE - nextBatch.length;
-          const limit = Math.min(50, remaining);
-          const r = await fetch(`https://api.giphy.com/v1/stickers/search?api_key=${KEY}&q=Clash+Royale+emotes&limit=${limit}&offset=${offset}&rating=pg`);
-          const d = await r.json();
-          totalCount = Number.isFinite(d?.pagination?.total_count) ? d.pagination.total_count : totalCount;
-          const fresh = (d.data ?? []).filter(s => s?.id && !seen.has(s.id) && (s?.images?.fixed_height?.url || s?.images?.downsized?.url));
-          fresh.forEach(s => { seen.add(s.id); nextBatch.push(s.images.fixed_height?.url || s.images.downsized.url); });
-          const returned = Array.isArray(d.data) ? d.data.length : 0;
-          if (!returned) break;
-          offset += returned;
-          pagesFetched += 1;
-          if (returned < limit) break;
+    return [
+        {
+            "http": f"http://{addr}",
+            "https": f"http://{addr}",
+            "addr": addr,
         }
-        if (!cancelled && nextBatch.length) {
-          batch = nextBatch;
-          batchIndex = 0;
-          showNext();
-          if (batchTimer) window.clearTimeout(batchTimer);
-          batchTimer = window.setTimeout(() => { if (!cancelled) void fetchBatch(); }, BATCH_WINDOW_MS);
-        }
-      } catch {} finally { fetching = false; }
-    };
+        for addr, _ in selected
+    ]
 
-    void fetchBatch();
-    rotateTimer = window.setInterval(() => { if (cancelled) return; if (batch.length) showNext(); }, ROTATE_MS);
-    return () => {
-      cancelled = true;
-      if (rotateTimer) window.clearInterval(rotateTimer);
-      if (batchTimer) window.clearTimeout(batchTimer);
-    };
-  }, [active]);
 
-  useEffect(() => {
-    if (!profileAvatarUrl) return;
-    const img = new Image(); img.src = profileAvatarUrl;
-    img.onload = () => setProfileAvatarVisible(true);
-    return () => { img.onload = null; };
-  }, [profileAvatarUrl]);
+def mark_dead(addr: str):
+    addr = addr.replace("http://", "").replace("https://", "").split("/")[0]
+    _evict(addr, "dead (reported)")
 
-  const handleReferralAttempt = (e) => {
-    e.preventDefault();
-    setReferralEditAttempt(true);
-    window.setTimeout(() => setReferralEditAttempt(false), 1000);
-  };
+def _snapshot_worker():
+    global _snap_fresh30, _snap_fresh120, _snap_fast
+    while True:
+        now = time.time()
+        f30, f120, fast, stale = [], [], [], []
+        with _proxies_lock:
+            items = list(_proxies.items())
+        for a, r in items:
+            lc  = r.get("last_checked", 0)
+            age = (now - lc) if lc else 1e9
+            if lc and now - r.get("received_at", now) > POOL_TTL_S:
+                stale.append(a)
+                continue
+            if age <= FRESH_COLD_S:
+                f120.append(a)
+                if r.get("label") in ("flash", "panther"):
+                    fast.append(a)
+                if age <= FRESH_HOT_S:
+                    f30.append(a)
+        for a in stale:
+            _evict(a, "ttl_expired")
+        with _snap_lock:
+            _snap_fresh30  = f30
+            _snap_fresh120 = f120
+            _snap_fast     = fast
+        time.sleep(SNAP_INTERVAL_S)
 
-  const handlePhoneChange = (e) => {
-    const next = e.target.value.replace(/\D/g,'').slice(0,10);
-    setPhoneNumber(next);
-    if (next.length < 10) { setMshoStatus('bad'); setAccountSubmitted(false); setFodLoading(false); setFodReady(false); setFodLoader(0); }
-  };
+async def _pool_recheck_worker():
+    connector = aiohttp.TCPConnector(limit=POOL_RECHECK_BATCH + 10, ttl_dns_cache=300)
+    sem = asyncio.Semaphore(POOL_RECHECK_BATCH)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        while True:
+            await asyncio.sleep(POOL_RECHECK_INTERVAL_S)
+            now = time.time()
+            with _proxies_lock:
+                due = [a for a, r in _proxies.items() if now >= r.get("next_check", 0)]
+            random.shuffle(due)
+            batch = due[:POOL_RECHECK_BATCH]
+            if not batch:
+                continue
+            print(f"[pool] recheck {len(batch)} proxies", flush=True)
 
-  const activeItem = navItems.find(i => i.id === active);
-  const actionCards = [
-    { id: 'accounts',    label: 'Accounts',    value: String(homeStats.total),     detail: 'Total Meesho Accounts',      icon: '▥' },
-    { id: 'addresses',   label: 'Addresses',   value: '—',                          detail: 'Manage Delivery Addresses',   icon: '⌂' },
-    { id: 'add-account', label: 'ADD Account', value: '—',                          detail: 'Add Meesho Account',          backText: 'Add Meesho Account', icon: '+' },
-    { id: 'fyp',         label: 'FYP',         value: '—',                          detail: 'Recommended Products',        backText: 'Recommended Products', icon: '◆' },
-  ];
+            async def _check_one(addr):
+                async with sem:
+                    passed, latency = await _meesho_check(session, addr)
+                if passed:
+                    _promote(addr, latency)
+                    _inc("recheck_pass")
+                else:
+                    _evict(addr, "recheck_fail")
+                    _inc("recheck_fail")
 
-  const orderTapTimers = useRef({});
-  const [orderTapState, setOrderTapState] = useState({});
+            await asyncio.gather(*[_check_one(a) for a in batch])
 
-  const openOrderDetails = useCallback((order, key) => {
-    if (orderTapTimers.current[key]) { window.clearTimeout(orderTapTimers.current[key]); delete orderTapTimers.current[key]; }
-    setOrderTapState(current => ({ ...current, [key]: false }));
-    setSelectedOrder(order);
-  }, []);
+def _pool_recheck_thread():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(_pool_recheck_worker())
 
-  const handleOrderCardTap = useCallback((order, key) => {
-    if (orderTapTimers.current[key]) {
-      window.clearTimeout(orderTapTimers.current[key]);
-      delete orderTapTimers.current[key];
-      openOrderDetails(order, key);
-      return;
+def _persist_worker():
+    while True:
+        _persist_event.wait(timeout=PERSIST_INTERVAL_S)
+        _persist_event.clear()
+        if ROLE == "pool":
+            _save_free()
+        elif ROLE == "vps":
+            _save_keys()
+
+def _start_pool():
+    _load_free()
+    threading.Thread(target=_snapshot_worker,     daemon=True, name="snap").start()
+    threading.Thread(target=_pool_recheck_thread, daemon=True, name="recheck").start()
+    threading.Thread(target=_persist_worker,      daemon=True, name="persist").start()
+    print(f"[pool] started — {len(_proxies)} proxies loaded", flush=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VPS ROLE
+# ═══════════════════════════════════════════════════════════════════════════════
+def _get_proxy_from_pool(cat: str = "any", purpose: str = "backend") -> dict:
+    pool_url = PEERS.get("pool", "")
+    if not pool_url:
+        return {}
+    try:
+        r = requests.get(
+            f"{pool_url}/pick",
+            params={"cat": cat, "purpose": purpose},
+            headers={"X-Secret": SHARED_SECRET},
+            timeout=5,
+        )
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        print(f"[vps] pool /pick failed: {e}", flush=True)
+    return {}
+
+
+def _get_race_proxies_from_pool(count: int = RACE_PROXY_COUNT) -> list[dict]:
+    pool_url = PEERS.get("pool", "")
+    if not pool_url:
+        return []
+
+    try:
+        r = requests.get(
+            f"{pool_url}/pick-many",
+            params={"count": count},
+            headers={"X-Secret": SHARED_SECRET},
+            timeout=6,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            proxies = data.get("proxies", [])
+            if isinstance(proxies, list):
+                return proxies
+    except Exception as e:
+        print(f"[vps] pool /pick-many failed: {e}", flush=True)
+
+    return []
+
+
+def _report_dead_to_pool(addr: str):
+    pool_url = PEERS.get("pool", "")
+    if not pool_url:
+        return
+    try:
+        requests.post(
+            f"{pool_url}/dead",
+            json={"addr": addr},
+            headers={"X-Secret": SHARED_SECRET},
+            timeout=3,
+        )
+    except Exception:
+        pass
+
+
+def _pinger():
+    ping_order = [
+        "checker_1", "checker_2", "checker_3", "checker_4", "checker_5",
+        "checker_6", "checker_7", "checker_8", "checker_9", "checker_10",
+        "pool", "dashboard",
+    ]
+    while True:
+        for role in ping_order:
+            url = PEERS.get(role, "")
+            if not url:
+                continue
+            try:
+                requests.get(f"{url}/health", timeout=5)
+                print(f"[pinger] {url} ok", flush=True)
+            except Exception as e:
+                print(f"[pinger] {url} failed: {e}", flush=True)
+            time.sleep(3)
+        time.sleep(PING_INTERVAL)
+
+
+def _start_vps():
+    _load_keys()
+    threading.Thread(target=_pinger,         daemon=True, name="pinger").start()
+    threading.Thread(target=_persist_worker, daemon=True, name="persist").start()
+    print(f"[vps] started — {len(_keys)} keys loaded", flush=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PERSIST
+# ═══════════════════════════════════════════════════════════════════════════════
+def _save_free():
+    try:
+        with _proxies_lock:
+            data = {
+                a: {
+                    "label":        r.get("label"),
+                    "latency_ms":   r.get("latency_ms"),
+                    "last_checked": r.get("last_checked", 0),
+                    "received_at":  r.get("received_at", 0),
+                }
+                for a, r in _proxies.items()
+            }
+        PERSIST_FREE.write_text(json.dumps(data))
+    except Exception as e:
+        print(f"[persist] free save failed: {e}", flush=True)
+
+def _load_free():
+    if not PERSIST_FREE.exists():
+        return
+    try:
+        data = json.loads(PERSIST_FREE.read_text())
+        now  = time.time()
+        rows = data.items() if isinstance(data, dict) else [(a, {}) for a in data]
+        with _proxies_lock:
+            for addr, r in rows:
+                if now - r.get("received_at", 0) > POOL_TTL_S:
+                    continue
+                _proxies[addr] = {
+                    "received_at":  r.get("received_at", now),
+                    "last_checked": r.get("last_checked", 0),
+                    "latency_ms":   r.get("latency_ms", 0),
+                    "label":        r.get("label"),
+                    "next_check":   now,
+                }
+        print(f"[persist] loaded {len(_proxies)} free proxies", flush=True)
+    except Exception as e:
+        print(f"[persist] free load failed: {e}", flush=True)
+
+def _save_keys():
+    try:
+        with _keys_lock:
+            keys = [dict(k) for k in _keys]
+        KEYS_FILE.write_text(json.dumps(keys, indent=2))
+    except Exception as e:
+        print(f"[persist] keys save failed: {e}", flush=True)
+
+def _load_keys():
+    if not KEYS_FILE.exists():
+        return
+    try:
+        data = json.loads(KEYS_FILE.read_text())
+        with _keys_lock:
+            for entry in data:
+                if "credits_used" not in entry:
+                    entry["credits_used"] = 0
+                if "credits_limit" not in entry:
+                    entry["credits_limit"] = DEFAULT_CREDIT_LIMITS.get(
+                        entry.get("provider", ""), 0)
+                if "reset_at" not in entry:
+                    entry["reset_at"] = 0
+                if "last_used" not in entry:
+                    entry["last_used"] = 0
+                if "credit_source" not in entry:
+                    entry["credit_source"] = "local"
+                if "last_sync" not in entry:
+                    entry["last_sync"] = 0
+                _keys.append(entry)
+        print(f"[persist] loaded {len(data)} keys", flush=True)
+    except Exception as e:
+        print(f"[persist] keys load failed: {e}", flush=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STATS
+# ═══════════════════════════════════════════════════════════════════════════════
+def _get_stats() -> dict:
+    now = time.time()
+    with _proxies_lock:
+        items = list(_proxies.items())
+    live = len(items)
+    f30  = sum(1 for _, r in items if r.get("last_checked") and now - r["last_checked"] <= FRESH_HOT_S)
+    f120 = sum(1 for _, r in items if r.get("last_checked") and now - r["last_checked"] <= FRESH_COLD_S)
+    labs = defaultdict(int)
+    for _, r in items:
+        if r.get("label"):
+            labs[r["label"]] += 1
+
+    providers_block = {}
+    with _keys_lock:
+        keys_snapshot = [dict(k) for k in _keys]
+    for k in keys_snapshot:
+        prov  = k.get("provider", "unknown")
+        limit = int(k.get("credits_limit")
+                    or DEFAULT_CREDIT_LIMITS.get(prov, 0))
+        used  = int(k.get("credits_used") or 0)
+        block = providers_block.setdefault(prov, {
+            "keys": 0, "live": 0, "total_credits": 0, "used_credits": 0,
+        })
+        block["keys"]          += 1
+        block["total_credits"] += limit
+        block["used_credits"]  += used
+        if used < limit:
+            block["live"] += 1
+
+    with _outbuf_lock: obuf = len(_outbuf)
+    with _counter_lock:
+        cnts_life  = dict(_counters_lifetime)
+        cnts_cycle = dict(_counters_cycle)
+        c_start    = _cycle_start
+    with _activity_lock: acts = list(reversed(_activity_log))
+    q_depth = _check_queue.qsize() if _check_queue else 0
+
+    caller_picks = {
+        "lifetime": {
+            k[len("pool_picks_by_"):]: v
+            for k, v in cnts_life.items()
+            if k.startswith("pool_picks_by_")
+        },
+        "cycle": {
+            k[len("pool_picks_by_"):]: v
+            for k, v in cnts_cycle.items()
+            if k.startswith("pool_picks_by_")
+        },
     }
-    setOrderTapState(current => ({ ...current, [key]: true }));
-    orderTapTimers.current[key] = window.setTimeout(() => { delete orderTapTimers.current[key]; }, 650);
-  }, [openOrderDetails]);
 
-  return (
-    <main className="app-page">
-      <LoadingOverlay onComplete={() => setPageReady(true)} />
-      <div className="app-page__ambient" aria-hidden="true" />
+    return {
+        "role": ROLE,
+        "counters": {
+            "lifetime": cnts_life,
+            "cycle": cnts_cycle,
+            "cycle_started_ago_s": round(time.time() - c_start, 1),
+        },
+        "caller_picks": caller_picks,
+        "activity":     acts[:50],
+        "queues":       {"check": q_depth, "outbuf": obuf},
+        "free": {
+            "live":       live,
+            "fresh_30s":  f30,
+            "fresh_120s": f120,
+            "flash":      labs["flash"],
+            "panther":    labs["panther"],
+            "lantern":    labs["lantern"],
+            "deadass":    labs["deadass"],
+        },
+        "providers": providers_block,
+        "peers": {role: url for role, url in PEERS.items()},
+    }
 
-      {selectedProduct && (
-        <ProductDetailPage
-          product={selectedProduct}
-          onClose={() => setSelectedProduct(null)}
-          onAddToCart={(p, qty, v) => addProductToCart(p, qty, false, v)}
-          onBuyNow={(p, qty, v) => addProductToCart(p, qty, true, v)}
-        />
-      )}
+# ═══════════════════════════════════════════════════════════════════════════════
+# FASTAPI
+# ═══════════════════════════════════════════════════════════════════════════════
+app = FastAPI(title=f"ProxyStack v2 [{ROLE}]")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-      {showCartAddressOverlay && cartAccountId && (
-        <CartAddressAddOverlay
-          accountId={cartAccountId}
-          onClose={() => setShowCartAddressOverlay(false)}
-          onSaved={async () => {
-            setShowCartAddressOverlay(false);
-            // Reload addresses for cart
-            try {
-              const r = await fetchAddresses(cartAccountId);
-              const addrs = r?.data?.addresses ?? r?.addresses ?? [];
-              setCartAddresses(Array.isArray(addrs) ? addrs : []);
-              const newest = addrs[addrs.length - 1] ?? addrs[0];
-              if (newest) {
-                setCartAddressId(newest.id);
-                // Auto bind the newly added address
-                await handleBindCartAddress(newest.id, newest.pin ?? newest.pincode);
-              }
-            } catch {}
-          }}
-        />
-      )}
+_static = BASE / "static"
+if _static.exists():
+    app.mount("/static", StaticFiles(directory=str(_static)), name="static")
 
-      <header className="app-page__header">
-        <div>
-          <p className="app-page__eyebrow">MesoWeb</p>
-          <h1>{activeItem?.label || actionCards.find(c => c.id === active)?.label || 'Home'}</h1>
-        </div>
-        <span className="app-page__brand">By SEV7N</span>
-      </header>
+@app.on_event("startup")
+async def _startup():
+    if ROLE.startswith("checker_"):
+        _start_checker()
+        deadline = time.time() + 10
+        while _check_queue is None and time.time() < deadline:
+            await asyncio.sleep(0.05)
+    elif ROLE == "pool":
+        _start_pool()
+    elif ROLE == "dashboard":
+        print(f"[dashboard] Yoru started", flush=True)
+    elif ROLE == "vps":
+        _start_vps()
+    print(f"[ProxyStack v2] {ROLE} booted on port {PORT}", flush=True)
 
-      <section className="app-page__content" aria-live="polite">
+@app.get("/health")
+def health():
+    return {"ok": True, "role": ROLE}
 
-        {/* ── HOME ── */}
-        {active === 'home' && (
-          <div className="app-page__dashboard">
-            <div className="app-page__stats">
-              {[
-                { title: 'Accounts',  value: statsReady ? String(dashStats.total_accounts) : String(homeStats.total),     percent: '—', tone: 'accounts'  },
-                { title: 'Success',   value: statsReady ? String((dashStats.shipped ?? 0) + (dashStats.delivered ?? 0)) : String(homeStats.success),   percent: '—', tone: 'success'   },
-                { title: 'Cancelled', value: statsReady ? String(dashStats.cancelled)      : String(homeStats.cancelled), percent: '—', tone: 'cancelled' },
-              ].map(card => (
-                <article className={`card card--${card.tone}${pageReady ? ' is-ready' : ''}`} key={card.title}>
-                  <div className="title">
-                    <span aria-hidden="true"><svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24"><rect x="4" y="12" width="3" height="7" rx="1"/><rect x="10.5" y="8" width="3" height="11" rx="1"/><rect x="17" y="4" width="3" height="15" rx="1"/></svg></span>
-                    <p className="title-text">{card.title}</p>
-                  </div>
-                  <div className="data"><p>{card.value}</p><div className="range"><div className="fill" /></div></div>
-                </article>
-              ))}
-            </div>
+@app.get("/stats")
+async def stats():
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_api_executor, _get_stats)
 
-            <div className="meso-card-grid">
-              {actionCards.map((card, i) => (
-                <FlipCard key={card.id} card={card} pageReady={pageReady} delay={i * 0.1} onOpen={id => { setActive(id); }} />
-              ))}
-            </div>
+@app.get("/activity")
+async def activity(limit: int = 50):
+    with _activity_lock:
+        acts = list(reversed(_activity_log))
+    return acts[:limit]
 
-            <section className="home-credits">
-              <div className="home-credits__stars container" aria-hidden="true"><div id="stars"/><div id="stars2"/><div id="stars3"/></div>
-              <div className="home-credits__sticker"><img className={homeCreditAvatarVisible ? 'is-visible' : ''} src={homeCreditAvatarUrl} alt="Clash Royale emote" /></div>
-              <div className="home-credits__text"><strong>Created By SEV7N</strong><span>With Help of Claude &amp; ProxyBin</span></div>
-            </section>
+@app.get("/qsize")
+def qsize(x_secret: Optional[str] = Header(None)):
+    if x_secret != SHARED_SECRET:
+        raise HTTPException(403, "invalid secret")
+    q = _check_queue.qsize() if _check_queue else 0
+    with _outbuf_lock: ob = len(_outbuf)
+    return {"check_qsize": q, "outbuf": ob, "role": ROLE}
 
-            <section className="recent-updates" aria-label="Recent Updates">
-              <div className="recent-updates__header">
-                <div><p className="app-page__eyebrow">MesoWeb</p><h2>Recent Updates</h2></div>
-                <button type="button" className={`recent-updates__refresh${statsRefreshing ? ' is-refreshing' : ''}`} onClick={handleStatsRefresh} disabled={statsRefreshing}>
-                  {statsRefreshing ? 'Refreshing…' : '↻ Refresh'}
-                </button>
-              </div>
-              <div className="recent-updates__list">
-                {recentUpdates.length === 0 && accounts.length === 0 && (
-                  <article><span className="recent-updates__dot"/><div><strong>No accounts yet</strong></div><time>—</time></article>
-                )}
-                {recentUpdates.map((u, i) => (
-                  <article key={i}>
-                    <span className="recent-updates__dot"/>
-                    <div><strong>+91 {u.phone} — order just got <span className={`recent-updates__status recent-updates__status--${u.next?.toLowerCase()}`}>{u.next}</span></strong></div>
-                    <time>{u.time}</time>
-                  </article>
-                ))}
-                {recentUpdates.length === 0 && accounts.length > 0 && (
-                  <article><span className="recent-updates__dot"/><div><strong>No status changes detected yet</strong></div><time>—</time></article>
-                )}
-              </div>
-            </section>
-          </div>
-        )}
+async def _sse_generator():
+    loop = asyncio.get_event_loop()
+    while True:
+        try:
+            if ROLE == "dashboard":
+                merged = {"role": ROLE, "nodes": {}, "ts": time.time()}
+                for peer_role, peer_url in PEERS.items():
+                    try:
+                        r = await asyncio.wait_for(
+                            loop.run_in_executor(
+                                _api_executor,
+                                lambda u=peer_url: requests.get(f"{u}/stats", timeout=2).json()
+                            ),
+                            timeout=3.0,
+                        )
+                        merged["nodes"][peer_role] = r
+                    except Exception:
+                        merged["nodes"][peer_role] = {"error": "unreachable"}
+                yield f"data: {json.dumps(merged)}\n\n"
+            else:
+                data       = await asyncio.wait_for(
+                    loop.run_in_executor(_api_executor, _get_stats),
+                    timeout=2.0,
+                )
+                data["ts"] = time.time()
+                yield f"data: {json.dumps(data)}\n\n"
+        except asyncio.TimeoutError:
+            yield ": keepalive\n\n"
+        await asyncio.sleep(2)
 
-        {/* ── ACCOUNTS ── */}
-        {active === 'accounts' && (
-          <div className="app-page__dashboard accounts-dashboard">
-            <div className="app-page__stats">
-              {[
-                { title: 'Total Accounts', value: statsReady ? String(dashStats.total_accounts) : String(accounts.length),                                                                          tone: 'accounts'  },
-                { title: 'FOD Available',  value: statsReady ? String(dashStats.fod_available)  : String(accounts.filter(a => !a.last_order_status || a.last_order_status === '—').length),          tone: 'unused'    },
-                { title: 'FOD Used',       value: statsReady ? String(dashStats.fod_used)        : String(accounts.reduce((t, a) => t + (a.orders_placed ?? 0), 0) || accounts.length),              tone: 'cancelled' },
-                { title: 'Shipped',        value: statsReady ? String(dashStats.shipped)         : String(accounts.filter(a => a.last_order_status === 'Shipped').length),                           tone: 'shipped'   },
-                { title: 'Cancelled',      value: statsReady ? String(dashStats.cancelled)       : String(accounts.filter(a => a.last_order_status === 'Cancelled').length),                         tone: 'cancelled' },
-                { title: 'Delivered',      value: statsReady ? String(dashStats.delivered)       : String(accounts.filter(a => a.last_order_status === 'Delivered').length),                         tone: 'delivered' },
-              ].map(card => (
-                <article className={`card card--${card.tone}${pageReady ? ' is-ready' : ''}`} key={card.title}>
-                  <div className="title">
-                    <span aria-hidden="true"><svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24"><rect x="4" y="12" width="3" height="7" rx="1"/><rect x="10.5" y="8" width="3" height="11" rx="1"/><rect x="17" y="4" width="3" height="15" rx="1"/></svg></span>
-                    <p className="title-text">{card.title}</p>
-                  </div>
-                  <div className="data"><p>{card.value}</p><div className="range"><div className="fill"/></div></div>
-                </article>
-              ))}
-            </div>
+@app.get("/stream/stats")
+async def stream_stats():
+    return StreamingResponse(
+        _sse_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":               "no-cache",
+            "X-Accel-Buffering":           "no",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
 
-            <section className="accounts-table">
-              <div className="accounts-table__header"><span>Phone</span><span>FOD</span><span>Status</span><span>Actions</span></div>
-              {accountsLoading && <div className="accounts-table__loading">Loading accounts…</div>}
-              <div className="accounts-table__body">
-                {accounts.map(acc => (
-                  <div className="accounts-table__row" key={acc.account_id}>
-                    <span className="accounts-table__id">{acc.phone}</span>
-                    <span className="accounts-table__fod">{acc.fod_bucket ? `₹${Number(acc.fod_bucket).toLocaleString('en-IN')}` : '—'}</span>
-                    <span className={`accounts-table__status accounts-table__status--${(acc.last_order_status ?? 'pending').toLowerCase().replace(/\s/g,'-')}`}>{acc.last_order_status ?? '—'}</span>
-                    <div className="accounts-table__actions">
-                      <button type="button" className="cssbuttons-io"
-                        onClick={async () => {
-                          try { await navigator.clipboard.writeText(JSON.stringify(acc, null, 2)); setCopiedId(acc.account_id); window.setTimeout(() => setCopiedId(null), 1400); } catch {}
-                        }}>
-                        <span>
-                          <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M0 0h24v24H0z" fill="none"/><path d="M24 12l-5.657 5.657-1.414-1.414L21.172 12l-4.243-4.243 1.414-1.414L24 12zM2.828 12l4.243 4.243 1.414-1.414L0 12l5.657-5.657L7.07 7.757 2.828 12zm6.96 9H7.66l6.552-18h2.128L9.788 21z" fill="currentColor"/></svg>
-                          {copiedId === acc.account_id ? 'Copied' : 'JSON'}
-                        </span>
-                      </button>
-                      <button type="button" className={`noselect${deleteConfirmId === acc.account_id ? ' is-confirming' : ''}`}
-                        onClick={async () => {
-                          if (deleteConfirmId === acc.account_id) {
-                            await deleteAccount(acc.account_id).catch(() => {});
-                            setDeleteConfirmId(null);
-                            loadAccounts();
-                          } else {
-                            setDeleteConfirmId(acc.account_id);
-                            window.setTimeout(() => setDeleteConfirmId(c => c === acc.account_id ? null : c), 1800);
-                          }
-                        }}>
-                        <span className="text">{deleteConfirmId === acc.account_id ? 'Confirm' : 'Delete'}</span>
-                        <span className="icon"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path d="M24 20.188l-8.315-8.209 8.2-8.282-3.697-3.697-8.212 8.318-8.31-8.203-3.666 3.666 8.321 8.24-8.206 8.313 3.666 3.666 8.237-8.318 8.285 8.203z"/></svg></span>
-                      </button>
-                    </div>
-                  </div>
-                ))}
-                {!accountsLoading && !accounts.length && (<div className="accounts-table__empty">No accounts yet. Add one to get started.</div>)}
-              </div>
-            </section>
-          </div>
-        )}
+# ── Pool ingest ───────────────────────────────────────────────────────────────
+class IngestItem(BaseModel):
+    addr:      str
+    latency_s: float = 5.0
 
-        {/* ── ADDRESSES ── */}
-        {active === 'addresses' && (
-          <section className="addresses-page">
-            <div className="addresses-page__intro"><p className="app-page__eyebrow">MesoWeb</p><h2>Addresses</h2><p>Manage delivery addresses for your accounts.</p></div>
-            <AccountPicker value={addressAccountId} onChange={setAddressAccountId} accounts={accounts} label="Select Account" />
+class IngestRequest(BaseModel):
+    proxies: list[IngestItem]
 
-            <section className="addresses-list">
-              <div className="addresses-section__header">
-                <div><p className="app-page__eyebrow">Saved</p><h3>Addresses on Meesho</h3></div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                  <span>{addressList.length} saved</span>
-                  <button type="button" className={`app-page__stats-refresh${addrCacheRefreshing ? ' is-refreshing' : ''}`} onClick={handleAddressRefresh} disabled={addrCacheRefreshing}>
-                    {addrCacheRefreshing ? 'Refreshing…' : '↻ Refresh'}
-                  </button>
-                </div>
-              </div>
-              {addressLoading && <div className="address-loading">Loading addresses…</div>}
-              {!addressLoading && addressAccountId && addressList.length === 0 && <div className="address-empty">No addresses found for this account.</div>}
-              <div className="addresses-scroll-container">
-                {addressList.map(addr => (
-                  <article className="address-card" key={addr.id ?? addr.address_id}>
-                    <div className="address-card__top">
-                      <div><strong>{addr.name}</strong>{addr.is_default && <span className="address-card__default">Default</span>}</div>
-                    </div>
-                    <p>{addr.address_line_1}{addr.address_line_2 ? `, ${addr.address_line_2}` : ''}</p>
-                    <p>{addr.city}, {addr.state} — {addr.pin ?? addr.pincode}</p>
-                    <span className="address-card__phone">{addr.mobile}</span>
-                  </article>
-                ))}
-              </div>
-            </section>
+@app.post("/ingest")
+async def ingest(req: IngestRequest, x_secret: Optional[str] = Header(None)):
+    if x_secret != SHARED_SECRET:
+        raise HTTPException(403, "invalid secret")
+    if ROLE != "pool":
+        raise HTTPException(400, f"ingest only on pool role, this is {ROLE}")
+    for item in req.proxies:
+        _promote(item.addr, item.latency_s)
+    return {"ingested": len(req.proxies)}
 
-            <section className="address-form-card">
-              <div className="addresses-section__header"><div><p className="app-page__eyebrow">Delivery</p><h3>Add New Address</h3></div></div>
-              <div className="address-form">
-                <label><span>Full Name</span><input value={addressForm.name} onChange={e => setAddressForm(f => ({ ...f, name: e.target.value }))} placeholder="Enter full name"/></label>
-                <label><span>Mobile Number</span><input inputMode="tel" value={addressForm.mobile} onChange={e => setAddressForm(f => ({ ...f, mobile: e.target.value }))} placeholder="+91 98765 43210"/></label>
-                <label>
-                  <span>Pincode {pincodeResolving ? '(resolving…)' : ''}</span>
-                  <input inputMode="numeric" value={addressForm.pincode}
-                    onChange={e => setAddressForm(f => ({ ...f, pincode: e.target.value.replace(/\D/g,'').slice(0,6) }))}
-                    onBlur={handlePincodeBlur} placeholder="411045"/>
-                </label>
-                <div className="address-form__split">
-                  <label><span>City</span><input value={addressForm.city} onChange={e => setAddressForm(f => ({ ...f, city: e.target.value }))} placeholder="City"/></label>
-                  <label><span>State</span><input value={addressForm.state} onChange={e => setAddressForm(f => ({ ...f, state: e.target.value }))} placeholder="State"/></label>
-                </div>
-                <label><span>Address Line 1</span><input value={addressForm.line1} onChange={e => setAddressForm(f => ({ ...f, line1: e.target.value }))} placeholder="House / Flat / Building"/></label>
-                <label><span>Address Line 2 <em>Optional</em></span><input value={addressForm.line2} onChange={e => setAddressForm(f => ({ ...f, line2: e.target.value }))} placeholder="Area / Street / Landmark"/></label>
-                <button type="button" className="address-save-button" disabled={addressSaving}
-                  onClick={async () => {
-                    if (!addressAccountId || !addressForm.name || !addressForm.mobile || !addressForm.pincode || !addressForm.city || !addressForm.state || !addressForm.line1) return;
-                    setAddressSaving(true);
-                    try {
-                      await createAddress({
-                        account_id: addressAccountId,
-                        name: addressForm.name, mobile: addressForm.mobile,
-                        pincode: addressForm.pincode, city: addressForm.city, state: addressForm.state,
-                        address_line_1: addressForm.line1, address_line_2: addressForm.line2,
-                        address_type: 'Home',
-                      });
-                      setAddressSaved(true);
-                      clearAddressCache();
-                      setAddressForm({ name:'', mobile:'', pincode:'', city:'', state:'', line1:'', line2:'', isDefault: false });
-                      fetchAddresses(addressAccountId).then(r => setAddressList(r?.data?.addresses ?? r?.addresses ?? [])).catch(() => {});
-                    } catch { alert('Failed to save address.'); }
-                    setAddressSaving(false);
-                  }}>
-                  {addressSaved ? 'Address Saved ✓' : addressSaving ? 'Saving…' : 'Save Address'}
-                </button>
-              </div>
-            </section>
-          </section>
-        )}
+# ── Pool pick ─────────────────────────────────────────────────────────────────
+@app.get("/pick")
+async def pick_route(
+    request: Request,
+    cat: str = "any",
+    purpose: str = "backend",
+    x_secret: Optional[str] = Header(None),
+):
+    if x_secret != SHARED_SECRET:
+        raise HTTPException(403, "invalid secret")
+    if ROLE != "pool":
+        raise HTTPException(400, "pick only on pool role")
+    caller = _identify_caller(request)
+    loop = asyncio.get_event_loop()
+    p = await loop.run_in_executor(_api_executor, _pick, purpose, caller)
+    if not p:
+        raise HTTPException(503, "no live proxies available")
+    return p
 
-        {/* ── ADD ACCOUNT ── */}
-        {active === 'add-account' && (
-          <section className="add-account-page">
-            <div className="add-account-form-card">
-              <div className="add-account-form-header"><span className="add-account-form-icon">+</span><div><p>Add Account</p><span>Add your Meesho account details</span></div></div>
-              <form className="add-account-form" onSubmit={e => { e.preventDefault(); if (phoneNumber.length === 10) setAccountSubmitted(true); }}>
-                <label className="add-account-field">
-                  <span>Phone Number</span>
-                  <div className="add-account-phone-wrap">
-                    <input type="tel" inputMode="numeric" placeholder="Enter 10 digit phone number" value={phoneNumber} onChange={handlePhoneChange} maxLength={10}/>
-                    {phoneNumber.length === 10 && (
-                      <div className="add-account-phone-status">
-                        <span className={`msho-status ${mshoStatus === 'bad' ? 'msho-status--bad' : 'msho-status--good'}`}>
-                          <span className="msho-status__text">MSHO</span>
-                          <span className={`msho-status__mark ${mshoStatus === 'bad' ? 'msho-status__mark--tick' : 'msho-status__mark--cross'}`}/>
-                        </span>
-                      </div>
-                    )}
-                  </div>
-                </label>
-                <div className="add-account-field">
-                  <span>Referal</span>
-                  <div className={`add-account-input-wrap${referralEditAttempt ? ' is-shaking is-error' : ''}`}>
-                    <input type="text" value="2560ev" readOnly aria-readonly="true" onClick={handleReferralAttempt} onKeyDown={handleReferralAttempt}/>
-                    <button type="button" className="add-account-lock" onClick={handleReferralAttempt}>
-                      <svg viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
-                    </button>
-                  </div>
-                </div>
-                <button className="add-account-submit" type="submit">Add Account</button>
-              </form>
+# ── Pool pick-many ────────────────────────────────────────────────────────────
+@app.get("/pick-many")
+async def pick_many_route(
+    request: Request,
+    count: int = RACE_PROXY_COUNT,
+    x_secret: Optional[str] = Header(None),
+):
+    if x_secret != SHARED_SECRET:
+        raise HTTPException(403, "invalid secret")
+    if ROLE != "pool":
+        raise HTTPException(400, "pick-many only on pool role")
 
-              {fodLoading && (
-                <div className="fod-loading" role="status"><div className="fod-loader"><FodLoader type={fodLoader % 5} visible={fodLoaderVisible}/></div><strong>Hunting FOD</strong></div>
-              )}
+    count = max(1, min(count, RACE_PROXY_COUNT))
+    caller = _identify_caller(request)
+    loop = asyncio.get_event_loop()
 
-              {fodReady && !otpState && !loginSuccess && (
-                <section className="fod-results">
-                  <div className="fod-result-card">
-                    <p>Login with <strong>+91{phoneNumber}</strong></p>
-                    <div className="fod-result-value"><span>Max FOD ₹{fodResult?.max_fod_bucket ? fodResult.max_fod_bucket.toLocaleString('en-IN') : '—'}</span><b>✓</b></div>
-                  </div>
-                  {otpError && <div className="otp-error">{otpError}</div>}
-                  <div className="fod-actions">
-                    <button type="button" onClick={handleSendOtp} disabled={otpSending}>{otpSending ? 'Sending…' : 'Send OTP'}</button>
-                    <button type="button" onClick={() => { setPhoneNumber(''); setAccountSubmitted(false); setFodReady(false); setFodResult(null); }}>Change Number</button>
-                    <button type="button" onClick={() => { setAccountSubmitted(false); window.setTimeout(() => setAccountSubmitted(true), 50); }}>Retry FOD</button>
-                  </div>
-                </section>
-              )}
+    proxies = await loop.run_in_executor(
+        _api_executor,
+        _pick_race_candidates,
+        caller,
+        count,
+    )
 
-              {otpState && !loginSuccess && (
-                <section className="otp-section fod-results">
-                  <div className="fod-result-card"><p>OTP sent to <strong>+91{phoneNumber}</strong></p></div>
-                  {otpError && <div className="otp-error">{otpError}</div>}
-                  <label className="add-account-field"><span>Enter OTP</span>
-                    <input type="tel" inputMode="numeric" placeholder="6-digit OTP" value={otpCode} onChange={e => setOtpCode(e.target.value.replace(/\D/g,'').slice(0,6))} maxLength={6}/>
-                  </label>
-                  <div className="fod-actions">
-                    <button type="button" onClick={handleVerifyOtp} disabled={otpVerifying || otpCode.length < 4}>{otpVerifying ? 'Verifying…' : 'Verify OTP'}</button>
-                    <button type="button" onClick={handleSendOtp} disabled={otpSending}>{otpSending ? 'Resending…' : 'Resend OTP'}</button>
-                  </div>
-                </section>
-              )}
+    if not proxies:
+        raise HTTPException(503, "no live proxies available")
 
-              {loginSuccess && (
-                <section className="fod-results">
-                  <div className="fod-result-card"><p><strong>+91{phoneNumber}</strong> added successfully!</p><div className="fod-result-value"><span>Account Created</span><b>✓</b></div></div>
-                  <div className="fod-actions">
-                    <button type="button" onClick={() => { setPhoneNumber(''); setAccountSubmitted(false); setFodReady(false); setFodResult(null); setOtpState(null); setLoginSuccess(false); setOtpCode(''); }}>Add Another</button>
-                    <button type="button" onClick={() => setActive('accounts')}>View Accounts</button>
-                  </div>
-                </section>
-              )}
-            </div>
-          </section>
-        )}
+    return {"proxies": proxies}
 
-        {/* ── SEARCH ── */}
-        {active === 'search' && (
-          <div className="search-page">
-            <div className="search-page__intro"><p className="app-page__eyebrow">MesoWeb</p><h2>Search</h2><p>Find products or paste a product link.</p></div>
-            <AccountPicker value={searchAccountId || 'anonymous'} onChange={value => setSearchAccountId(value === 'anonymous' ? '' : value)} accounts={accounts} label="Account" includeAnonymous />
-            <form className="meso-search" onSubmit={handleSearch}>
-              <div className="meso-search__shadow"/>
-              <input type="text" value={searchQuery} onChange={e => { setSearchQuery(e.target.value); setSearchSubmitted(false); }} placeholder="Paste Link Or Search Products"/>
-              <button type="submit">
-                <svg fill="none" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M4 9a5 5 0 1110 0A5 5 0 014 9zm5-7a7 7 0 104.2 12.6.999.999 0 00.093.107l3 3a1 1 0 001.414-1.414l-3-3a.999.999 0 00-.107-.093A7 7 0 009 2z" fillRule="evenodd" fill="currentColor"/></svg>
-              </button>
-            </form>
-            {searchLoading && <div className="search-loading">Searching…</div>}
-            {searchSubmitted && !searchLoading && (
-              <div className="search-results">
-                <div className="search-results__header">
-                  <span>{searchResults.length} {searchResults.length === 1 ? 'product' : 'products'}</span>
-                  <small>{searchQuery ? `Results for "${searchQuery}"` : ''}</small>
-                </div>
-                <ProductGrid pageReady={pageReady} products={searchResults} onOpenDetail={openProductDetail}/>
-              </div>
-            )}
-          </div>
-        )}
+# ── Pool dead ─────────────────────────────────────────────────────────────────
+class DeadReport(BaseModel):
+    addr: str
 
-        {/* ── FYP ── */}
-        {active === 'fyp' && (
-          <div className="fyp-page">
-            <div className="fyp-page__intro">
-              <div className="fyp-page__title-row">
-                <div><p className="app-page__eyebrow">MesoWeb</p><h2>For You</h2><p>Recommended products picked for the selected account.</p></div>
-                <div className="fyp-account-dropdown">
-                  <button type="button" className="fyp-account-dropdown__trigger"
-                    onClick={e => { const open = e.currentTarget.getAttribute('aria-expanded') !== 'true'; e.currentTarget.setAttribute('aria-expanded', String(open)); e.currentTarget.classList.toggle('is-open', open); e.currentTarget.nextElementSibling?.classList.toggle('is-open', open); }}
-                    aria-expanded="false" aria-haspopup="listbox">
-                    <span className="fyp-account-dropdown__current">
-                      <span className="fyp-account-dropdown__avatar">
-                        {fypAccountId === 'anonymous' ? 'A' : accounts.find(a => a.account_id === fypAccountId)?.phone?.slice(-2) ?? '?'}
-                      </span>
-                      <span>
-                        <small>Account</small>
-                        <strong>{fypAccountId === 'anonymous' ? 'Anonymous' : accounts.find(a => a.account_id === fypAccountId)?.phone ?? fypAccountId}</strong>
-                      </span>
-                    </span>
-                    <svg viewBox="0 0 24 24" fill="none"><path d="m7 9 5 5 5-5"/></svg>
-                  </button>
-                  <div className="fyp-account-dropdown__menu" role="listbox">
-                    {[{ account_id: 'anonymous', phone: 'Anonymous (Your IP)' }, ...accounts].map(a => (
-                      <button type="button" key={a.account_id}
-                        className={`fyp-account-dropdown__option${fypAccountId === a.account_id ? ' is-selected' : ''}`}
-                        onClick={e => {
-                          setFypAccountId(a.account_id);
-                          const dd = e.currentTarget.closest('.fyp-account-dropdown');
-                          dd?.querySelector('.fyp-account-dropdown__trigger')?.setAttribute('aria-expanded','false');
-                          dd?.querySelector('.fyp-account-dropdown__trigger')?.classList.remove('is-open');
-                          dd?.querySelector('.fyp-account-dropdown__menu')?.classList.remove('is-open');
-                        }}
-                        role="option" aria-selected={fypAccountId === a.account_id}>
-                        <span className="fyp-account-dropdown__avatar">{a.account_id === 'anonymous' ? 'A' : a.phone?.slice(-2)}</span>
-                        <span><strong>{a.account_id === 'anonymous' ? 'Anonymous' : a.phone}</strong></span>
-                        <i>{fypAccountId === a.account_id ? '✓' : ''}</i>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </div>
-            </div>
-            {fypLoading && <div className="fyp-loading">Loading recommendations…</div>}
-            <ProductGrid pageReady={pageReady} products={fypProducts} onOpenDetail={openProductDetail}/>
-          </div>
-        )}
+@app.post("/dead")
+async def report_dead(req: DeadReport, x_secret: Optional[str] = Header(None)):
+    if x_secret != SHARED_SECRET:
+        raise HTTPException(403, "invalid secret")
+    if ROLE != "pool":
+        raise HTTPException(400, "dead report only on pool role")
+    mark_dead(req.addr)
+    return {"ok": True}
 
-        {/* ── CART ── */}
-        {active === 'cart' && !checkoutStep && !paymentPage && (
-          <div className="cart-page">
-            <div className="cart-page__intro">
-              <p className="app-page__eyebrow">MesoWeb</p>
-              <h2>Cart</h2>
-              {cartAccountId
-                ? <p>Ordering from <strong>{accounts.find(a => a.account_id === cartAccountId)?.phone ?? cartAccountId}</strong></p>
-                : <p>Select an account to order</p>}
-            </div>
+@app.post("/reset-cycle")
+async def reset_cycle_route(x_secret: Optional[str] = Header(None)):
+    if x_secret != SHARED_SECRET:
+        raise HTTPException(403, "invalid secret")
+    _reset_cycle()
+    return {"ok": True, "reset_at": time.time()}
 
-            <CartAccountPicker value={cartAccountId} onChange={setCartAccountId} accounts={accounts} />
+# ═══════════════════════════════════════════════════════════════════════════════
+# VPS /request — read/write/sticky dispatch + premium fallback
+# ═══════════════════════════════════════════════════════════════════════════════
+class ProxyRequest(BaseModel):
+    url:      str
+    method:   str            = "GET"
+    headers:  Optional[dict] = None
+    body:     Optional[dict] = None
+    params:   Optional[dict] = None
+    retries:  int            = 5
+    timeout:  int            = 10
+    tier:     str            = "any"
+    category: str            = "any"
 
-            {/* Delivery address strip */}
-            {cartAccountId && (
-              <section className="cart-page__section cart-address-section">
-                <div className="cart-page__section-header">
-                  <div><p className="app-page__eyebrow">Deliver to</p><h3>Delivery Address</h3></div>
-                  <button type="button" className="cart-page__button cart-page__button--small" onClick={() => setShowCartAddressOverlay(true)}>+ Add</button>
-                </div>
-                {cartAddressLoading && <div className="cart-address-loading">Loading addresses…</div>}
-                {!cartAddressLoading && cartAddresses.length === 0 && (
-                  <div className="cart-address-empty">No addresses yet. Tap + Add to create one.</div>
-                )}
-                <div className="cart-address-strip">
-                  {cartAddresses.map(addr => (
-                    <button
-                      type="button"
-                      key={addr.id}
-                      className={`cart-address-chip${cartAddressId === addr.id ? ' is-selected' : ''}`}
-                      onClick={() => handleBindCartAddress(addr.id, addr.pin ?? addr.pincode)}
-                    >
-                      <strong>{addr.name}</strong>
-                      <span>{addr.city} — {addr.pin ?? addr.pincode}</span>
-                    </button>
-                  ))}
-                </div>
-              </section>
-            )}
 
-            <form className="meso-search" onSubmit={e => e.preventDefault()}>
-              <div className="meso-search__shadow"/>
-              <input type="text" placeholder="Paste Meesho Product Link" value={productLink} onChange={e => setProductLink(e.target.value)}/>
-            </form>
+async def _do_free_race(req: ProxyRequest, loop) -> Optional[Response]:
+    method = req.method.upper()
+    proxies = await loop.run_in_executor(
+        _backend_executor,
+        _get_race_proxies_from_pool,
+        RACE_PROXY_COUNT,
+    )
+    if not proxies:
+        return None
 
-            <div className="cart-page__actions">
-              <button className="cart-page__button" type="button" onClick={handleFetchProduct} disabled={fetchingProduct}>
-                {fetchingProduct ? 'Fetching…' : 'Fetch Product'}
-              </button>
-              <button className="cart-page__button" type="button" onClick={handleFetchMyCart}>Fetch My Cart</button>
-            </div>
+    connector = aiohttp.TCPConnector(
+        limit=len(proxies) + 5,
+        ssl=False,
+        enable_cleanup_closed=True,
+    )
 
-            {fetchedProduct && (
-              <section className={`cart-page__section cart-fetched-product ${productMovingToCart ? 'is-moving-to-cart' : ''}${productDisappearing ? ' is-disappearing' : ''}`}>
-                <div className="cart-page__section-header">
-                  <div><p className="app-page__eyebrow">Fetched product</p><h3>{fetchedProduct.name}</h3></div>
-                  <span>{fetchedProduct.price}</span>
-                </div>
-                <div className="cart-fetched-product__body">
-                  <img src={fetchedProduct.image || null} alt=""/>
-                  <div className="cart-fetched-product__info">
-                    <strong>{fetchedProduct.name}</strong>
-                    <span>{fetchedProduct.category}</span>
-                    <div className="cart-fetched-product__pricing">
-                      {fetchedProduct.mrpPrice && (<del className="product-detail__mrp">{fetchedProduct.mrpPrice}</del>)}
-                      <b className="product-detail__cod">{fetchedProduct.price}</b>
-                      {fetchedProduct.upiPrice && (
-                        <span className="product-detail__upi-glow"><svg className="product-detail__upi-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M13.2 2 5 13h6l-.8 9L19 10h-6z"/></svg>{fetchedProduct.upiPrice} UPI PRICE</span>
-                      )}
-                    </div>
-                  </div>
-                </div>
-                <div className="cart-fetched-product__actions">
-                  <button className={`cart-add-button ${productAdded ? 'is-added' : ''}`} type="button" onClick={addFetchedToCart}>
-                    <span className="cart-add-button__circle">
-                      <span className="cart-add-button__cart"><svg viewBox="0 0 24 24"><path d="M3 4h2l2.2 10.2a2 2 0 0 0 2 1.6h7.7a2 2 0 0 0 1.9-1.4L21 8H7.1M10 20h.01M18 20h.01"/></svg></span>
-                      <span className="cart-add-button__wind"/>
-                    </span>
-                    <span className="cart-add-button__text">{productAdded ? 'Added' : 'Add to Cart'}</span>
-                  </button>
-                  <button className="cart-fetched-product__cancel" type="button" onClick={() => setFetchedProduct(null)}>Cancel</button>
-                </div>
-              </section>
-            )}
+    async with aiohttp.ClientSession(connector=connector) as session:
+        async def _one_shot(prx: dict):
+            addr = prx.get("addr", "")
+            proxy_url = prx.get("http", "")
+            if not proxy_url:
+                return None
+            try:
+                async with session.request(
+                    method=method,
+                    url=req.url,
+                    headers=req.headers or {},
+                    json=req.body if method in ("POST", "PUT", "PATCH") else None,
+                    params=req.params,
+                    proxy=proxy_url,
+                    timeout=aiohttp.ClientTimeout(total=RACE_WAIT_S),
+                ) as r:
+                    raw = await r.read()
+                    enc = r.headers.get("Content-Encoding", "")
+                    ct  = r.headers.get("Content-Type", "application/octet-stream")
+                    try:
+                        if "gzip" in enc:
+                            raw = gzip.decompress(raw)
+                        elif "deflate" in enc:
+                            raw = zlib.decompress(raw)
+                    except Exception:
+                        pass
+                    if r.status < 400:
+                        return {
+                            "addr": addr,
+                            "status": r.status,
+                            "raw": raw,
+                            "content_type": ct,
+                        }
+            except (
+                asyncio.TimeoutError,
+                aiohttp.ClientConnectionError,
+                aiohttp.ClientProxyConnectionError,
+                aiohttp.ClientError,
+            ):
+                if addr:
+                    await asyncio.get_running_loop().run_in_executor(
+                        _backend_executor, _report_dead_to_pool, addr,
+                    )
+            except Exception:
+                pass
+            return None
 
-            <section className="cart-page__section">
-              <div className="cart-page__section-header">
-                <div><p className="app-page__eyebrow">Your cart</p><h3>Items in Cart</h3></div>
-                <span>{cartItems.length} {cartItems.length === 1 ? 'item' : 'items'}</span>
-              </div>
-              <div className="cart-items-list">
-                {cartItems.map(item => (
-                  <div className={`cart-items-list__row ${cartJustAddedId === item.id ? 'is-new' : ''}`} key={item.id}>
-                    <img src={item.image} alt="" />
-                    <div className="cart-items-list__info">
-                      <strong>{item.name}</strong>
-                      <span>{item.quantity} {item.quantity === 1 ? 'piece' : 'pieces'}</span>
-                    </div>
-                    <div className="cart-items-list__amount">
-                      <span>Amount</span>
-                      <strong>{item.price}</strong>
-                      <div className="cart-quantity">
-                        <button type="button" onClick={() => changeCartQuantity(item, -1)}>−</button>
-                        <b>{item.quantity}</b>
-                        <button type="button" onClick={() => changeCartQuantity(item, +1)}>+</button>
-                      </div>
-                      <button className="cart-item-delete" type="button" onClick={() => removeCartItem(item)}>Delete</button>
-                    </div>
-                  </div>
-                ))}
-                {cartItems.length === 0 && <div className="cart-empty">Cart is empty. Fetch a product or paste a link.</div>}
-              </div>
-            </section>
+        tasks = [asyncio.create_task(_one_shot(prx)) for prx in proxies]
 
-            <button className="cart-page__button cart-page__button--checkout" type="button" onClick={() => setCheckoutStep(true)} disabled={!cartItems.length || !cartAddressId}>
-              Proceed to Checkout
-            </button>
-          </div>
-        )}
+        try:
+            for completed in asyncio.as_completed(tasks, timeout=RACE_WAIT_S + 0.2):
+                result = await completed
+                if result is None:
+                    continue
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                _inc("race_wins")
+                _log("race_win",
+                     f"url={req.url} proxy={result['addr']} "
+                     f"status={result['status']} candidates={len(proxies)}")
+                return Response(
+                    content=result["raw"],
+                    status_code=result["status"],
+                    media_type=result["content_type"],
+                )
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-        {/* ── CHECKOUT ── */}
-        {active === 'cart' && checkoutStep && (
-          <div className="checkout-page">
-            <div className="checkout-page__intro">
-              <p className="app-page__eyebrow">MesoWeb</p>
-              <h2>Payment Method</h2>
-              {cartAccountId && <p>Ordering from <strong>{accounts.find(a => a.account_id === cartAccountId)?.phone}</strong></p>}
-            </div>
+    _inc("race_all_failed")
+    return None
 
-            {/* Read-only delivery address */}
-            <section className="checkout-address checkout-address--readonly">
-              <div className="checkout-page__summary-header">
-                <div><p className="app-page__eyebrow">Delivery</p><h3>Delivering To</h3></div>
-              </div>
-              {selectedAddress ? (
-                <div className="checkout-address__preview">
-                  <div><span>Recipient</span><strong>{selectedAddress.name}</strong></div>
-                  <p>{selectedAddress.address_line_1}{selectedAddress.address_line_2 ? `, ${selectedAddress.address_line_2}` : ''}, {selectedAddress.city}, {selectedAddress.state} — {selectedAddress.pin ?? selectedAddress.pincode}</p>
-                  <span>{selectedAddress.mobile}</span>
-                </div>
-              ) : (
-                <div className="checkout-no-addr">No address selected. Go back and pick one.</div>
-              )}
-            </section>
 
-            <section className="checkout-page__summary">
-              <div className="checkout-page__summary-header">
-                <div><p className="app-page__eyebrow">Your order</p><h3>Order Summary</h3></div>
-                <span>{cartItems.length} {cartItems.length === 1 ? 'item' : 'items'}</span>
-              </div>
-              <div className="checkout-page__summary-items">
-                {cartItems.map(item => (
-                  <div className="checkout-order-item" key={item.id}>
-                    <img src={item.image} alt=""/>
-                    <div className="checkout-order-item__info">
-                      <strong>{item.name}</strong>
-                      <span>{item.category}</span>
-                      <small>{item.quantity} {item.quantity === 1 ? 'piece' : 'pieces'}</small>
-                    </div>
-                    <strong className="checkout-order-item__price">₹{(Number((item.price||'').replace(/[^0-9]/g,'')) * item.quantity).toLocaleString('en-IN')}</strong>
-                  </div>
-                ))}
-              </div>
-            </section>
+async def _do_free_single(req: ProxyRequest, loop) -> Response:
+    """Single free proxy, no race, no premium fallback. FOD shot path."""
+    prx = await loop.run_in_executor(
+        _backend_executor, _get_proxy_from_pool, "any", "fod"
+    )
+    if not prx:
+        _inc("free_single_no_pool")
+        raise HTTPException(503, "no free proxies available")
 
-            <section className="cart-fod-highlight">
-              <div className="cart-fod-highlight__gift"><span className="gift-box"><i/><b/></span></div>
-              <div><span>FOD Applied</span><strong>- ₹{fodDiscount}</strong></div>
-              <b>Offer applied</b>
-            </section>
+    proxy_url = prx.get("http", "")
+    if not proxy_url:
+        _inc("free_single_bad_proxy")
+        raise HTTPException(503, "invalid free proxy")
 
-            <section className="cart-page__section checkout-page__bill">
-              <div className="cart-page__section-header"><div><p className="app-page__eyebrow">Final calculation</p><h3>Bill Details</h3></div></div>
-              <div className="cart-bill">
-                <div><span>Product Price</span><strong>₹{cartSubtotal.toLocaleString('en-IN')}</strong></div>
-                <div><span>FOD on Product</span><strong className="cart-bill__discount">- ₹{fodDiscount}</strong></div>
-                <div><span>Cash On Delivery</span><strong>₹{codTotal.toLocaleString('en-IN')}</strong></div>
-                <div><span>Via UPI</span><strong>₹{upiTotal.toLocaleString('en-IN')}</strong></div>
-                <div className="cart-bill__total"><span>You Pay</span><strong>₹{(paymentMethod === 'UPI' ? upiTotal : codTotal).toLocaleString('en-IN')}</strong></div>
-              </div>
-            </section>
+    addr   = prx.get("addr", "")
+    method = req.method.upper()
 
-            <section className="payment-methods">
-              <button type="button" className={`payment-method ${paymentMethod === 'COD' ? 'is-selected' : ''}`} onClick={() => setPaymentMethod('COD')}>
-                <span className="payment-method__icon">₹</span>
-                <span><strong>Cash on Delivery</strong><small>Pay when your order arrives</small></span>
-                <b>₹{codTotal.toLocaleString('en-IN')}</b>
-              </button>
-              <button type="button" className={`payment-method ${paymentMethod === 'UPI' ? 'is-selected' : ''}`} onClick={() => setPaymentMethod('UPI')}>
-                <span className="payment-method__icon">UPI</span>
-                <span><strong>UPI</strong><small>Pay securely online</small></span>
-                <b>₹{upiTotal.toLocaleString('en-IN')}</b>
-              </button>
-            </section>
+    connector = aiohttp.TCPConnector(ssl=False, enable_cleanup_closed=True)
 
-            <div className="checkout-page__total">
-              <span>You Pay</span>
-              <strong>₹{(paymentMethod === 'UPI' ? upiTotal : codTotal).toLocaleString('en-IN')}</strong>
-            </div>
+    try:
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.request(
+                method=method,
+                url=req.url,
+                headers=req.headers or {},
+                json=req.body if method in ("POST", "PUT", "PATCH") else None,
+                params=req.params,
+                proxy=proxy_url,
+                timeout=aiohttp.ClientTimeout(total=req.timeout or 10),
+            ) as r:
+                raw = await r.read()
+                enc = r.headers.get("Content-Encoding", "")
+                ct  = r.headers.get("Content-Type", "application/octet-stream")
+                try:
+                    if "gzip" in enc:
+                        raw = gzip.decompress(raw)
+                    elif "deflate" in enc:
+                        raw = zlib.decompress(raw)
+                except Exception:
+                    pass
+                _inc("free_single_ok")
+                _log("free_single_ok",
+                     f"url={req.url} proxy={addr} status={r.status}")
+                return Response(content=raw, status_code=r.status, media_type=ct)
+    except asyncio.TimeoutError:
+        _inc("free_single_timeout")
+        if addr:
+            await loop.run_in_executor(_backend_executor, _report_dead_to_pool, addr)
+        raise HTTPException(504, "free single timeout")
+    except (aiohttp.ClientProxyConnectionError, aiohttp.ClientConnectionError):
+        _inc("free_single_conn_err")
+        if addr:
+            await loop.run_in_executor(_backend_executor, _report_dead_to_pool, addr)
+        raise HTTPException(502, "free proxy connection failed")
+    except Exception as e:
+        _inc("free_single_err")
+        raise HTTPException(502, f"free single failed: {e}")
 
-            <button className="cart-page__button checkout-page__place" type="button" onClick={startPaymentPage}>Place Order</button>
-            <button className="checkout-page__back" type="button" onClick={() => setCheckoutStep(false)}>Back to Cart</button>
-          </div>
-        )}
 
-        {/* ── PAYMENT ── */}
-        {paymentPage && paymentOrder && (
-          <div className="payment-page" key={paymentOrder.id}>
-            <PaymentPrintAnimation paymentOrder={paymentOrder}/>
-            {paymentOrder.paymentMethod === 'COD' ? (
-              <div className="payment-page__cod-actions">
-                <button className="cart-page__button payment-page__complete" type="button" onClick={completeOrder}>Confirm Order</button>
-                <button className="payment-page__cancel" type="button" onClick={() => { setPaymentPage(false); setPaymentOrder(null); setCheckoutStep(true); }}>Cancel</button>
-              </div>
-            ) : (
-              <div className="payment-page__upi-actions">
-                <label className={`payment-light-button payment-light-button--${paymentOrder.paymentLightColor || 'green'}${paymentChecking ? ' is-on' : ''}`} htmlFor={`payment-light-${paymentOrder.id}`}>
-                  <input id={`payment-light-${paymentOrder.id}`} name={`payment-light-${paymentOrder.id}`} type="checkbox"
-                    checked={paymentChecking}
-                    onChange={e => { const c = e.target.checked; setPaymentChecking(c); if (c) window.setTimeout(completeOrder, 350); }}/>
-                  <span className="payment-light-button__socket"/>
-                  <span className="payment-light-button__bulb">
-                    <svg fill="none" viewBox="0 0 131 151" width="22"><path strokeWidth="8" stroke="currentColor" d="M1.00043 50.4999C80.0004 57.4999 102 50.4999 102 50.4999C102 50.4999 125 45.9999 127 31.4999C129 16.9998 115 1.49988 107.5 3.49988C100 5.49988 83.5004 16.9999 83.5004 75.4999C83.5004 83.9786 83.8466 91.4701 84.4622 98.0884M1 100.5C43.5028 96.7338 69.5067 97.0201 84.4622 98.0884M84.4622 98.0884C97.3045 99.0058 102 100.5 102 100.5C102 100.5 125 105 127 119.5C129 134 115 149.5 107.5 147.5C101.087 145.79 88.0938 137.134 84.4622 98.0884Z"/></svg>
-                    <span className="payment-light-button__text">Checking payment..</span>
-                  </span>
-                </label>
-                <button className="payment-page__cancel" type="button" onClick={() => { setPaymentChecking(false); setPaymentPage(false); setPaymentOrder(null); setCheckoutStep(true); }}>Cancel</button>
-              </div>
-            )}
-          </div>
-        )}
+async def _premium_forward(req: ProxyRequest, plan: str, loop) -> Response:
+    method   = req.method.upper()
+    providers = _provider_priority(plan)
+    sticky_entry = None
 
-        {/* ── ORDERS ── */}
-        {active === 'orders' && (
-          <section className="orders-page">
-            <div className="orders-page__intro"><p className="app-page__eyebrow">MesoWeb</p><h2>Recent Orders</h2><p>Latest orders from your accounts</p></div>
-            <div className="orders-account-selector"><AccountPicker value={ordersAccountId} onChange={setOrdersAccountId} accounts={accounts} label="Account" includeAll /></div>
+    if plan == "sticky":
+        flow_key = _derive_sticky_id(req)
+        sticky_entry = await loop.run_in_executor(_backend_executor, _sticky_pin, flow_key)
+        if not sticky_entry:
+            raise HTTPException(503, "no premium provider available for sticky flow")
+        providers = [sticky_entry["provider"]]
 
-            {ordersLoading && (
-              <div className="orders-loading">
-                <FodLoader type={3} visible />
-                <span>Loading orders…</span>
-                <button type="button" onClick={() => {
-                  setOrdersLoading(true); setOrdersRetrying(true);
-                  const refresh = async () => {
-                    try {
-                      const results = await Promise.all(accounts.map(async (acc) => {
-                        const r = await fetchOrders(acc.account_id);
-                        return { acc, orders: (r.orders ?? []).map(o => ({ ...o, phone: acc.phone, accountId: acc.account_id })) };
-                      }));
-                      let nextCache = readOrdersCache();
-                      results.forEach(({ acc, orders }) => { nextCache = mergeCachedOrders(nextCache, acc.account_id, acc.phone, orders); });
-                      writeOrdersCache(nextCache);
-                      const nextOrders = getCachedOrdersForAccounts(nextCache, accounts, ordersAccountId);
-                      setOrdersList(nextOrders);
-                      setOrdersLoading(nextOrders.length === 0);
-                    } catch {} finally { setOrdersRetrying(false); }
-                  };
-                  void refresh();
-                }} disabled={ordersRetrying}>{ordersRetrying ? 'Retrying…' : 'Retry now'}</button>
-              </div>
-            )}
+    last_err = None
+    for provider in providers:
+        pinned_label = sticky_entry.get("key_label") if sticky_entry else None
+        session_id   = sticky_entry.get("session_number") if sticky_entry else None
 
-            <div className="orders-list">
-              {ordersList.map((order, i) => {
-                const statusText = typeof order.status === 'string' ? order.status : order.status?.title?.text ?? '—';
-                const dateStr = order.date ?? (order.created_date ? new Date(order.created_date).toLocaleDateString('en-IN') : '—');
-                const rawPaymentMode = order.payment_mode ?? order.payment_details?.final_payment_mode ?? '';
-                const paymentValue = String(rawPaymentMode).toLowerCase().replace(/[^a-z0-9]/g, '');
-                const isCod = /cod|cash.?on.?delivery/i.test(paymentValue);
-                const isWallet = /meesho.?balance|wallet/i.test(paymentValue);
-                const paymentLabel = isCod ? 'COD' : isWallet ? 'Wallet' : 'UPI';
-                const paymentTone = isCod ? 'cod' : isWallet ? 'wallet' : 'upi';
-                const orderName = order.product_name ?? order.productName ?? order.product_title ?? order.item_name ?? order.name ?? order.title ?? 'Order';
-                const statusClass = String(statusText).trim().toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+        result = await loop.run_in_executor(
+            _backend_executor,
+            _provider_call_sync,
+            provider, method, req.url, req.headers or {},
+            req.body if method in ("POST", "PUT", "PATCH") else None,
+            session_id, pinned_label,
+        )
 
-                return (
-                  <button type="button" className={`orders-card${orderTapState[order.sub_order_num ?? order.id ?? i] ? ' is-pressed' : ''}`}
-                    key={order.sub_order_num ?? order.id ?? i}
-                    onClick={() => handleOrderCardTap(order, order.sub_order_num ?? order.id ?? i)}
-                    onDoubleClick={(e) => { e.preventDefault(); openOrderDetails(order, order.sub_order_num ?? order.id ?? i); }}>
-                    <div className="orders-card__image-wrap">
-                      {order.product_image ? (<img className="orders-card__image" src={order.product_image} alt="" />) : (<div className="orders-card__image-fallback" aria-hidden="true">MESO</div>)}
-                    </div>
-                    <div className="orders-card__info">
-                      <div className="orders-card__name" title={orderName}>{orderName}</div>
-                      <div className="orders-card__line"><span className="orders-card__label">STATUS</span><strong className={`orders-card__status orders-card__status--${statusClass}`}>{statusText}</strong></div>
-                      <div className="orders-card__line"><span className="orders-card__label">PAYMENT</span><strong className={`orders-card__payment orders-card__payment--${paymentTone}`}>{paymentLabel}</strong></div>
-                      <div className="orders-card__footer">
-                        <span><small>ID</small><strong>{order.sub_order_num ?? order.id ?? '—'}</strong></span>
-                        <span><small>Date</small><strong>{dateStr}</strong></span>
-                      </div>
-                    </div>
-                  </button>
-                );
-              })}
-              {!ordersLoading && !ordersList.length && (<div className="orders-empty">Unable to load orders. Retrying automatically…</div>)}
-            </div>
-          </section>
-        )}
+        if result.get("success"):
+            data = result.get("data")
+            if isinstance(data, (dict, list)):
+                raw = json.dumps(data).encode()
+                ct  = "application/json"
+            else:
+                raw = str(data).encode()
+                ct  = "text/plain"
+            _inc(f"premium_ok_{provider}")
+            _log("premium_ok", f"url={req.url} provider={provider} plan={plan}")
+            return Response(content=raw, status_code=200, media_type=ct)
 
-        {selectedOrder && (
-          <OrderDetailsPage
-            order={selectedOrder}
-            accountId={selectedOrder.accountId ?? (ordersAccountId !== 'all' ? ordersAccountId : null)}
-            onClose={() => setSelectedOrder(null)}
-          />
-        )}
+        last_err = result.get("error", "unknown")
+        _inc(f"premium_fail_{provider}")
+        _log("premium_fail", f"url={req.url} provider={provider} err={last_err}")
 
-        {/* ── PROFILE ── */}
-        {active === 'profile' && (
-          <section className="profile-page">
-            <div className="profile-hero">
-              <div className="profile-avatar"><img className={profileAvatarVisible ? 'is-visible' : ''} src={profileAvatarUrl} alt="Clash Royale emote"/></div>
-              <div className="profile-hero__info"><p className="app-page__eyebrow">MesoWeb</p><h2>Meso User</h2><span>Profile & account overview</span></div>
-            </div>
+    raise HTTPException(502, f"all premium providers failed: {last_err}")
 
-            <section className="profile-details-card">
-              <div className="profile-details-card__header"><div><p className="app-page__eyebrow">Account</p><h3>Personal Details</h3></div></div>
-              <div className="profile-detail-row"><span>Name</span><strong>Meso User</strong></div>
-              <div className="profile-detail-row"><span>Primary Phone</span><strong>{accounts[0]?.phone ?? '—'}</strong></div>
-            </section>
 
-            <section className="profile-phone-card">
-              <div className="profile-details-card__header"><div><p className="app-page__eyebrow">Accounts</p><h3>Phone Numbers</h3></div><span>{accounts.length} numbers</span></div>
-              <div className="profile-phone-list">
-                {accounts.map((a, i) => (<div className="profile-phone-row" key={a.account_id}><span>{String(i + 1).padStart(2,'0')}</span><strong>{a.phone}</strong></div>))}
-                {!accounts.length && <div className="profile-phone-row"><span>—</span><strong>No accounts</strong></div>}
-              </div>
-            </section>
+@app.post("/request")
+async def proxy_request(req: ProxyRequest):
+    if ROLE != "vps":
+        raise HTTPException(400, "/request only on vps role")
 
-            <div className="profile-stats">
-              {[
-                { title: 'Total Numbers', value: String(accounts.length), tone: 'total' },
-                { title: 'Unused', value: String(accounts.filter(a => !a.last_order_status || a.last_order_status === '—').length), tone: 'unused' },
-                { title: 'Cancelled', value: String(accounts.filter(a => a.last_order_status === 'Cancelled').length), tone: 'cancelled' },
-              ].map(stat => (
-                <article className={`profile-stat profile-stat--${stat.tone}`} key={stat.title}>
-                  <span>{stat.title}</span><strong>{stat.value}</strong>
-                </article>
-              ))}
-            </div>
+    loop = asyncio.get_event_loop()
 
-            <section className="profile-referral">
-              <div><p className="app-page__eyebrow">Referral</p><h3>Referral Code</h3></div>
-              <div className={`profile-referral__input-wrap${referralEditAttempt ? ' is-shaking is-error' : ''}`}>
-                <input type="text" value="2560ev" readOnly aria-readonly="true" onClick={handleReferralAttempt} onKeyDown={handleReferralAttempt}/>
-                <button type="button" className="profile-referral__lock" onClick={handleReferralAttempt}>
-                  <svg viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
-                </button>
-              </div>
-            </section>
-          </section>
-        )}
+    # ─── Tier overrides (win over URL planning) ─────────────────────────────
+    if req.tier == "premium":
+        _inc("requests_premium_forced")
+        return await _premium_forward(req, "read", loop)
 
-        {/* ── FALLBACK ── */}
-        {active !== 'home' && active !== 'search' && active !== 'fyp' && active !== 'add-account' && active !== 'accounts' && active !== 'addresses' && active !== 'cart' && active !== 'orders' && active !== 'profile' && (
-          <div className="app-page__detail">
-            <p className="app-page__eyebrow">MesoWeb</p>
-            <h2>{actionCards.find(c => c.id === active)?.label}</h2>
-            <div className="app-page__detail-value">{actionCards.find(c => c.id === active)?.value}</div>
-            <p>{actionCards.find(c => c.id === active)?.detail}</p>
-            <button type="button" onClick={() => setActive('home')}>Back to Home</button>
-          </div>
-        )}
+    if req.tier == "free_only":
+        _inc("requests_free_only")
+        return await _do_free_single(req, loop)
 
-      </section>
+    if req.tier == "paid":
+        _inc("requests_premium_forced")
+        return await _premium_forward(req, "read", loop)
 
-      <nav className="app-nav glass-radio-group">
-        {navItems.map(item => (
-          <React.Fragment key={item.id}>
-            <input type="radio" name="mesoweb-nav" id={'glass-' + item.id}
-              checked={active === item.id}
-              onChange={() => { setPaymentPage(false); setPaymentOrder(null); setActive(item.id); }}/>
-            <label htmlFor={'glass-' + item.id}>{item.label}</label>
-          </React.Fragment>
-        ))}
-        <div className="glass-glider"/>
-      </nav>
+    # FOD URLs with tier="any" default to free_only — never race, never burn
+    # premium. Index.py always sends explicit tier, this is a safety net.
+    if _is_fod_url(req.url) and req.tier == "any":
+        _inc("requests_fod_default_free")
+        return await _do_free_single(req, loop)
 
-      {orderPlacedOverlay && (
-        <div className="order-placed-overlay" role="status" aria-live="polite">
-          <div className="order-placed-overlay__confetti">{Array.from({ length: 24 }, (_, i) => <i key={i}/>)}</div>
-          <div className="order-placed-overlay__card">
-            <div className="order-placed-overlay__check">✓</div>
-            <p className="app-page__eyebrow">MesoWeb</p>
-            <h2>Order Placed</h2>
-            <span>{paymentOrder?.id}</span>
-          </div>
-        </div>
-      )}
-    </main>
-  );
-}
+    # ─── URL-based planning ─────────────────────────────────────────────────
+    plan = _plan_for_url(req.url)
+
+    if plan == "read":
+        _inc("requests_read")
+        result = await _do_free_race(req, loop)
+        if result is not None:
+            return result
+        return await _premium_forward(req, "read", loop)
+
+    if plan == "write":
+        _inc("requests_write")
+        return await _premium_forward(req, "write", loop)
+
+    if plan == "sticky":
+        _inc("requests_sticky")
+        return await _premium_forward(req, "sticky", loop)
+
+    raise HTTPException(500, "unknown plan")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VPS KEY MANAGEMENT — VPS handles, dashboard forwards
+# ═══════════════════════════════════════════════════════════════════════════════
+class AddKeyRequest(BaseModel):
+    provider:      str
+    key:           str
+    label:         Optional[str] = ""
+    credits_limit: Optional[int] = None
+
+class RemoveKeyRequest(BaseModel):
+    key:   Optional[str] = None
+    label: Optional[str] = None
+
+
+def _vps_forward(method: str, path: str, body=None) -> tuple[int, dict]:
+    base = PEERS.get("vps", "").rstrip("/")
+    if not base:
+        return 503, {"error": "vps not configured"}
+    try:
+        r = requests.request(
+            method, f"{base}{path}",
+            json=body,
+            headers={"X-Secret": SHARED_SECRET},
+            timeout=15,
+        )
+        try:
+            data = r.json() if r.content else {}
+        except Exception:
+            data = {"raw": r.text[:300]}
+        return r.status_code, data
+    except Exception as e:
+        return 502, {"error": str(e)}
+
+
+@app.post("/keys/add")
+async def add_key(req: AddKeyRequest):
+    if ROLE == "dashboard":
+        loop = asyncio.get_event_loop()
+        code, body = await loop.run_in_executor(
+            _api_executor, _vps_forward, "POST", "/keys/add", req.dict(),
+        )
+        if code >= 400:
+            raise HTTPException(code, body.get("detail", body.get("error", "vps error")))
+        return body
+
+    if ROLE != "vps":
+        raise HTTPException(400, "keys only on vps or dashboard")
+
+    provider = req.provider.strip().lower()
+    if provider not in PROVIDERS:
+        raise HTTPException(400, f"provider must be one of {PROVIDERS}")
+
+    auto_label = req.label or f"{provider}-{req.key[:8]}"
+    with _keys_lock:
+        if any(k["key"] == req.key for k in _keys):
+            raise HTTPException(400, "key already exists")
+        existing = {k["label"] for k in _keys}
+        final    = auto_label
+        suffix   = 2
+        while final in existing:
+            final = f"{auto_label}-{suffix}"
+            suffix += 1
+        entry = {
+            "provider":      provider,
+            "key":           req.key,
+            "label":         final,
+            "credits_limit": req.credits_limit or DEFAULT_CREDIT_LIMITS.get(provider, 1000),
+            "credits_used":  0,
+            "reset_at":      0,
+            "last_used":     0,
+            "credit_source": "local",
+            "last_sync":     0,
+        }
+        _keys.append(entry)
+    _save_keys()
+    return {"status": "ok", "label": final, "provider": provider}
+
+
+@app.delete("/keys/remove")
+async def remove_key(req: RemoveKeyRequest):
+    if ROLE == "dashboard":
+        loop = asyncio.get_event_loop()
+        code, body = await loop.run_in_executor(
+            _api_executor, _vps_forward, "DELETE", "/keys/remove", req.dict(),
+        )
+        if code >= 400:
+            raise HTTPException(code, body.get("detail", body.get("error", "vps error")))
+        return body
+
+    if ROLE != "vps":
+        raise HTTPException(400, "keys only on vps or dashboard")
+
+    with _keys_lock:
+        if req.key:
+            entry = next((k for k in _keys if k["key"] == req.key), None)
+        elif req.label:
+            entry = next((k for k in _keys if k["label"] == req.label), None)
+        else:
+            raise HTTPException(400, "key or label required")
+        if not entry:
+            raise HTTPException(404, "key not found")
+        label    = entry["label"]
+        _keys[:] = [k for k in _keys if k["label"] != label]
+    _save_keys()
+    return {"status": "ok", "removed": label}
+
+
+@app.get("/keys/list")
+async def list_keys():
+    if ROLE == "dashboard":
+        loop = asyncio.get_event_loop()
+        code, body = await loop.run_in_executor(
+            _api_executor, _vps_forward, "GET", "/keys/list",
+        )
+        if code >= 400:
+            raise HTTPException(code, body.get("detail", body.get("error", "vps error")))
+        return body
+
+    if ROLE != "vps":
+        raise HTTPException(400, "keys only on vps or dashboard")
+
+    with _keys_lock:
+        return [
+            {
+                "label":    k["label"],
+                "provider": k["provider"],
+                "hint":     f"***{k['key'][-6:]}" if k.get("key") else "",
+            }
+            for k in _keys
+        ]
+
+
+@app.get("/keys/stats")
+async def keys_stats():
+    if ROLE == "dashboard":
+        loop = asyncio.get_event_loop()
+        code, body = await loop.run_in_executor(
+            _api_executor, _vps_forward, "GET", "/keys/stats",
+        )
+        if code >= 400:
+            raise HTTPException(code, body.get("detail", body.get("error", "vps error")))
+        return body
+
+    if ROLE != "vps":
+        raise HTTPException(400, "keys only on vps or dashboard")
+
+    with _keys_lock:
+        keys = [dict(k) for k in _keys]
+
+    by_provider: dict[str, dict] = defaultdict(
+        lambda: {"keys": 0, "live": 0, "total_credits": 0, "used_credits": 0}
+    )
+    out_keys = []
+    for k in keys:
+        prov  = k.get("provider", "")
+        limit = int(k.get("credits_limit")
+                    or DEFAULT_CREDIT_LIMITS.get(prov, 0))
+        used  = int(k.get("credits_used") or 0)
+        live  = used < limit
+        out_keys.append({
+            "label":         k.get("label"),
+            "provider":      prov,
+            "credits_limit": limit,
+            "credits_used":  used,
+            "live":          live,
+            "last_used":     k.get("last_used", 0),
+            "credit_source": k.get("credit_source", "local"),
+            "last_sync":     k.get("last_sync", 0),
+            "hint":          f"***{k['key'][-6:]}" if k.get("key") else "",
+        })
+        block = by_provider[prov]
+        block["keys"]          += 1
+        block["total_credits"] += limit
+        block["used_credits"]  += used
+        if live:
+            block["live"] += 1
+
+    return {"providers": dict(by_provider), "keys": out_keys}
+
+
+@app.post("/keys/sync")
+async def keys_sync(x_secret: Optional[str] = Header(None)):
+    if ROLE == "dashboard":
+        loop = asyncio.get_event_loop()
+        code, body = await loop.run_in_executor(
+            _api_executor, _vps_forward, "POST", "/keys/sync",
+        )
+        if code >= 400:
+            raise HTTPException(code, body.get("detail", body.get("error", "vps error")))
+        return body
+
+    if ROLE != "vps":
+        raise HTTPException(400, "keys only on vps or dashboard")
+
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(_api_executor, _sync_all_keys)
+    return result
+
+
+@app.post("/keys/reset-credits")
+async def keys_reset_credits(x_secret: Optional[str] = Header(None)):
+    if ROLE == "dashboard":
+        loop = asyncio.get_event_loop()
+        code, body = await loop.run_in_executor(
+            _api_executor, _vps_forward, "POST", "/keys/reset-credits",
+        )
+        if code >= 400:
+            raise HTTPException(code, body.get("detail", body.get("error", "vps error")))
+        return body
+
+    if x_secret != SHARED_SECRET:
+        raise HTTPException(403, "invalid secret")
+    if ROLE != "vps":
+        raise HTTPException(400, "keys only on vps or dashboard")
+
+    with _keys_lock:
+        for k in _keys:
+            k["credits_used"] = 0
+            k["reset_at"]     = 0
+            k["credit_source"] = "local"
+    _save_keys()
+    return {"status": "ok", "reset": len(_keys)}
+
+
+# ── Dashboard / pool root ─────────────────────────────────────────────────────
+@app.get("/")
+def root():
+    if ROLE in ("pool", "dashboard"):
+        dash = BASE / "static" / "dashboard.html"
+        if dash.exists():
+            return HTMLResponse(dash.read_text())
+        return HTMLResponse(
+            "<h2>ProxyStack v2</h2>"
+            "<p>dashboard.html not found — drop it in /static/</p>"
+            "<p><a href='/stats'>stats JSON</a> | "
+            "<a href='/stream/stats'>SSE stream</a></p>"
+        )
+    return {"role": ROLE, "status": "running"}
