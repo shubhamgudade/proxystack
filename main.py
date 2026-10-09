@@ -31,6 +31,10 @@ VPS (premium providers):
   sticky  → premium sticky pin (ScraperAPI → ScrapeOps); login + checkout
   free_only → single free proxy, no race, no fallback (FOD free shots)
   premium → premium rotating, no race, no free (FOD premium shots, anon session xo)
+
+Credit sync:
+  POST /keys/sync  → pulls real credits from each provider API, updates keys.json
+                     credit_source becomes "api" for synced keys, "local" otherwise
 """
 
 import asyncio
@@ -418,7 +422,12 @@ SCRAPINGANT_ENDPOINT = "https://api.scrapingant.com/v2/general"
 SCRAPERAPI_ENDPOINT  = "https://api.scraperapi.com/"
 SCRAPEOPS_ENDPOINT   = "https://proxy.scrapeops.io/v1/"
 
+SCRAPINGANT_USAGE_URL = "https://api.scrapingant.com/v2/usage"
+SCRAPERAPI_USAGE_URL  = "https://api.scraperapi.com/account"
+SCRAPEOPS_USAGE_URL   = "https://backend.scrapeops.io/v1/proxy/account/usage"
+
 PREMIUM_TIMEOUT_S = 5
+USAGE_TIMEOUT_S   = 8
 
 _scrapingant_sem = threading.Semaphore(1)
 
@@ -602,6 +611,136 @@ _PROVIDER_CALLS = {
     "scraperapi":  _call_scraperapi,
     "scrapeops":   _call_scrapeops,
 }
+
+
+# ─── Provider credit fetchers ────────────────────────────────────────────────
+# Each returns (credits_limit, credits_used, reset_at) or raises.
+# Reset times are best-effort: parsed to epoch seconds, 0 if unparseable.
+
+def _parse_iso_epoch(s) -> float:
+    if not s:
+        return 0.0
+    try:
+        s2 = str(s).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s2)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return 0.0
+
+
+def _fetch_scrapingant_credits(api_key: str) -> tuple[int, int, float]:
+    r = requests.get(
+        SCRAPINGANT_USAGE_URL,
+        params={"x-api-key": api_key},
+        timeout=USAGE_TIMEOUT_S,
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"http {r.status_code}: {r.text[:120]}")
+    j = r.json()
+    total = int(j.get("plan_total_credits") or 0)
+    rem   = int(j.get("remained_credits") or 0)
+    used  = max(0, total - rem)
+    reset = _parse_iso_epoch(j.get("end_date"))
+    return total, used, reset
+
+
+def _fetch_scraperapi_credits(api_key: str) -> tuple[int, int, float]:
+    r = requests.get(
+        SCRAPERAPI_USAGE_URL,
+        params={"api_key": api_key},
+        timeout=USAGE_TIMEOUT_S,
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"http {r.status_code}: {r.text[:120]}")
+    j = r.json()
+    limit = int(j.get("requestLimit") or 0)
+    used  = int(j.get("requestCount") or 0)
+    reset = _parse_iso_epoch(j.get("nextBillingDate"))
+    return limit, used, reset
+
+
+def _fetch_scrapeops_credits(api_key: str) -> tuple[int, int, float]:
+    r = requests.get(
+        SCRAPEOPS_USAGE_URL,
+        params={"api_key": api_key},
+        timeout=USAGE_TIMEOUT_S,
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"http {r.status_code}: {r.text[:120]}")
+    j = r.json()
+    inner = j.get("results") or j
+
+    def _int(v) -> int:
+        try:
+            return int(float(str(v)))
+        except Exception:
+            return 0
+
+    limit = _int(inner.get("plan_api_credits"))
+    used  = _int(inner.get("used_api_credits"))
+    reset = _parse_iso_epoch(inner.get("plan_renewal_date"))
+    return limit, used, reset
+
+
+_USAGE_FETCHERS = {
+    "scrapingant": _fetch_scrapingant_credits,
+    "scraperapi":  _fetch_scraperapi_credits,
+    "scrapeops":   _fetch_scrapeops_credits,
+}
+
+
+def _sync_one_key(key_dict: dict) -> dict:
+    provider = key_dict.get("provider", "")
+    fn = _USAGE_FETCHERS.get(provider)
+    if not fn:
+        return {
+            "label":  key_dict.get("label"),
+            "provider": provider,
+            "ok":     False,
+            "error":  f"no usage fetcher for {provider}",
+        }
+    try:
+        limit, used, reset = fn(key_dict.get("key", ""))
+    except Exception as e:
+        return {
+            "label":  key_dict.get("label"),
+            "provider": provider,
+            "ok":     False,
+            "error":  str(e),
+        }
+    with _keys_lock:
+        key_dict["credits_limit"] = limit
+        key_dict["credits_used"]  = used
+        key_dict["reset_at"]      = reset
+        key_dict["credit_source"] = "api"
+        key_dict["last_sync"]     = time.time()
+    return {
+        "label":         key_dict.get("label"),
+        "provider":      provider,
+        "ok":            True,
+        "credits_limit": limit,
+        "credits_used":  used,
+        "reset_at":      reset,
+    }
+
+
+def _sync_all_keys() -> dict:
+    with _keys_lock:
+        snapshot = list(_keys)
+    results = []
+    for k in snapshot:
+        results.append(_sync_one_key(k))
+    _save_keys()
+    ok_count   = sum(1 for r in results if r["ok"])
+    fail_count = len(results) - ok_count
+    return {
+        "ok":      ok_count,
+        "failed":  fail_count,
+        "total":   len(results),
+        "results": results,
+    }
 
 
 def _provider_priority(plan: str) -> list[str]:
@@ -1457,6 +1596,10 @@ def _load_keys():
                     entry["reset_at"] = 0
                 if "last_used" not in entry:
                     entry["last_used"] = 0
+                if "credit_source" not in entry:
+                    entry["credit_source"] = "local"
+                if "last_sync" not in entry:
+                    entry["last_sync"] = 0
                 _keys.append(entry)
         print(f"[persist] loaded {len(data)} keys", flush=True)
     except Exception as e:
@@ -1996,7 +2139,7 @@ def _vps_forward(method: str, path: str, body=None) -> tuple[int, dict]:
             method, f"{base}{path}",
             json=body,
             headers={"X-Secret": SHARED_SECRET},
-            timeout=8,
+            timeout=15,
         )
         try:
             data = r.json() if r.content else {}
@@ -2043,6 +2186,8 @@ async def add_key(req: AddKeyRequest):
             "credits_used":  0,
             "reset_at":      0,
             "last_used":     0,
+            "credit_source": "local",
+            "last_sync":     0,
         }
         _keys.append(entry)
     _save_keys()
@@ -2137,6 +2282,8 @@ async def keys_stats():
             "credits_used":  used,
             "live":          live,
             "last_used":     k.get("last_used", 0),
+            "credit_source": k.get("credit_source", "local"),
+            "last_sync":     k.get("last_sync", 0),
             "hint":          f"***{k['key'][-6:]}" if k.get("key") else "",
         })
         block = by_provider[prov]
@@ -2147,6 +2294,25 @@ async def keys_stats():
             block["live"] += 1
 
     return {"providers": dict(by_provider), "keys": out_keys}
+
+
+@app.post("/keys/sync")
+async def keys_sync(x_secret: Optional[str] = Header(None)):
+    if ROLE == "dashboard":
+        loop = asyncio.get_event_loop()
+        code, body = await loop.run_in_executor(
+            _api_executor, _vps_forward, "POST", "/keys/sync",
+        )
+        if code >= 400:
+            raise HTTPException(code, body.get("detail", body.get("error", "vps error")))
+        return body
+
+    if ROLE != "vps":
+        raise HTTPException(400, "keys only on vps or dashboard")
+
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(_api_executor, _sync_all_keys)
+    return result
 
 
 @app.post("/keys/reset-credits")
@@ -2169,6 +2335,7 @@ async def keys_reset_credits(x_secret: Optional[str] = Header(None)):
         for k in _keys:
             k["credits_used"] = 0
             k["reset_at"]     = 0
+            k["credit_source"] = "local"
     _save_keys()
     return {"status": "ok", "reset": len(_keys)}
 
