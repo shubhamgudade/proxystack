@@ -29,6 +29,8 @@ VPS (premium providers):
   read    → free race (3s, 6 parallel) → premium fallback (ScraperAPI → ScrapeOps → ScrapingAnt)
   write   → premium only (ScrapingAnt serial → ScraperAPI → ScrapeOps)
   sticky  → premium sticky pin (ScraperAPI → ScrapeOps); login + checkout
+  free_only → single free proxy, no race, no fallback (FOD free shots)
+  premium → premium rotating, no race, no free (FOD premium shots, anon session xo)
 """
 
 import asyncio
@@ -183,6 +185,10 @@ WRITE_URL_FRAGMENTS = [
     "/api/2.0/orders/",
 ]
 
+# FOD URLs are NOT raceable — index.py fires them in parallel with explicit
+# tier="free_only" or tier="premium". Anon session (search/recs) uses these
+# same URLs but sends tier="premium" explicitly. If tier="any" arrives for
+# a FOD URL, default to free_only (never race, never burn premium).
 RACEABLE_URL_FRAGMENTS = [
     "/api/3.0/search/suggest",
     "/api/3.0/anonymous/search/suggest",
@@ -197,9 +203,6 @@ RACEABLE_URL_FRAGMENTS = [
     "/api/4.0/anonymous/for-you",
     "/api/3.0/user/orders",
     "/api/3.0/user/order-details",
-    "/api/1.0/anonymous/fod-personalisation",
-    "/api/1.0/anonymous/config",
-    "/api/1.0/anonymous/referral-app-install",
 ]
 
 
@@ -237,7 +240,7 @@ def _plan_for_url(url: str) -> str:
     return "read"
 
 
-def _is_fod_hunt(url: str) -> bool:
+def _is_fod_url(url: str) -> bool:
     path = _url_path(url)
     return any(path.startswith(p) for p in FOD_HUNT_PATHS)
 
@@ -727,6 +730,13 @@ def _gh_headers() -> dict:
     if GITHUB_TOKEN:
         h["Authorization"] = f"Bearer {GITHUB_TOKEN}"
     return h
+
+def _sticky_key(headers) -> str:
+    if not headers:
+        return ""
+    low = {str(k).lower(): v for k, v in headers.items()}
+    k = low.get("app-session-id") or low.get("instance-id")
+    return f"fod:{k}" if k else ""
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SOURCE FETCHERS
@@ -1813,6 +1823,65 @@ async def _do_free_race(req: ProxyRequest, loop) -> Optional[Response]:
     return None
 
 
+async def _do_free_single(req: ProxyRequest, loop) -> Response:
+    """Single free proxy, no race, no premium fallback. FOD shot path."""
+    prx = await loop.run_in_executor(
+        _backend_executor, _get_proxy_from_pool, "any", "fod"
+    )
+    if not prx:
+        _inc("free_single_no_pool")
+        raise HTTPException(503, "no free proxies available")
+
+    proxy_url = prx.get("http", "")
+    if not proxy_url:
+        _inc("free_single_bad_proxy")
+        raise HTTPException(503, "invalid free proxy")
+
+    addr   = prx.get("addr", "")
+    method = req.method.upper()
+
+    connector = aiohttp.TCPConnector(ssl=False, enable_cleanup_closed=True)
+
+    try:
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.request(
+                method=method,
+                url=req.url,
+                headers=req.headers or {},
+                json=req.body if method in ("POST", "PUT", "PATCH") else None,
+                params=req.params,
+                proxy=proxy_url,
+                timeout=aiohttp.ClientTimeout(total=req.timeout or 10),
+            ) as r:
+                raw = await r.read()
+                enc = r.headers.get("Content-Encoding", "")
+                ct  = r.headers.get("Content-Type", "application/octet-stream")
+                try:
+                    if "gzip" in enc:
+                        raw = gzip.decompress(raw)
+                    elif "deflate" in enc:
+                        raw = zlib.decompress(raw)
+                except Exception:
+                    pass
+                _inc("free_single_ok")
+                _log("free_single_ok",
+                     f"url={req.url} proxy={addr} status={r.status}")
+                return Response(content=raw, status_code=r.status, media_type=ct)
+    except asyncio.TimeoutError:
+        _inc("free_single_timeout")
+        if addr:
+            await loop.run_in_executor(_backend_executor, _report_dead_to_pool, addr)
+        raise HTTPException(504, "free single timeout")
+    except (aiohttp.ClientProxyConnectionError, aiohttp.ClientConnectionError):
+        _inc("free_single_conn_err")
+        if addr:
+            await loop.run_in_executor(_backend_executor, _report_dead_to_pool, addr)
+        raise HTTPException(502, "free proxy connection failed")
+    except Exception as e:
+        _inc("free_single_err")
+        raise HTTPException(502, f"free single failed: {e}")
+
+
 async def _premium_forward(req: ProxyRequest, plan: str, loop) -> Response:
     method   = req.method.upper()
     providers = _provider_priority(plan)
@@ -1864,10 +1933,26 @@ async def proxy_request(req: ProxyRequest):
 
     loop = asyncio.get_event_loop()
 
-    if req.tier in ("premium", "paid"):
+    # ─── Tier overrides (win over URL planning) ─────────────────────────────
+    if req.tier == "premium":
         _inc("requests_premium_forced")
         return await _premium_forward(req, "read", loop)
 
+    if req.tier == "free_only":
+        _inc("requests_free_only")
+        return await _do_free_single(req, loop)
+
+    if req.tier == "paid":
+        _inc("requests_premium_forced")
+        return await _premium_forward(req, "read", loop)
+
+    # FOD URLs with tier="any" default to free_only — never race, never burn
+    # premium. Index.py always sends explicit tier, this is a safety net.
+    if _is_fod_url(req.url) and req.tier == "any":
+        _inc("requests_fod_default_free")
+        return await _do_free_single(req, loop)
+
+    # ─── URL-based planning ─────────────────────────────────────────────────
     plan = _plan_for_url(req.url)
 
     if plan == "read":
@@ -1889,7 +1974,7 @@ async def proxy_request(req: ProxyRequest):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# VPS KEY MANAGEMENT
+# VPS KEY MANAGEMENT — VPS handles, dashboard forwards
 # ═══════════════════════════════════════════════════════════════════════════════
 class AddKeyRequest(BaseModel):
     provider:      str
@@ -1898,13 +1983,44 @@ class AddKeyRequest(BaseModel):
     credits_limit: Optional[int] = None
 
 class RemoveKeyRequest(BaseModel):
-    key: str
+    key:   Optional[str] = None
+    label: Optional[str] = None
+
+
+def _vps_forward(method: str, path: str, body=None) -> tuple[int, dict]:
+    base = PEERS.get("vps", "").rstrip("/")
+    if not base:
+        return 503, {"error": "vps not configured"}
+    try:
+        r = requests.request(
+            method, f"{base}{path}",
+            json=body,
+            headers={"X-Secret": SHARED_SECRET},
+            timeout=8,
+        )
+        try:
+            data = r.json() if r.content else {}
+        except Exception:
+            data = {"raw": r.text[:300]}
+        return r.status_code, data
+    except Exception as e:
+        return 502, {"error": str(e)}
 
 
 @app.post("/keys/add")
 async def add_key(req: AddKeyRequest):
+    if ROLE == "dashboard":
+        loop = asyncio.get_event_loop()
+        code, body = await loop.run_in_executor(
+            _api_executor, _vps_forward, "POST", "/keys/add", req.dict(),
+        )
+        if code >= 400:
+            raise HTTPException(code, body.get("detail", body.get("error", "vps error")))
+        return body
+
     if ROLE != "vps":
-        raise HTTPException(400, "keys only on vps role")
+        raise HTTPException(400, "keys only on vps or dashboard")
+
     provider = req.provider.strip().lower()
     if provider not in PROVIDERS:
         raise HTTPException(400, f"provider must be one of {PROVIDERS}")
@@ -1935,22 +2051,47 @@ async def add_key(req: AddKeyRequest):
 
 @app.delete("/keys/remove")
 async def remove_key(req: RemoveKeyRequest):
+    if ROLE == "dashboard":
+        loop = asyncio.get_event_loop()
+        code, body = await loop.run_in_executor(
+            _api_executor, _vps_forward, "DELETE", "/keys/remove", req.dict(),
+        )
+        if code >= 400:
+            raise HTTPException(code, body.get("detail", body.get("error", "vps error")))
+        return body
+
     if ROLE != "vps":
-        raise HTTPException(400, "keys only on vps role")
+        raise HTTPException(400, "keys only on vps or dashboard")
+
     with _keys_lock:
-        entry = next((k for k in _keys if k["key"] == req.key), None)
+        if req.key:
+            entry = next((k for k in _keys if k["key"] == req.key), None)
+        elif req.label:
+            entry = next((k for k in _keys if k["label"] == req.label), None)
+        else:
+            raise HTTPException(400, "key or label required")
         if not entry:
             raise HTTPException(404, "key not found")
-        label = entry["label"]
-        _keys[:] = [k for k in _keys if k["key"] != req.key]
+        label    = entry["label"]
+        _keys[:] = [k for k in _keys if k["label"] != label]
     _save_keys()
     return {"status": "ok", "removed": label}
 
 
 @app.get("/keys/list")
 async def list_keys():
+    if ROLE == "dashboard":
+        loop = asyncio.get_event_loop()
+        code, body = await loop.run_in_executor(
+            _api_executor, _vps_forward, "GET", "/keys/list",
+        )
+        if code >= 400:
+            raise HTTPException(code, body.get("detail", body.get("error", "vps error")))
+        return body
+
     if ROLE != "vps":
-        raise HTTPException(400, "keys only on vps role")
+        raise HTTPException(400, "keys only on vps or dashboard")
+
     with _keys_lock:
         return [
             {
@@ -1964,8 +2105,18 @@ async def list_keys():
 
 @app.get("/keys/stats")
 async def keys_stats():
+    if ROLE == "dashboard":
+        loop = asyncio.get_event_loop()
+        code, body = await loop.run_in_executor(
+            _api_executor, _vps_forward, "GET", "/keys/stats",
+        )
+        if code >= 400:
+            raise HTTPException(code, body.get("detail", body.get("error", "vps error")))
+        return body
+
     if ROLE != "vps":
-        raise HTTPException(400, "keys only on vps role")
+        raise HTTPException(400, "keys only on vps or dashboard")
+
     with _keys_lock:
         keys = [dict(k) for k in _keys]
 
@@ -1995,18 +2146,25 @@ async def keys_stats():
         if live:
             block["live"] += 1
 
-    return {
-        "providers": dict(by_provider),
-        "keys":      out_keys,
-    }
+    return {"providers": dict(by_provider), "keys": out_keys}
 
 
 @app.post("/keys/reset-credits")
 async def keys_reset_credits(x_secret: Optional[str] = Header(None)):
+    if ROLE == "dashboard":
+        loop = asyncio.get_event_loop()
+        code, body = await loop.run_in_executor(
+            _api_executor, _vps_forward, "POST", "/keys/reset-credits",
+        )
+        if code >= 400:
+            raise HTTPException(code, body.get("detail", body.get("error", "vps error")))
+        return body
+
     if x_secret != SHARED_SECRET:
         raise HTTPException(403, "invalid secret")
     if ROLE != "vps":
-        raise HTTPException(400, "keys only on vps role")
+        raise HTTPException(400, "keys only on vps or dashboard")
+
     with _keys_lock:
         for k in _keys:
             k["credits_used"] = 0
