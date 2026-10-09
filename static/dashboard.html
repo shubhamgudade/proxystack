@@ -667,7 +667,8 @@ function ingest(data) {
   const poolNode = nodes['pool'] || (data.role === 'pool' ? data : null);
   if (poolNode && !poolNode.error) {
     renderPool(poolNode);
-    renderCallerPicks(poolNode.caller_picks || {});
+    const cp = poolNode.caller_picks || {};
+    renderCallerPicks(cp.lifetime || cp);
     renderLog(poolNode);
   }
 
@@ -685,22 +686,23 @@ function ingest(data) {
 function renderPool(d) {
   const f  = d.free || {};
   const cn = d.counters || {};
+  const life = cn.lifetime || cn;
   const live = f.live || 0;
 
   set('pool-live', live);
   set('pool-f30',  f.fresh_30s  || 0);
   set('pool-f120', f.fresh_120s || 0);
-  set('pool-evicted',      cn.pool_evicted || 0);
-  set('pool-picks',        cn.pool_picks   || 0);
-  set('pool-recheck-pass', cn.recheck_pass || 0);
-  set('pool-recheck-fail', cn.recheck_fail || 0);
+  set('pool-evicted',      life.pool_evicted || 0);
+  set('pool-picks',        life.pool_picks   || 0);
+  set('pool-recheck-pass', life.recheck_pass || 0);
+  set('pool-recheck-fail', life.recheck_fail || 0);
   set('cnt-flash',   f.flash   || 0);
   set('cnt-panther', f.panther || 0);
   set('cnt-lantern', f.lantern || 0);
   set('cnt-deadass', f.deadass || 0);
   set('hdr-live',  live);
   set('hdr-fresh', f.fresh_30s || 0);
-  set('hdr-picks', cn.pool_picks || 0);
+  set('hdr-picks', life.pool_picks || 0);
 
   const pct = n => live > 0 ? Math.min(100, Math.round((n/live)*100)) : 0;
   bar('bar-flash',   'pct-flash',   pct(f.flash   || 0));
@@ -740,7 +742,7 @@ function renderPipeline() {
   let fetched=0,checked=0,passed=0,failed=0,commits=0,cycles=0,outbuf=0,checkq=0;
   ROLES.forEach(({role}) => {
     const s = store[role]; if (!s) return;
-    const c = s.counters;
+    const c = (s.counters || {}).lifetime || s.counters || {};
     const passSum = (c.check_pass_flash||0)+(c.check_pass_panther||0)+(c.check_pass_lantern||0)+(c.check_pass_deadass||0);
     passed  += passSum;
     failed  += c.check_fail || 0;
@@ -791,13 +793,21 @@ function renderCheckers() {
           <div>commits <span id="cp-commit-${role}">0</span></div>
           <div>cycles  <span id="cp-cycle-${role}">0</span></div>
           <div>outbuf  <span id="cp-obuf-${role}">0</span></div>
+        </div>
+        <div class="checker-nums" style="margin-top:5px;border-top:1px solid var(--border);padding-top:5px;">
+          <div style="color:var(--muted);font-size:8px;letter-spacing:.08em">CYCLE</div>
+          <div>pass <span id="cp-cpass-${role}">—</span></div>
+          <div>fail <span id="cp-cfail-${role}">—</span></div>
         </div>`;
       grid.appendChild(card);
     }
     if (!s) return;
-    const c     = s.counters;
+    const c     = (s.counters || {}).lifetime || s.counters || {};
+    const cyc   = (s.counters || {}).cycle || {};
     const passS = (c.check_pass_flash||0)+(c.check_pass_panther||0)+(c.check_pass_lantern||0)+(c.check_pass_deadass||0);
     const failS = c.check_fail || 0;
+    const cpass = (cyc.check_pass_flash||0)+(cyc.check_pass_panther||0)+(cyc.check_pass_lantern||0)+(cyc.check_pass_deadass||0);
+    const cfail = cyc.check_fail || 0;
     const total = passS + failS;
     const pct   = total > 0 ? Math.min(100, Math.round((passS/total)*100)) : 0;
     const age   = lastTs - (s.ts || 0);
@@ -806,6 +816,8 @@ function renderCheckers() {
     stEl.className   = `checker-status ${age > 20 ? 'err' : 'ok'}`;
     set(`cp-pass-${role}`,   fmt(passS));
     set(`cp-fail-${role}`,   fmt(failS));
+    set(`cp-cpass-${role}`,  fmt(cpass));
+    set(`cp-cfail-${role}`,  fmt(cfail));
     set(`cp-q-${role}`,      s.queues.check || 0);
     set(`cp-commit-${role}`, c.commits_detected || 0);
     set(`cp-cycle-${role}`,  c.cycle_fetches    || 0);
