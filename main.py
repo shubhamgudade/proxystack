@@ -1,4 +1,3 @@
-
 """
 ProxyStack v2 — Simplified Distributed Proxy Gateway
 =====================================================
@@ -8,7 +7,7 @@ ROLES:
   checker_1  through checker_10 → fetch from source slice, check meesho, push to pool
   pool       → Omen  — ingest, pick, dead, recheck, persist, dashboard SSE
   dashboard  → Yoru  — stats aggregator + dashboard UI
-  vps        → Oracle — /request, pinger, paid proxies, main app API
+  vps        → Oracle — /request, pinger, premium providers, main app API
 
 Pipeline (per checker):
   Boot → fetch latest 500 from my sources → check meesho → push live → pool
@@ -25,10 +24,16 @@ Pool:
   recheck    → every 8min, proxies older than 5min → meesho check → evict if dead
   hard TTL   → 15min evict regardless
   dashboard  → served here, SSE /stream/stats
+
+VPS (premium providers):
+  read    → free race (3s, 6 parallel) → premium fallback (ScraperAPI → ScrapeOps → ScrapingAnt)
+  write   → premium only (ScrapingAnt serial → ScraperAPI → ScrapeOps)
+  sticky  → premium sticky pin (ScraperAPI → ScrapeOps); login + checkout
 """
 
 import asyncio
 import gzip
+import hashlib
 import json
 import os
 import random
@@ -43,6 +48,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 import aiohttp
 import requests
@@ -64,7 +70,6 @@ SHARED_SECRET = os.getenv("SHARED_SECRET", "changeme")
 PORT          = int(os.getenv("PORT", "8080"))
 GITHUB_TOKEN  = os.getenv("GITHUB_TOKEN", "")
 
-# ─── Peer URLs ────────────────────────────────────────────────────────────────
 PEERS = {
     "checker_1":  os.getenv("PEER_CHECKER_1",  "https://ps-brimstone.onrender.com"),
     "checker_2":  os.getenv("PEER_CHECKER_2",  "https://ps-viper.onrender.com"),
@@ -84,7 +89,7 @@ PEERS = {
 CHECKER_ROLES = [f"checker_{i}" for i in range(1, 11)]
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CALLER IDENTIFICATION — port → label, logged only, no blocking
+# CALLER IDENTIFICATION
 # ═══════════════════════════════════════════════════════════════════════════════
 CALLER_PORT_MAP: dict[int, str] = {
     8001: "MesoWebBackend",
@@ -103,38 +108,34 @@ def _identify_caller(request: Request) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 BASE         = Path(__file__).parent
 PERSIST_FREE = BASE / "proxy_live.json"
-PERSIST_PAID = BASE / "paid_live.json"
 KEYS_FILE    = BASE / "keys.json"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TUNING
 # ═══════════════════════════════════════════════════════════════════════════════
-BOOT_FETCH_COUNT    = 500      # proxies to fetch on boot
-COMMIT_FETCH_COUNT  = 1000     # proxies to fetch per new commit
-CYCLE_FETCH_COUNT   = 500      # proxies per normal cycle
-COMMIT_POLL_S       = 60       # how often to poll for new commits
-CHECK_CONCURRENCY   = 150      # concurrent meesho checks per checker
-CHECK_TIMEOUT_S     = 12       # meesho check timeout
-FETCH_WORKERS       = 20       # concurrent source fetchers
-SEEN_TTL_S          = 3600     # 1hr — don't recheck same proxy in cycle
+BOOT_FETCH_COUNT    = 500
+COMMIT_FETCH_COUNT  = 1000
+CYCLE_FETCH_COUNT   = 500
+COMMIT_POLL_S       = 60
+CHECK_CONCURRENCY   = 150
+CHECK_TIMEOUT_S     = 12
+FETCH_WORKERS       = 20
+SEEN_TTL_S          = 3600
 INGEST_BATCH_SIZE   = 100
 INGEST_INTERVAL_S   = 1.0
 
-# pool tuning
 POOL_RECHECK_INTERVAL_S = 480
 POOL_RECHECK_MIN_AGE_S  = 300
 POOL_RECHECK_BATCH      = 80
 POOL_TTL_S              = 900
 POOL_COOLDOWN_S         = 8
 
-# request freshness tuning
 PICK_WAIT_S          = 0.0
 PICK_FAST_MAX_S      = 4.0
 PICK_FALLBACK_COUNT  = 10
 
 SNAP_INTERVAL_S         = 2
 PERSIST_INTERVAL_S      = 60
-# latency categories
 CAT_FLASH   = 3.0
 CAT_PANTHER = 5.0
 CAT_LANTERN = 7.0
@@ -143,12 +144,11 @@ CAT_DEAD    = 10.0
 FRESH_HOT_S  = 30
 FRESH_COLD_S = 120
 
-# paid
 MEESHO_API  = "https://prod.meeshoapi.com"
 MEESHO_AUTH = "32c4d8137cn9eb493a1921f203173080"
 APP_ID      = "com.meesho.supply"
 
-STICKY_TTL_S = 90
+STICKY_TTL_S = 900
 PING_INTERVAL = 240
 
 FOD_HUNT_PATHS = (
@@ -157,29 +157,30 @@ FOD_HUNT_PATHS = (
     "/api/1.0/anonymous/fod-personalisation",
 )
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
-# SERVER-SIDE REQUEST RACING
+# URL ROUTING
 # ═══════════════════════════════════════════════════════════════════════════════
 
-RACE_WAIT_S      = 2.0
+RACE_WAIT_S      = 3.0
 RACE_FRESH_MAX_S = 4.0
-RACE_PROXY_COUNT = 10
+RACE_PROXY_COUNT = 6
 
 STICKY_URL_FRAGMENTS = [
-    "/api/1.0/cart",
-    "/api/8.0/cart",
-    "/api/1.0/cart/add",
-    "/api/1.0/cart/location",
+    "/api/2.0/user/login",
     "/api/1.0/cart/paymentinfo",
-    "/api/3.0/order",
     "/api/4.0/preorders",
-    "/api/2.0/orders",
+]
+STICKY_EXACT_PATHS = [
+    "/api/3.0/order",
+]
 
-    "/api/3.0/addresses",
+WRITE_URL_FRAGMENTS = [
+    "/api/1.0/cart/add",
+    "/api/1.0/cart/remove",
+    "/api/1.0/cart/location",
     "/api/2.0/addresses",
     "/api/1.0/user/delivery-location",
-    "/api/1.0/suborders/ratings/pending",
+    "/api/2.0/orders/",
 ]
 
 RACEABLE_URL_FRAGMENTS = [
@@ -198,16 +199,48 @@ RACEABLE_URL_FRAGMENTS = [
     "/api/3.0/user/order-details",
     "/api/1.0/anonymous/fod-personalisation",
     "/api/1.0/anonymous/config",
+    "/api/1.0/anonymous/referral-app-install",
 ]
 
-def _is_sticky_url(url: str) -> bool:
-    return any(frag in url for frag in STICKY_URL_FRAGMENTS)
 
-def _is_raceable_url(url: str) -> bool:
-    # Sticky wins if a URL appears in both lists.
+def _url_path(url: str) -> str:
+    try:
+        return urlsplit(url).path.rstrip("/") or "/"
+    except Exception:
+        return ""
+
+
+def _is_sticky_url(url: str) -> bool:
+    for frag in STICKY_URL_FRAGMENTS:
+        if frag in url:
+            return True
+    return _url_path(url) in STICKY_EXACT_PATHS
+
+
+def _is_write_url(url: str) -> bool:
     if _is_sticky_url(url):
         return False
+    return any(frag in url for frag in WRITE_URL_FRAGMENTS)
+
+
+def _is_raceable_url(url: str) -> bool:
+    if _is_sticky_url(url) or _is_write_url(url):
+        return False
     return any(frag in url for frag in RACEABLE_URL_FRAGMENTS)
+
+
+def _plan_for_url(url: str) -> str:
+    if _is_sticky_url(url):
+        return "sticky"
+    if _is_write_url(url):
+        return "write"
+    return "read"
+
+
+def _is_fod_hunt(url: str) -> bool:
+    path = _url_path(url)
+    return any(path.startswith(p) for p in FOD_HUNT_PATHS)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SOURCES
@@ -331,11 +364,11 @@ _snap_fresh30:  list[str] = []
 _snap_fresh120: list[str] = []
 _snap_fast:     list[str] = []
 
-_paid_lock    = threading.Lock()
-_paid_proxies: dict[str, dict] = {}
-
 _keys_lock = threading.Lock()
 _keys: list[dict] = []
+
+_sticky_lock = threading.Lock()
+_sticky_sessions: dict[str, dict] = {}
 
 _seen_lock = threading.Lock()
 _seen: dict[str, float] = {}
@@ -343,7 +376,6 @@ _seen: dict[str, float] = {}
 _outbuf_lock = threading.Lock()
 _outbuf: list[tuple[str, float]] = []
 
-# ─── Counters ─────────────────────────────────────────────────────────────────
 _counter_lock = threading.Lock()
 _counters_lifetime: dict[str, int] = defaultdict(int)
 _counters_cycle:    dict[str, int] = defaultdict(int)
@@ -365,11 +397,258 @@ _http_lmod: dict[str, str] = {}
 _check_queue: asyncio.Queue = None
 _check_loop:  asyncio.AbstractEventLoop = None
 
-_sticky_lock = threading.Lock()
-_sticky: dict[str, tuple] = {}
-
 _api_executor     = ThreadPoolExecutor(max_workers=8,  thread_name_prefix="api")
 _backend_executor = ThreadPoolExecutor(max_workers=24, thread_name_prefix="backend")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PREMIUM PROVIDERS — ScrapingAnt / ScraperAPI / ScrapeOps
+# ═══════════════════════════════════════════════════════════════════════════════
+PROVIDERS = ("scrapingant", "scraperapi", "scrapeops")
+
+DEFAULT_CREDIT_LIMITS = {
+    "scrapingant": 10_000,
+    "scraperapi":  1_000,
+    "scrapeops":   1_000,
+}
+
+SCRAPINGANT_ENDPOINT = "https://api.scrapingant.com/v2/general"
+SCRAPERAPI_ENDPOINT  = "https://api.scraperapi.com/"
+SCRAPEOPS_ENDPOINT   = "https://proxy.scrapeops.io/v1/"
+
+PREMIUM_TIMEOUT_S = 5
+
+_scrapingant_sem = threading.Semaphore(1)
+
+
+def _key_is_live(k: dict) -> bool:
+    reset = float(k.get("reset_at") or 0)
+    if reset and time.time() >= reset:
+        k["credits_used"] = 0
+        k["reset_at"]     = 0
+    limit = int(k.get("credits_limit")
+                or DEFAULT_CREDIT_LIMITS.get(k.get("provider", ""), 0))
+    used  = int(k.get("credits_used") or 0)
+    return used < limit
+
+
+def _pick_premium_key(provider: str) -> Optional[dict]:
+    with _keys_lock:
+        candidates = [k for k in _keys if k.get("provider") == provider]
+        live       = [k for k in candidates if _key_is_live(k)]
+    if not live:
+        return None
+    live.sort(key=lambda k: float(k.get("last_used") or 0))
+    return live[0]
+
+
+def _get_key_by_label(provider: str, label: str) -> Optional[dict]:
+    with _keys_lock:
+        for k in _keys:
+            if k.get("provider") == provider and k.get("label") == label:
+                return k if _key_is_live(k) else None
+    return None
+
+
+def _mark_key_used(key_dict: dict, credits: int = 1):
+    with _keys_lock:
+        key_dict["credits_used"] = int(key_dict.get("credits_used") or 0) + credits
+        key_dict["last_used"]    = time.time()
+
+
+def _exhaust_key(key_dict: dict):
+    limit = int(key_dict.get("credits_limit")
+                or DEFAULT_CREDIT_LIMITS.get(key_dict.get("provider", ""), 0))
+    with _keys_lock:
+        key_dict["credits_used"] = limit
+        key_dict["last_used"]    = time.time()
+
+
+def _premium_response(r: requests.Response, key: dict, provider: str) -> dict:
+    if r.status_code in (401, 403, 429):
+        _exhaust_key(key)
+        return {
+            "success": False,
+            "error":   f"{provider}: http {r.status_code}",
+            "rotate":  True,
+        }
+
+    _mark_key_used(key, credits=1)
+
+    if r.status_code >= 400:
+        return {
+            "success": False,
+            "error":   f"{provider}: http {r.status_code}",
+            "raw":     r.text[:300],
+        }
+
+    try:
+        data = r.json()
+    except Exception:
+        data = r.text
+
+    return {"success": True, "data": data}
+
+
+def _call_scrapingant(method: str, url: str, headers: dict, body=None,
+                     session=None, key_label=None) -> dict:
+    if key_label:
+        key = _get_key_by_label("scrapingant", key_label)
+    else:
+        key = _pick_premium_key("scrapingant")
+    if not key:
+        return {"success": False, "error": "scrapingant: no live keys"}
+
+    ant_headers = {"x-api-key": key["key"]}
+    for k, v in (headers or {}).items():
+        ant_headers[f"ant-{k}"] = v
+
+    params = {
+        "url":                url,
+        "browser":            "false",
+        "return_page_source": "true",
+    }
+
+    with _scrapingant_sem:
+        try:
+            if method.upper() == "GET":
+                r = requests.get(
+                    SCRAPINGANT_ENDPOINT, params=params,
+                    headers=ant_headers, timeout=PREMIUM_TIMEOUT_S,
+                )
+            else:
+                r = requests.post(
+                    SCRAPINGANT_ENDPOINT, params=params,
+                    headers=ant_headers, json=body, timeout=PREMIUM_TIMEOUT_S,
+                )
+        except Exception as e:
+            return {"success": False, "error": f"scrapingant: {e}"}
+
+    return _premium_response(r, key, "scrapingant")
+
+
+def _call_scraperapi(method: str, url: str, headers: dict, body=None,
+                    session=None, key_label=None) -> dict:
+    if key_label:
+        key = _get_key_by_label("scraperapi", key_label)
+    else:
+        key = _pick_premium_key("scraperapi")
+    if not key:
+        return {"success": False, "error": "scraperapi: no live keys"}
+
+    params = {
+        "api_key":      key["key"],
+        "url":          url,
+        "keep_headers": "true",
+    }
+    if session:
+        params["session_number"] = str(session)
+
+    try:
+        if method.upper() == "GET":
+            r = requests.get(
+                SCRAPERAPI_ENDPOINT, params=params,
+                headers=headers or {}, timeout=PREMIUM_TIMEOUT_S,
+            )
+        else:
+            r = requests.post(
+                SCRAPERAPI_ENDPOINT, params=params,
+                headers=headers or {}, json=body, timeout=PREMIUM_TIMEOUT_S,
+            )
+    except Exception as e:
+        return {"success": False, "error": f"scraperapi: {e}"}
+
+    return _premium_response(r, key, "scraperapi")
+
+
+def _call_scrapeops(method: str, url: str, headers: dict, body=None,
+                   session=None, key_label=None) -> dict:
+    if key_label:
+        key = _get_key_by_label("scrapeops", key_label)
+    else:
+        key = _pick_premium_key("scrapeops")
+    if not key:
+        return {"success": False, "error": "scrapeops: no live keys"}
+
+    params = {
+        "api_key":      key["key"],
+        "url":          url,
+        "keep_headers": "true",
+    }
+    if session:
+        params["session_number"] = str(session)
+
+    try:
+        if method.upper() == "GET":
+            r = requests.get(
+                SCRAPEOPS_ENDPOINT, params=params,
+                headers=headers or {}, timeout=PREMIUM_TIMEOUT_S,
+            )
+        else:
+            r = requests.post(
+                SCRAPEOPS_ENDPOINT, params=params,
+                headers=headers or {}, json=body, timeout=PREMIUM_TIMEOUT_S,
+            )
+    except Exception as e:
+        return {"success": False, "error": f"scrapeops: {e}"}
+
+    return _premium_response(r, key, "scrapeops")
+
+
+_PROVIDER_CALLS = {
+    "scrapingant": _call_scrapingant,
+    "scraperapi":  _call_scraperapi,
+    "scrapeops":   _call_scrapeops,
+}
+
+
+def _provider_priority(plan: str) -> list[str]:
+    if plan == "sticky":
+        return ["scraperapi", "scrapeops"]
+    if plan == "write":
+        return ["scrapingant", "scraperapi", "scrapeops"]
+    return ["scraperapi", "scrapeops", "scrapingant"]
+
+
+def _provider_call_sync(provider: str, method: str, url: str,
+                       headers: dict, body, session, key_label=None) -> dict:
+    fn = _PROVIDER_CALLS.get(provider)
+    if not fn:
+        return {"success": False, "error": f"unknown provider {provider}"}
+    return fn(method, url, headers, body, session=session, key_label=key_label)
+
+
+def _derive_sticky_id(req) -> int:
+    headers = req.headers or {}
+    low = {str(k).lower(): v for k, v in headers.items()}
+    sid = low.get("app-session-id") or low.get("instance-id") or ""
+    if not sid:
+        sid = req.url + json.dumps(req.body or {}, sort_keys=True)
+    h = hashlib.md5(sid.encode()).hexdigest()
+    return int(h[:8], 16) % 1_000_000
+
+
+def _sticky_pin(flow_key: int) -> Optional[dict]:
+    now = time.time()
+    with _sticky_lock:
+        entry = _sticky_sessions.get(str(flow_key))
+        if entry and entry.get("expires_at", 0) > now:
+            entry["expires_at"] = now + STICKY_TTL_S
+            return entry
+
+    for provider in ("scraperapi", "scrapeops"):
+        key = _pick_premium_key(provider)
+        if key:
+            entry = {
+                "provider":       provider,
+                "key_label":      key.get("label"),
+                "session_number": flow_key,
+                "expires_at":     now + STICKY_TTL_S,
+            }
+            with _sticky_lock:
+                _sticky_sessions[str(flow_key)] = entry
+            return entry
+    return None
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # HELPERS
@@ -448,21 +727,6 @@ def _gh_headers() -> dict:
     if GITHUB_TOKEN:
         h["Authorization"] = f"Bearer {GITHUB_TOKEN}"
     return h
-
-def _is_fod_hunt(url: str) -> bool:
-    from urllib.parse import urlsplit
-    try:
-        path = urlsplit(url).path
-    except Exception:
-        return False
-    return any(path.startswith(p) for p in FOD_HUNT_PATHS)
-
-def _sticky_key(headers) -> str:
-    if not headers:
-        return ""
-    low = {str(k).lower(): v for k, v in headers.items()}
-    k = low.get("app-session-id") or low.get("instance-id")
-    return f"fod:{k}" if k else ""
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SOURCE FETCHERS
@@ -760,7 +1024,7 @@ def _checker_main():
     while True:
         time.sleep(5)
         now = time.time()
-        _reset_cycle()   # cycle counters = this poll window only
+        _reset_cycle()
 
         if now - last_commit_poll >= COMMIT_POLL_S:
             last_commit_poll = now
@@ -834,9 +1098,7 @@ def _evict(addr: str, reason: str = "dead"):
         _last_used.pop(addr, None)
 
 
-
 def _pick(purpose: str = "backend", caller: str = "unknown") -> dict:
-    """Pick one proxy immediately for normal/sticky requests."""
     now = time.time()
 
     with _proxies_lock:
@@ -892,9 +1154,7 @@ def _pick_race_candidates(
     caller: str = "unknown",
     count: int = RACE_PROXY_COUNT,
 ) -> list[dict]:
-    """Wait 2s, then return fresh-window candidates or latest 10 live proxies."""
     window_start = time.time()
-    time.sleep(RACE_WAIT_S)
     now = time.time()
 
     with _proxies_lock:
@@ -908,7 +1168,7 @@ def _pick_race_candidates(
         checked_at = rec.get("last_checked", 0)
         latency_s = rec.get("latency_ms", 0) / 1000.0
 
-        if window_start <= checked_at <= now and 0 < latency_s < RACE_FRESH_MAX_S:
+        if window_start - 30 <= checked_at <= now and 0 < latency_s < RACE_FRESH_MAX_S:
             fresh.append((checked_at, addr, rec))
 
     fresh.sort(key=lambda x: x[0], reverse=True)
@@ -1025,8 +1285,10 @@ def _persist_worker():
     while True:
         _persist_event.wait(timeout=PERSIST_INTERVAL_S)
         _persist_event.clear()
-        _save_free()
-        _save_paid()
+        if ROLE == "pool":
+            _save_free()
+        elif ROLE == "vps":
+            _save_keys()
 
 def _start_pool():
     _load_free()
@@ -1066,7 +1328,7 @@ def _get_race_proxies_from_pool(count: int = RACE_PROXY_COUNT) -> list[dict]:
             f"{pool_url}/pick-many",
             params={"count": count},
             headers={"X-Secret": SHARED_SECRET},
-            timeout=RACE_WAIT_S + 3,
+            timeout=6,
         )
         if r.status_code == 200:
             data = r.json()
@@ -1077,6 +1339,7 @@ def _get_race_proxies_from_pool(count: int = RACE_PROXY_COUNT) -> list[dict]:
         print(f"[vps] pool /pick-many failed: {e}", flush=True)
 
     return []
+
 
 def _report_dead_to_pool(addr: str):
     pool_url = PEERS.get("pool", "")
@@ -1092,98 +1355,6 @@ def _report_dead_to_pool(addr: str):
     except Exception:
         pass
 
-def _pick_paid() -> dict:
-    with _paid_lock:
-        live = [p for p in _paid_proxies.values() if p.get("alive")]
-    if not live:
-        return {}
-    p = random.choice(live)
-    return {"http": p["http"], "https": p["https"], "addr": p.get("addr", "")}
-
-def pick_proxy_vps(tier: str = "any", cat: str = "any", purpose: str = "backend") -> dict:
-    if tier == "paid":
-        return _pick_paid()
-    return _get_proxy_from_pool(cat, purpose)
-
-def _check_paid_proxy(addr: str, prx: dict) -> bool:
-    hdr = _meesho_headers()
-    try:
-        r    = requests.get(
-            f"{MEESHO_API}/api/1.0/anonymous/config",
-            headers=hdr, proxies=prx, timeout=10, verify=False,
-        )
-        enc  = r.headers.get("content-encoding", "")
-        data = _decode_meesho(r.content, enc)
-        xoox = data.get("xoox", {})
-        if isinstance(xoox, str):
-            try: xoox = json.loads(xoox)
-            except: xoox = {}
-        return bool(isinstance(xoox, dict) and xoox.get("xo"))
-    except Exception:
-        return False
-
-def _fetch_webshare(entry: dict) -> list[dict]:
-    label, key = entry["label"], entry["key"]
-    out, page  = [], 1
-    while True:
-        try:
-            r = requests.get(
-                f"https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page={page}&page_size=100",
-                headers={"Authorization": f"Token {key}"}, timeout=10,
-            )
-            if r.status_code == 401:
-                print(f"[paid] {label} invalid key", flush=True)
-                break
-            data    = r.json()
-            results = data.get("results", [])
-            if not results:
-                break
-            for p in results:
-                ip   = p.get("proxy_address", "")
-                port = p.get("port", 0)
-                user = p.get("username", "")
-                pw   = p.get("password", "")
-                addr = f"{ip}:{port}"
-                url  = f"http://{user}:{pw}@{ip}:{port}" if user and pw else f"http://{ip}:{port}"
-                out.append({
-                    "addr": addr, "http": url, "https": url,
-                    "key_label": label, "alive": None, "last_check": 0,
-                })
-            if not data.get("next"):
-                break
-            page += 1
-        except Exception as e:
-            print(f"[paid] fetch failed {label} p{page}: {e}", flush=True)
-            break
-    print(f"[paid] {label} pulled {len(out)}", flush=True)
-    return out
-
-def _paid_worker():
-    _load_paid()
-    with _keys_lock:
-        keys = list(_keys)
-    for entry in keys:
-        proxies = _fetch_webshare(entry)
-        with _paid_lock:
-            for p in proxies:
-                if p["addr"] not in _paid_proxies:
-                    _paid_proxies[p["addr"]] = p
-
-        def _check(label=entry["label"]):
-            with _paid_lock:
-                to_check = [(a, dict(p)) for a, p in _paid_proxies.items() if p.get("key_label") == label]
-            alive = 0
-            for addr, p in to_check:
-                ok = _check_paid_proxy(addr, {"http": p["http"], "https": p["https"]})
-                if ok: alive += 1
-                with _paid_lock:
-                    if addr in _paid_proxies:
-                        _paid_proxies[addr]["alive"]      = ok
-                        _paid_proxies[addr]["last_check"] = time.time()
-            _save_paid()
-            print(f"[paid] {label} ready — {alive}/{len(to_check)} alive", flush=True)
-
-        threading.Thread(target=_check, daemon=True, name=f"paid-{entry['label']}").start()
 
 def _pinger():
     ping_order = [
@@ -1204,13 +1375,12 @@ def _pinger():
             time.sleep(3)
         time.sleep(PING_INTERVAL)
 
+
 def _start_vps():
-    _load_paid()
     _load_keys()
-    threading.Thread(target=_paid_worker,    daemon=True, name="paid").start()
     threading.Thread(target=_pinger,         daemon=True, name="pinger").start()
     threading.Thread(target=_persist_worker, daemon=True, name="persist").start()
-    print(f"[vps] started", flush=True)
+    print(f"[vps] started — {len(_keys)} keys loaded", flush=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PERSIST
@@ -1253,31 +1423,10 @@ def _load_free():
     except Exception as e:
         print(f"[persist] free load failed: {e}", flush=True)
 
-def _save_paid():
-    try:
-        with _paid_lock:
-            data = {a: dict(p) for a, p in _paid_proxies.items() if p.get("alive")}
-        PERSIST_PAID.write_text(json.dumps(data))
-    except Exception as e:
-        print(f"[persist] paid save failed: {e}", flush=True)
-
-def _load_paid():
-    if not PERSIST_PAID.exists():
-        return
-    try:
-        data = json.loads(PERSIST_PAID.read_text())
-        with _paid_lock:
-            for addr, p in data.items():
-                if addr not in _paid_proxies:
-                    _paid_proxies[addr] = p
-        print(f"[persist] loaded {len(data)} paid proxies", flush=True)
-    except Exception as e:
-        print(f"[persist] paid load failed: {e}", flush=True)
-
 def _save_keys():
     try:
         with _keys_lock:
-            keys = list(_keys)
+            keys = [dict(k) for k in _keys]
         KEYS_FILE.write_text(json.dumps(keys, indent=2))
     except Exception as e:
         print(f"[persist] keys save failed: {e}", flush=True)
@@ -1288,7 +1437,17 @@ def _load_keys():
     try:
         data = json.loads(KEYS_FILE.read_text())
         with _keys_lock:
-            _keys.extend(data)
+            for entry in data:
+                if "credits_used" not in entry:
+                    entry["credits_used"] = 0
+                if "credits_limit" not in entry:
+                    entry["credits_limit"] = DEFAULT_CREDIT_LIMITS.get(
+                        entry.get("provider", ""), 0)
+                if "reset_at" not in entry:
+                    entry["reset_at"] = 0
+                if "last_used" not in entry:
+                    entry["last_used"] = 0
+                _keys.append(entry)
         print(f"[persist] loaded {len(data)} keys", flush=True)
     except Exception as e:
         print(f"[persist] keys load failed: {e}", flush=True)
@@ -1307,9 +1466,24 @@ def _get_stats() -> dict:
     for _, r in items:
         if r.get("label"):
             labs[r["label"]] += 1
-    with _paid_lock:
-        p_total = len(_paid_proxies)
-        p_alive = sum(1 for p in _paid_proxies.values() if p.get("alive"))
+
+    providers_block = {}
+    with _keys_lock:
+        keys_snapshot = [dict(k) for k in _keys]
+    for k in keys_snapshot:
+        prov  = k.get("provider", "unknown")
+        limit = int(k.get("credits_limit")
+                    or DEFAULT_CREDIT_LIMITS.get(prov, 0))
+        used  = int(k.get("credits_used") or 0)
+        block = providers_block.setdefault(prov, {
+            "keys": 0, "live": 0, "total_credits": 0, "used_credits": 0,
+        })
+        block["keys"]          += 1
+        block["total_credits"] += limit
+        block["used_credits"]  += used
+        if used < limit:
+            block["live"] += 1
+
     with _outbuf_lock: obuf = len(_outbuf)
     with _counter_lock:
         cnts_life  = dict(_counters_lifetime)
@@ -1350,7 +1524,7 @@ def _get_stats() -> dict:
             "lantern":    labs["lantern"],
             "deadass":    labs["deadass"],
         },
-        "paid":  {"total": p_total, "alive": p_alive},
+        "providers": providers_block,
         "peers": {role: url for role, url in PEERS.items()},
     }
 
@@ -1481,10 +1655,7 @@ async def pick_route(
         raise HTTPException(503, "no live proxies available")
     return p
 
-# ── Pool dead ─────────────────────────────────────────────────────────────────
-class DeadReport(BaseModel):
-    addr: str
-
+# ── Pool pick-many ────────────────────────────────────────────────────────────
 @app.get("/pick-many")
 async def pick_many_route(
     request: Request,
@@ -1512,6 +1683,10 @@ async def pick_many_route(
 
     return {"proxies": proxies}
 
+# ── Pool dead ─────────────────────────────────────────────────────────────────
+class DeadReport(BaseModel):
+    addr: str
+
 @app.post("/dead")
 async def report_dead(req: DeadReport, x_secret: Optional[str] = Header(None)):
     if x_secret != SHARED_SECRET:
@@ -1528,7 +1703,9 @@ async def reset_cycle_route(x_secret: Optional[str] = Header(None)):
     _reset_cycle()
     return {"ok": True, "reset_at": time.time()}
 
-# ── VPS /request ──────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# VPS /request — read/write/sticky dispatch + premium fallback
+# ═══════════════════════════════════════════════════════════════════════════════
 class ProxyRequest(BaseModel):
     url:      str
     method:   str            = "GET"
@@ -1540,277 +1717,199 @@ class ProxyRequest(BaseModel):
     tier:     str            = "any"
     category: str            = "any"
 
+
+async def _do_free_race(req: ProxyRequest, loop) -> Optional[Response]:
+    method = req.method.upper()
+    proxies = await loop.run_in_executor(
+        _backend_executor,
+        _get_race_proxies_from_pool,
+        RACE_PROXY_COUNT,
+    )
+    if not proxies:
+        return None
+
+    connector = aiohttp.TCPConnector(
+        limit=len(proxies) + 5,
+        ssl=False,
+        enable_cleanup_closed=True,
+    )
+
+    async with aiohttp.ClientSession(connector=connector) as session:
+        async def _one_shot(prx: dict):
+            addr = prx.get("addr", "")
+            proxy_url = prx.get("http", "")
+            if not proxy_url:
+                return None
+            try:
+                async with session.request(
+                    method=method,
+                    url=req.url,
+                    headers=req.headers or {},
+                    json=req.body if method in ("POST", "PUT", "PATCH") else None,
+                    params=req.params,
+                    proxy=proxy_url,
+                    timeout=aiohttp.ClientTimeout(total=RACE_WAIT_S),
+                ) as r:
+                    raw = await r.read()
+                    enc = r.headers.get("Content-Encoding", "")
+                    ct  = r.headers.get("Content-Type", "application/octet-stream")
+                    try:
+                        if "gzip" in enc:
+                            raw = gzip.decompress(raw)
+                        elif "deflate" in enc:
+                            raw = zlib.decompress(raw)
+                    except Exception:
+                        pass
+                    if r.status < 400:
+                        return {
+                            "addr": addr,
+                            "status": r.status,
+                            "raw": raw,
+                            "content_type": ct,
+                        }
+            except (
+                asyncio.TimeoutError,
+                aiohttp.ClientConnectionError,
+                aiohttp.ClientProxyConnectionError,
+                aiohttp.ClientError,
+            ):
+                if addr:
+                    await asyncio.get_running_loop().run_in_executor(
+                        _backend_executor, _report_dead_to_pool, addr,
+                    )
+            except Exception:
+                pass
+            return None
+
+        tasks = [asyncio.create_task(_one_shot(prx)) for prx in proxies]
+
+        try:
+            for completed in asyncio.as_completed(tasks, timeout=RACE_WAIT_S + 0.2):
+                result = await completed
+                if result is None:
+                    continue
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                _inc("race_wins")
+                _log("race_win",
+                     f"url={req.url} proxy={result['addr']} "
+                     f"status={result['status']} candidates={len(proxies)}")
+                return Response(
+                    content=result["raw"],
+                    status_code=result["status"],
+                    media_type=result["content_type"],
+                )
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    _inc("race_all_failed")
+    return None
+
+
+async def _premium_forward(req: ProxyRequest, plan: str, loop) -> Response:
+    method   = req.method.upper()
+    providers = _provider_priority(plan)
+    sticky_entry = None
+
+    if plan == "sticky":
+        flow_key = _derive_sticky_id(req)
+        sticky_entry = await loop.run_in_executor(_backend_executor, _sticky_pin, flow_key)
+        if not sticky_entry:
+            raise HTTPException(503, "no premium provider available for sticky flow")
+        providers = [sticky_entry["provider"]]
+
+    last_err = None
+    for provider in providers:
+        pinned_label = sticky_entry.get("key_label") if sticky_entry else None
+        session_id   = sticky_entry.get("session_number") if sticky_entry else None
+
+        result = await loop.run_in_executor(
+            _backend_executor,
+            _provider_call_sync,
+            provider, method, req.url, req.headers or {},
+            req.body if method in ("POST", "PUT", "PATCH") else None,
+            session_id, pinned_label,
+        )
+
+        if result.get("success"):
+            data = result.get("data")
+            if isinstance(data, (dict, list)):
+                raw = json.dumps(data).encode()
+                ct  = "application/json"
+            else:
+                raw = str(data).encode()
+                ct  = "text/plain"
+            _inc(f"premium_ok_{provider}")
+            _log("premium_ok", f"url={req.url} provider={provider} plan={plan}")
+            return Response(content=raw, status_code=200, media_type=ct)
+
+        last_err = result.get("error", "unknown")
+        _inc(f"premium_fail_{provider}")
+        _log("premium_fail", f"url={req.url} provider={provider} err={last_err}")
+
+    raise HTTPException(502, f"all premium providers failed: {last_err}")
+
+
 @app.post("/request")
 async def proxy_request(req: ProxyRequest):
     if ROLE != "vps":
         raise HTTPException(400, "/request only on vps role")
 
-    method = req.method.upper()
-    purpose = "fod-hunt" if _is_fod_hunt(req.url) else "backend"
-    skey = _sticky_key(req.headers) if purpose == "fod-hunt" else ""
     loop = asyncio.get_event_loop()
 
-    # Sticky URLs stay single-proxy. Only explicitly raceable URLs race.
-    if _is_raceable_url(req.url):
-        _inc("race_requests")
-        _log("race_start", f"url={req.url} method={method}")
+    if req.tier in ("premium", "paid"):
+        _inc("requests_premium_forced")
+        return await _premium_forward(req, "read", loop)
 
-        proxies = await loop.run_in_executor(
-            _backend_executor,
-            _get_race_proxies_from_pool,
-            RACE_PROXY_COUNT,
-        )
+    plan = _plan_for_url(req.url)
 
-        if not proxies:
-            raise HTTPException(503, "no proxies available for race")
+    if plan == "read":
+        _inc("requests_read")
+        result = await _do_free_race(req, loop)
+        if result is not None:
+            return result
+        return await _premium_forward(req, "read", loop)
 
-        connector = aiohttp.TCPConnector(
-            limit=len(proxies) + 5,
-            ssl=False,
-            enable_cleanup_closed=True,
-        )
+    if plan == "write":
+        _inc("requests_write")
+        return await _premium_forward(req, "write", loop)
 
-        async with aiohttp.ClientSession(
-            connector=connector,
-        ) as session:
+    if plan == "sticky":
+        _inc("requests_sticky")
+        return await _premium_forward(req, "sticky", loop)
 
-            async def _one_shot(prx: dict):
-                addr = prx.get("addr", "")
-                proxy_url = prx.get("http", "")
-
-                if not proxy_url:
-                    return None
-
-                try:
-                    async with session.request(
-                        method=method,
-                        url=req.url,
-                        headers=req.headers or {},
-                        json=req.body if method in ("POST", "PUT", "PATCH") else None,
-                        params=req.params,
-                        proxy=proxy_url,
-                        timeout=aiohttp.ClientTimeout(total=req.timeout),
-                    ) as r:
-
-                        raw = await r.read()
-                        enc = r.headers.get("Content-Encoding", "")
-                        ct = r.headers.get(
-                            "Content-Type",
-                            "application/octet-stream",
-                        )
-
-                        try:
-                            if "gzip" in enc:
-                                raw = gzip.decompress(raw)
-                            elif "deflate" in enc:
-                                raw = zlib.decompress(raw)
-                        except Exception:
-                            pass
-
-                        if r.status < 400:
-                            return {
-                                "addr": addr,
-                                "status": r.status,
-                                "raw": raw,
-                                "content_type": ct,
-                            }
-
-                except (
-                    asyncio.TimeoutError,
-                    aiohttp.ClientConnectionError,
-                    aiohttp.ClientProxyConnectionError,
-                    aiohttp.ClientError,
-                ):
-                    if addr:
-                        await asyncio.get_running_loop().run_in_executor(
-                            _backend_executor,
-                            _report_dead_to_pool,
-                            addr,
-                        )
-                except Exception:
-                    pass
-
-                return None
-
-            tasks = [
-                asyncio.create_task(_one_shot(prx))
-                for prx in proxies
-            ]
-
-            try:
-                for completed in asyncio.as_completed(
-                    tasks,
-                    timeout=req.timeout,
-                ):
-                    result = await completed
-
-                    if result is None:
-                        continue
-
-                    for task in tasks:
-                        if not task.done():
-                            task.cancel()
-
-                    await asyncio.gather(
-                        *tasks,
-                        return_exceptions=True,
-                    )
-
-                    _inc("race_wins")
-                    _log(
-                        "race_win",
-                        f"url={req.url} proxy={result['addr']} "
-                        f"status={result['status']} candidates={len(proxies)}",
-                    )
-
-                    return Response(
-                        content=result["raw"],
-                        status_code=result["status"],
-                        media_type=result["content_type"],
-                    )
-
-            except asyncio.TimeoutError:
-                pass
-            finally:
-                for task in tasks:
-                    if not task.done():
-                        task.cancel()
-
-                await asyncio.gather(
-                    *tasks,
-                    return_exceptions=True,
-                )
-
-        _inc("race_all_failed")
-        raise HTTPException(502, "all race proxies failed")
-
-    # Normal/sticky request: immediate single proxy.
-    prx = None
-
-    if skey:
-        with _sticky_lock:
-            st = _sticky.get(skey)
-            if st and st[1] > time.time():
-                prx = {
-                    "http": f"http://{st[0]}",
-                    "https": f"http://{st[0]}",
-                    "addr": st[0],
-                }
-                _sticky[skey] = (
-                    st[0],
-                    time.time() + STICKY_TTL_S,
-                )
-
-    if prx is None:
-        prx = await loop.run_in_executor(
-            _backend_executor,
-            pick_proxy_vps,
-            req.tier,
-            req.category,
-            purpose,
-        )
-
-        if prx and skey:
-            with _sticky_lock:
-                _sticky[skey] = (
-                    prx.get("addr", ""),
-                    time.time() + STICKY_TTL_S,
-                )
-
-    if not prx:
-        raise HTTPException(503, "no live proxies available")
-
-    proxy_addr = prx.get(
-        "addr",
-        prx.get("http", ""),
-    )
-    proxy_url = prx["http"]
-
-    try:
-        connector = aiohttp.TCPConnector(
-            ssl=False,
-            enable_cleanup_closed=True,
-        )
-
-        async with aiohttp.ClientSession(
-            connector=connector,
-        ) as session:
-
-            async with session.request(
-                method=method,
-                url=req.url,
-                headers=req.headers or {},
-                json=req.body if method in ("POST", "PUT", "PATCH") else None,
-                params=req.params,
-                proxy=proxy_url,
-                timeout=aiohttp.ClientTimeout(total=req.timeout),
-            ) as r:
-
-                raw = await r.read()
-                enc = r.headers.get("Content-Encoding", "")
-                ct = r.headers.get(
-                    "Content-Type",
-                    "application/octet-stream",
-                )
-
-                try:
-                    if "gzip" in enc:
-                        raw = gzip.decompress(raw)
-                    elif "deflate" in enc:
-                        raw = zlib.decompress(raw)
-                except Exception:
-                    pass
-
-                return Response(
-                    content=raw,
-                    status_code=r.status,
-                    media_type=ct,
-                )
-
-    except asyncio.TimeoutError:
-        raise HTTPException(504, "upstream request timed out")
-
-    except (
-        aiohttp.ClientProxyConnectionError,
-        aiohttp.ClientConnectionError,
-    ) as e:
-
-        await loop.run_in_executor(
-            _backend_executor,
-            _report_dead_to_pool,
-            proxy_addr,
-        )
-
-        if skey:
-            with _sticky_lock:
-                _sticky.pop(skey, None)
-
-        raise HTTPException(
-            502,
-            f"proxy connection failed: {e}",
-        )
-
-    except Exception as e:
-        raise HTTPException(
-            502,
-            f"upstream request failed: {e}",
-        )
+    raise HTTPException(500, "unknown plan")
 
 
-# ── VPS key management ────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# VPS KEY MANAGEMENT
+# ═══════════════════════════════════════════════════════════════════════════════
 class AddKeyRequest(BaseModel):
-    provider: str
-    key:      str
-    label:    Optional[str] = ""
+    provider:      str
+    key:           str
+    label:         Optional[str] = ""
+    credits_limit: Optional[int] = None
 
 class RemoveKeyRequest(BaseModel):
     key: str
+
 
 @app.post("/keys/add")
 async def add_key(req: AddKeyRequest):
     if ROLE != "vps":
         raise HTTPException(400, "keys only on vps role")
-    auto_label = req.label or f"{req.provider}-{req.key[:8]}"
+    provider = req.provider.strip().lower()
+    if provider not in PROVIDERS:
+        raise HTTPException(400, f"provider must be one of {PROVIDERS}")
+
+    auto_label = req.label or f"{provider}-{req.key[:8]}"
     with _keys_lock:
         if any(k["key"] == req.key for k in _keys):
             raise HTTPException(400, "key already exists")
@@ -1820,31 +1919,19 @@ async def add_key(req: AddKeyRequest):
         while final in existing:
             final = f"{auto_label}-{suffix}"
             suffix += 1
-        entry = {"provider": req.provider, "key": req.key, "label": final}
+        entry = {
+            "provider":      provider,
+            "key":           req.key,
+            "label":         final,
+            "credits_limit": req.credits_limit or DEFAULT_CREDIT_LIMITS.get(provider, 1000),
+            "credits_used":  0,
+            "reset_at":      0,
+            "last_used":     0,
+        }
         _keys.append(entry)
     _save_keys()
+    return {"status": "ok", "label": final, "provider": provider}
 
-    def _bg():
-        proxies = _fetch_webshare(entry)
-        with _paid_lock:
-            for p in proxies:
-                if p["addr"] not in _paid_proxies:
-                    _paid_proxies[p["addr"]] = p
-        with _paid_lock:
-            to_check = [(a, dict(px)) for a, px in _paid_proxies.items() if px.get("key_label") == final]
-        alive = 0
-        for addr, p in to_check:
-            ok = _check_paid_proxy(addr, {"http": p["http"], "https": p["https"]})
-            if ok: alive += 1
-            with _paid_lock:
-                if addr in _paid_proxies:
-                    _paid_proxies[addr]["alive"]      = ok
-                    _paid_proxies[addr]["last_check"] = time.time()
-        _save_paid()
-        print(f"[paid] {final} ready — {alive}/{len(to_check)} alive", flush=True)
-
-    threading.Thread(target=_bg, daemon=True, name=f"add-key-{final}").start()
-    return {"status": "ok", "label": final}
 
 @app.delete("/keys/remove")
 async def remove_key(req: RemoveKeyRequest):
@@ -1854,15 +1941,11 @@ async def remove_key(req: RemoveKeyRequest):
         entry = next((k for k in _keys if k["key"] == req.key), None)
         if not entry:
             raise HTTPException(404, "key not found")
-        label    = entry["label"]
+        label = entry["label"]
         _keys[:] = [k for k in _keys if k["key"] != req.key]
-    with _paid_lock:
-        dead = [a for a, p in _paid_proxies.items() if p.get("key_label") == label]
-        for a in dead:
-            del _paid_proxies[a]
     _save_keys()
-    _save_paid()
-    return {"status": "ok", "evicted": len(dead)}
+    return {"status": "ok", "removed": label}
+
 
 @app.get("/keys/list")
 async def list_keys():
@@ -1870,9 +1953,67 @@ async def list_keys():
         raise HTTPException(400, "keys only on vps role")
     with _keys_lock:
         return [
-            {"label": k["label"], "provider": k["provider"], "hint": f"***{k['key'][-6:]}"}
+            {
+                "label":    k["label"],
+                "provider": k["provider"],
+                "hint":     f"***{k['key'][-6:]}" if k.get("key") else "",
+            }
             for k in _keys
         ]
+
+
+@app.get("/keys/stats")
+async def keys_stats():
+    if ROLE != "vps":
+        raise HTTPException(400, "keys only on vps role")
+    with _keys_lock:
+        keys = [dict(k) for k in _keys]
+
+    by_provider: dict[str, dict] = defaultdict(
+        lambda: {"keys": 0, "live": 0, "total_credits": 0, "used_credits": 0}
+    )
+    out_keys = []
+    for k in keys:
+        prov  = k.get("provider", "")
+        limit = int(k.get("credits_limit")
+                    or DEFAULT_CREDIT_LIMITS.get(prov, 0))
+        used  = int(k.get("credits_used") or 0)
+        live  = used < limit
+        out_keys.append({
+            "label":         k.get("label"),
+            "provider":      prov,
+            "credits_limit": limit,
+            "credits_used":  used,
+            "live":          live,
+            "last_used":     k.get("last_used", 0),
+            "hint":          f"***{k['key'][-6:]}" if k.get("key") else "",
+        })
+        block = by_provider[prov]
+        block["keys"]          += 1
+        block["total_credits"] += limit
+        block["used_credits"]  += used
+        if live:
+            block["live"] += 1
+
+    return {
+        "providers": dict(by_provider),
+        "keys":      out_keys,
+    }
+
+
+@app.post("/keys/reset-credits")
+async def keys_reset_credits(x_secret: Optional[str] = Header(None)):
+    if x_secret != SHARED_SECRET:
+        raise HTTPException(403, "invalid secret")
+    if ROLE != "vps":
+        raise HTTPException(400, "keys only on vps role")
+    with _keys_lock:
+        for k in _keys:
+            k["credits_used"] = 0
+            k["reset_at"]     = 0
+    _save_keys()
+    return {"status": "ok", "reset": len(_keys)}
+
 
 # ── Dashboard / pool root ─────────────────────────────────────────────────────
 @app.get("/")
