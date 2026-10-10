@@ -743,11 +743,13 @@ def _sync_all_keys() -> dict:
 
 
 def _provider_priority(plan: str) -> list[str]:
+    # CHANGED: sticky now uses ScrapeOps first (has session_number support),
+    # then ScrapingAnt. ScraperAPI removed from sticky due to chronic timeouts.
     if plan == "sticky":
-        return ["scraperapi", "scrapeops"]
+        return ["scrapeops", "scrapingant"]
     if plan == "write":
-        return ["scrapingant", "scraperapi", "scrapeops"]
-    return ["scraperapi", "scrapeops", "scrapingant"]
+        return ["scrapingant", "scrapeops"]
+    return ["scrapeops", "scrapingant"]
 
 
 def _provider_call_sync(provider: str, method: str, url: str,
