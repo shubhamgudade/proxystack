@@ -426,7 +426,7 @@ SCRAPINGANT_USAGE_URL = "https://api.scrapingant.com/v2/usage"
 SCRAPERAPI_USAGE_URL  = "https://api.scraperapi.com/account"
 SCRAPEOPS_USAGE_URL   = "https://backend.scrapeops.io/v1/proxy/account/usage"
 
-PREMIUM_TIMEOUT_S = 5
+PREMIUM_TIMEOUT_S = 12
 USAGE_TIMEOUT_S   = 8
 
 _scrapingant_sem = threading.Semaphore(1)
