@@ -173,7 +173,7 @@ RACE_PROXY_COUNT = 6
 
 STICKY_URL_FRAGMENTS = [
     "/api/2.0/user/login",
-    "/api/1.0/cart/paymentinfo",
+    
     "/api/4.0/preorders",
 ]
 STICKY_EXACT_PATHS = [
@@ -207,6 +207,7 @@ RACEABLE_URL_FRAGMENTS = [
     "/api/4.0/anonymous/for-you",
     "/api/3.0/user/orders",
     "/api/3.0/user/order-details",
+    "/api/1.0/cart/paymentinfo",
 ]
 
 
