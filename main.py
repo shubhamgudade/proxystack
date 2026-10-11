@@ -26,11 +26,16 @@ Pool:
   dashboard  → served here, SSE /stream/stats
 
 VPS (premium providers):
-  read    → free race (3s, 6 parallel) → premium fallback (ScraperAPI → ScrapeOps → ScrapingAnt)
-  write   → premium only (ScrapingAnt serial → ScraperAPI → ScrapeOps)
-  sticky  → premium sticky pin (ScraperAPI → ScrapeOps); login + checkout
+  read    → free race (3s, 6 parallel) → premium fallback (ScrapeOps → ScrapingAnt → ScraperAPI last)
+  write   → premium only (ScrapingAnt → ScrapeOps → ScraperAPI last)
+  sticky  → premium sticky pin (ScrapeOps → ScrapingAnt); ScraperAPI excluded from sticky
   free_only → single free proxy, no race, no fallback (FOD free shots)
   premium → premium rotating, no race, no free (FOD premium shots, anon session xo)
+
+Key rotation:
+  Random live key selection per call — avoids provider-side flagging from
+  hammering one key. Per-key semaphore enforces per-key concurrency limits.
+  ScraperAPI is last resort on read/write, excluded from sticky entirely.
 
 Credit sync:
   POST /keys/sync  → pulls real credits from each provider API, updates keys.json
@@ -173,7 +178,6 @@ RACE_PROXY_COUNT = 6
 
 STICKY_URL_FRAGMENTS = [
     "/api/2.0/user/login",
-    
     "/api/4.0/preorders",
 ]
 STICKY_EXACT_PATHS = [
@@ -189,10 +193,6 @@ WRITE_URL_FRAGMENTS = [
     "/api/2.0/orders/",
 ]
 
-# FOD URLs are NOT raceable — index.py fires them in parallel with explicit
-# tier="free_only" or tier="premium". Anon session (search/recs) uses these
-# same URLs but sends tier="premium" explicitly. If tier="any" arrives for
-# a FOD URL, default to free_only (never race, never burn premium).
 RACEABLE_URL_FRAGMENTS = [
     "/api/3.0/search/suggest",
     "/api/3.0/anonymous/search/suggest",
@@ -375,6 +375,25 @@ _snap_fast:     list[str] = []
 _keys_lock = threading.Lock()
 _keys: list[dict] = []
 
+# Per-key semaphores: {label: threading.Semaphore}
+# Concurrency limits per provider key (adjust as needed per plan)
+KEY_CONCURRENCY_LIMITS: dict[str, int] = {
+    "scrapingant": 1,   # ScrapingAnt: 1 concurrent per key by default
+    "scraperapi":  5,   # ScraperAPI: higher concurrency allowed
+    "scrapeops":   3,   # ScrapeOps: moderate
+}
+_key_sems_lock = threading.Lock()
+_key_sems: dict[str, threading.Semaphore] = {}
+
+def _get_key_sem(key_dict: dict) -> threading.Semaphore:
+    label    = key_dict.get("label", "unknown")
+    provider = key_dict.get("provider", "")
+    with _key_sems_lock:
+        if label not in _key_sems:
+            limit = KEY_CONCURRENCY_LIMITS.get(provider, 1)
+            _key_sems[label] = threading.Semaphore(limit)
+        return _key_sems[label]
+
 _sticky_lock = threading.Lock()
 _sticky_sessions: dict[str, dict] = {}
 
@@ -409,7 +428,7 @@ _api_executor     = ThreadPoolExecutor(max_workers=8,  thread_name_prefix="api")
 _backend_executor = ThreadPoolExecutor(max_workers=24, thread_name_prefix="backend")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PREMIUM PROVIDERS — ScrapingAnt / ScraperAPI / ScrapeOps
+# PREMIUM PROVIDERS
 # ═══════════════════════════════════════════════════════════════════════════════
 PROVIDERS = ("scrapingant", "scraperapi", "scrapeops")
 
@@ -430,8 +449,6 @@ SCRAPEOPS_USAGE_URL   = "https://backend.scrapeops.io/v1/proxy/account/usage"
 PREMIUM_TIMEOUT_S = 20
 USAGE_TIMEOUT_S   = 8
 
-_scrapingant_sem = threading.Semaphore(1)
-
 
 def _key_is_live(k: dict) -> bool:
     reset = float(k.get("reset_at") or 0)
@@ -444,14 +461,19 @@ def _key_is_live(k: dict) -> bool:
     return used < limit
 
 
-def _pick_premium_key(provider: str) -> Optional[dict]:
+def _pick_premium_key(provider: str, exclude_labels: set = None) -> Optional[dict]:
+    """Pick a random live key for the provider instead of oldest-first.
+    Random selection spreads load across keys, reducing per-key flag risk."""
     with _keys_lock:
         candidates = [k for k in _keys if k.get("provider") == provider]
-        live       = [k for k in candidates if _key_is_live(k)]
+        live = [
+            k for k in candidates
+            if _key_is_live(k) and (exclude_labels is None or k.get("label") not in exclude_labels)
+        ]
     if not live:
         return None
-    live.sort(key=lambda k: float(k.get("last_used") or 0))
-    return live[0]
+    # Random rotation — avoids hammering one key
+    return random.choice(live)
 
 
 def _get_key_by_label(provider: str, label: str) -> Optional[dict]:
@@ -503,7 +525,7 @@ def _premium_response(r: requests.Response, key: dict, provider: str) -> dict:
 
 
 def _call_scrapingant(method: str, url: str, headers: dict, body=None,
-                     session=None, key_label=None) -> dict:
+                      session=None, key_label=None) -> dict:
     if key_label:
         key = _get_key_by_label("scrapingant", key_label)
     else:
@@ -511,6 +533,7 @@ def _call_scrapingant(method: str, url: str, headers: dict, body=None,
     if not key:
         return {"success": False, "error": "scrapingant: no live keys"}
 
+    sem = _get_key_sem(key)
     ant_headers = {"x-api-key": key["key"]}
     for k, v in (headers or {}).items():
         ant_headers[f"ant-{k}"] = v
@@ -521,7 +544,7 @@ def _call_scrapingant(method: str, url: str, headers: dict, body=None,
         "return_page_source": "true",
     }
 
-    with _scrapingant_sem:
+    with sem:
         try:
             if method.upper() == "GET":
                 r = requests.get(
@@ -540,7 +563,7 @@ def _call_scrapingant(method: str, url: str, headers: dict, body=None,
 
 
 def _call_scraperapi(method: str, url: str, headers: dict, body=None,
-                    session=None, key_label=None) -> dict:
+                     session=None, key_label=None) -> dict:
     if key_label:
         key = _get_key_by_label("scraperapi", key_label)
     else:
@@ -548,6 +571,7 @@ def _call_scraperapi(method: str, url: str, headers: dict, body=None,
     if not key:
         return {"success": False, "error": "scraperapi: no live keys"}
 
+    sem = _get_key_sem(key)
     params = {
         "api_key":      key["key"],
         "url":          url,
@@ -556,25 +580,26 @@ def _call_scraperapi(method: str, url: str, headers: dict, body=None,
     if session:
         params["session_number"] = str(session)
 
-    try:
-        if method.upper() == "GET":
-            r = requests.get(
-                SCRAPERAPI_ENDPOINT, params=params,
-                headers=headers or {}, timeout=PREMIUM_TIMEOUT_S,
-            )
-        else:
-            r = requests.post(
-                SCRAPERAPI_ENDPOINT, params=params,
-                headers=headers or {}, json=body, timeout=PREMIUM_TIMEOUT_S,
-            )
-    except Exception as e:
-        return {"success": False, "error": f"scraperapi: {e}"}
+    with sem:
+        try:
+            if method.upper() == "GET":
+                r = requests.get(
+                    SCRAPERAPI_ENDPOINT, params=params,
+                    headers=headers or {}, timeout=PREMIUM_TIMEOUT_S,
+                )
+            else:
+                r = requests.post(
+                    SCRAPERAPI_ENDPOINT, params=params,
+                    headers=headers or {}, json=body, timeout=PREMIUM_TIMEOUT_S,
+                )
+        except Exception as e:
+            return {"success": False, "error": f"scraperapi: {e}"}
 
     return _premium_response(r, key, "scraperapi")
 
 
 def _call_scrapeops(method: str, url: str, headers: dict, body=None,
-                   session=None, key_label=None) -> dict:
+                    session=None, key_label=None) -> dict:
     if key_label:
         key = _get_key_by_label("scrapeops", key_label)
     else:
@@ -582,6 +607,7 @@ def _call_scrapeops(method: str, url: str, headers: dict, body=None,
     if not key:
         return {"success": False, "error": "scrapeops: no live keys"}
 
+    sem = _get_key_sem(key)
     params = {
         "api_key":      key["key"],
         "url":          url,
@@ -590,19 +616,20 @@ def _call_scrapeops(method: str, url: str, headers: dict, body=None,
     if session:
         params["session_number"] = str(session)
 
-    try:
-        if method.upper() == "GET":
-            r = requests.get(
-                SCRAPEOPS_ENDPOINT, params=params,
-                headers=headers or {}, timeout=PREMIUM_TIMEOUT_S,
-            )
-        else:
-            r = requests.post(
-                SCRAPEOPS_ENDPOINT, params=params,
-                headers=headers or {}, json=body, timeout=PREMIUM_TIMEOUT_S,
-            )
-    except Exception as e:
-        return {"success": False, "error": f"scrapeops: {e}"}
+    with sem:
+        try:
+            if method.upper() == "GET":
+                r = requests.get(
+                    SCRAPEOPS_ENDPOINT, params=params,
+                    headers=headers or {}, timeout=PREMIUM_TIMEOUT_S,
+                )
+            else:
+                r = requests.post(
+                    SCRAPEOPS_ENDPOINT, params=params,
+                    headers=headers or {}, json=body, timeout=PREMIUM_TIMEOUT_S,
+                )
+        except Exception as e:
+            return {"success": False, "error": f"scrapeops: {e}"}
 
     return _premium_response(r, key, "scrapeops")
 
@@ -614,7 +641,7 @@ _PROVIDER_CALLS = {
 }
 
 
-# ─── Provider credit fetchers ────────────────────────────────────────────────
+# ─── Provider credit fetchers ─────────────────────────────────────────────────
 
 def _parse_iso_epoch(s) -> float:
     if not s:
@@ -743,17 +770,23 @@ def _sync_all_keys() -> dict:
 
 
 def _provider_priority(plan: str) -> list[str]:
-    # CHANGED: sticky now uses ScrapeOps first (has session_number support),
-    # then ScrapingAnt. ScraperAPI removed from sticky due to chronic timeouts.
+    """
+    Provider order by plan:
+    - sticky: ScrapeOps → ScrapingAnt. ScraperAPI excluded (session reliability issues).
+    - write:  ScrapingAnt → ScrapeOps → ScraperAPI (last resort).
+    - read:   ScrapeOps → ScrapingAnt → ScraperAPI (last resort).
+    ScraperAPI is always last or excluded — chronic timeout issues on sticky,
+    and we want to preserve its credits for burst fallback only.
+    """
     if plan == "sticky":
-        return ["scrapeops", "scrapingant"]
+        return ["scrapeops", "scrapingant"]  # ScraperAPI excluded from sticky
     if plan == "write":
-        return ["scrapingant", "scrapeops"]
-    return ["scrapeops", "scrapingant"]
+        return ["scrapingant", "scrapeops", "scraperapi"]
+    return ["scrapeops", "scrapingant", "scraperapi"]
 
 
 def _provider_call_sync(provider: str, method: str, url: str,
-                       headers: dict, body, session, key_label=None) -> dict:
+                        headers: dict, body, session, key_label=None) -> dict:
     fn = _PROVIDER_CALLS.get(provider)
     if not fn:
         return {"success": False, "error": f"unknown provider {provider}"}
@@ -778,7 +811,8 @@ def _sticky_pin(flow_key: int) -> Optional[dict]:
             entry["expires_at"] = now + STICKY_TTL_S
             return entry
 
-    for provider in ("scraperapi", "scrapeops"):
+    # ScraperAPI intentionally excluded from sticky
+    for provider in ("scrapeops", "scrapingant"):
         key = _pick_premium_key(provider)
         if key:
             entry = {
@@ -1968,7 +2002,6 @@ async def _do_free_race(req: ProxyRequest, loop) -> Optional[Response]:
 
 
 async def _do_free_single(req: ProxyRequest, loop) -> Response:
-    """Single free proxy, no race, no premium fallback. FOD shot path."""
     prx = await loop.run_in_executor(
         _backend_executor, _get_proxy_from_pool, "any", "fod"
     )
@@ -2077,7 +2110,6 @@ async def proxy_request(req: ProxyRequest):
 
     loop = asyncio.get_event_loop()
 
-    # ─── Tier overrides (win over URL planning) ─────────────────────────────
     if req.tier == "premium":
         _inc("requests_premium_forced")
         return await _premium_forward(req, "read", loop)
@@ -2090,13 +2122,10 @@ async def proxy_request(req: ProxyRequest):
         _inc("requests_premium_forced")
         return await _premium_forward(req, "read", loop)
 
-    # FOD URLs with tier="any" default to free_only — never race, never burn
-    # premium. Index.py always sends explicit tier, this is a safety net.
     if _is_fod_url(req.url) and req.tier == "any":
         _inc("requests_fod_default_free")
         return await _do_free_single(req, loop)
 
-    # ─── URL-based planning ─────────────────────────────────────────────────
     plan = _plan_for_url(req.url)
 
     if plan == "read":
@@ -2118,7 +2147,7 @@ async def proxy_request(req: ProxyRequest):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# VPS KEY MANAGEMENT — VPS handles, dashboard forwards
+# VPS KEY MANAGEMENT
 # ═══════════════════════════════════════════════════════════════════════════════
 class AddKeyRequest(BaseModel):
     provider:      str
@@ -2179,11 +2208,12 @@ async def add_key(req: AddKeyRequest):
         while final in existing:
             final = f"{auto_label}-{suffix}"
             suffix += 1
+        limit = req.credits_limit or DEFAULT_CREDIT_LIMITS.get(provider, 1000)
         entry = {
             "provider":      provider,
             "key":           req.key,
             "label":         final,
-            "credits_limit": req.credits_limit or DEFAULT_CREDIT_LIMITS.get(provider, 1000),
+            "credits_limit": limit,
             "credits_used":  0,
             "reset_at":      0,
             "last_used":     0,
@@ -2191,6 +2221,11 @@ async def add_key(req: AddKeyRequest):
             "last_sync":     0,
         }
         _keys.append(entry)
+        # Create semaphore for new key immediately
+        with _key_sems_lock:
+            _key_sems[final] = threading.Semaphore(
+                KEY_CONCURRENCY_LIMITS.get(provider, 1)
+            )
     _save_keys()
     return {"status": "ok", "label": final, "provider": provider}
 
@@ -2220,6 +2255,8 @@ async def remove_key(req: RemoveKeyRequest):
             raise HTTPException(404, "key not found")
         label    = entry["label"]
         _keys[:] = [k for k in _keys if k["label"] != label]
+    with _key_sems_lock:
+        _key_sems.pop(label, None)
     _save_keys()
     return {"status": "ok", "removed": label}
 
