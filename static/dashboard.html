@@ -848,6 +848,8 @@ main .row:nth-child(6) .card{animation-delay:.34s;}
           <option value="scrapingant">ScrapingAnt</option>
           <option value="scraperapi">ScraperAPI</option>
           <option value="scrapeops">ScrapeOps</option>
+          <option value="scrapingbee">ScrapingBee</option>
+          <option value="scrapfly">Scrapfly</option>
         </select>
         <input id="kf-key"   placeholder="API key" autocomplete="off">
         <input id="kf-label" placeholder="label (optional)" autocomplete="off">
@@ -1441,7 +1443,7 @@ function renderKeys(data){
     rows.appendChild(div);
   }
 
-  const order = ['scrapingant','scraperapi','scrapeops'];
+  const order = ['scrapingant','scraperapi','scrapeops','scrapingbee','scrapfly'];
   const seen = new Set();
   order.forEach(name => {
     const p = providers[name];
