@@ -26,16 +26,23 @@ Pool:
   dashboard  → served here, SSE /stream/stats
 
 VPS (premium providers):
-  read    → free race (3s, 6 parallel) → premium fallback (ScrapeOps → ScrapingAnt → ScraperAPI last)
-  write   → premium only (ScrapingAnt → ScrapeOps → ScraperAPI last)
-  sticky  → premium sticky pin (ScrapeOps → ScrapingAnt); ScraperAPI excluded from sticky
+  read    → free race (3s, 6 parallel) → premium fallback (rotated primaries → last-resort)
+  write   → premium only (rotated primaries → last-resort)
+  sticky  → premium sticky pin (sticky-capable providers only; ScraperAPI excluded)
   free_only → single free proxy, no race, no fallback (FOD free shots)
   premium → premium rotating, no race, no free (FOD premium shots, anon session xo)
+
+Provider rotation:
+  - Providers tagged "primary" in PROVIDER_SPECS are tried in RANDOM order
+    (healthy set first, cooled-down set second).
+  - Providers tagged "last_resort" (e.g. ScraperAPI) are NEVER rotated in —
+    they only fire after every primary has failed.
+  - A provider failing >= PROVIDER_FAIL_THRESHOLD times in a row gets a
+    PROVIDER_COOLDOWN_S cool-down and sinks to the tail until it recovers.
 
 Key rotation:
   Random live key selection per call — avoids provider-side flagging from
   hammering one key. Per-key semaphore enforces per-key concurrency limits.
-  ScraperAPI is last resort on read/write, excluded from sticky entirely.
 
 Credit sync:
   POST /keys/sync  → pulls real credits from each provider API, updates keys.json
@@ -376,12 +383,7 @@ _keys_lock = threading.Lock()
 _keys: list[dict] = []
 
 # Per-key semaphores: {label: threading.Semaphore}
-# Concurrency limits per provider key (adjust as needed per plan)
-KEY_CONCURRENCY_LIMITS: dict[str, int] = {
-    "scrapingant": 1,   # ScrapingAnt: 1 concurrent per key by default
-    "scraperapi":  5,   # ScraperAPI: higher concurrency allowed
-    "scrapeops":   3,   # ScrapeOps: moderate
-}
+# Concurrency limits per provider key — derived from PROVIDER_SPECS below.
 _key_sems_lock = threading.Lock()
 _key_sems: dict[str, threading.Semaphore] = {}
 
@@ -430,26 +432,46 @@ _backend_executor = ThreadPoolExecutor(max_workers=24, thread_name_prefix="backe
 # ═══════════════════════════════════════════════════════════════════════════════
 # PREMIUM PROVIDERS
 # ═══════════════════════════════════════════════════════════════════════════════
-PROVIDERS = ("scrapingant", "scraperapi", "scrapeops")
 
-DEFAULT_CREDIT_LIMITS = {
-    "scrapingant": 10_000,
-    "scraperapi":  1_000,
-    "scrapeops":   1_000,
-}
-
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 SCRAPINGANT_ENDPOINT = "https://api.scrapingant.com/v2/general"
 SCRAPERAPI_ENDPOINT  = "https://api.scraperapi.com/"
 SCRAPEOPS_ENDPOINT   = "https://proxy.scrapeops.io/v1/"
+SCRAPINGBEE_ENDPOINT = "https://app.scrapingbee.com/api/v1/"
+SCRAPFLY_ENDPOINT    = "https://api.scrapfly.io/scrape"
 
-SCRAPINGANT_USAGE_URL = "https://api.scrapingant.com/v2/usage"
-SCRAPERAPI_USAGE_URL  = "https://api.scraperapi.com/account"
-SCRAPEOPS_USAGE_URL   = "https://backend.scrapeops.io/v1/proxy/account/usage"
+SCRAPINGANT_USAGE_URL  = "https://api.scrapingant.com/v2/usage"
+SCRAPERAPI_USAGE_URL   = "https://api.scraperapi.com/account"
+SCRAPEOPS_USAGE_URL    = "https://backend.scrapeops.io/v1/proxy/account/usage"
+SCRAPINGBEE_USAGE_URL  = "https://app.scrapingbee.com/api/v1/usage"
+SCRAPFLY_ACCOUNT_URL   = "https://api.scrapfly.io/account"
 
 PREMIUM_TIMEOUT_S = 20
 USAGE_TIMEOUT_S   = 8
 
+# ── Provider cool-down state ──────────────────────────────────────────────────
+PROVIDER_COOLDOWN_S     = 45
+PROVIDER_FAIL_THRESHOLD = 2
 
+_provider_cooldown_lock = threading.Lock()
+_provider_cooldown:      dict[str, float] = {}   # provider → cooldown_until
+_provider_fail_streak:   dict[str, int]   = {}   # provider → consecutive fails
+
+
+def _mark_provider_ok(provider: str):
+    with _provider_cooldown_lock:
+        _provider_fail_streak[provider] = 0
+        _provider_cooldown.pop(provider, None)
+
+
+def _mark_provider_fail(provider: str):
+    with _provider_cooldown_lock:
+        _provider_fail_streak[provider] = _provider_fail_streak.get(provider, 0) + 1
+        if _provider_fail_streak[provider] >= PROVIDER_FAIL_THRESHOLD:
+            _provider_cooldown[provider] = time.time() + PROVIDER_COOLDOWN_S
+
+
+# ── Key helpers ───────────────────────────────────────────────────────────────
 def _key_is_live(k: dict) -> bool:
     reset = float(k.get("reset_at") or 0)
     if reset and time.time() >= reset:
@@ -462,17 +484,17 @@ def _key_is_live(k: dict) -> bool:
 
 
 def _pick_premium_key(provider: str, exclude_labels: set = None) -> Optional[dict]:
-    """Pick a random live key for the provider instead of oldest-first.
-    Random selection spreads load across keys, reducing per-key flag risk."""
+    """Pick a random live key for the provider. Random selection spreads load
+    across keys, reducing per-key flag risk."""
     with _keys_lock:
         candidates = [k for k in _keys if k.get("provider") == provider]
         live = [
             k for k in candidates
-            if _key_is_live(k) and (exclude_labels is None or k.get("label") not in exclude_labels)
+            if _key_is_live(k)
+            and (exclude_labels is None or k.get("label") not in exclude_labels)
         ]
     if not live:
         return None
-    # Random rotation — avoids hammering one key
     return random.choice(live)
 
 
@@ -498,6 +520,7 @@ def _exhaust_key(key_dict: dict):
         key_dict["last_used"]    = time.time()
 
 
+# ── Response helpers ──────────────────────────────────────────────────────────
 def _premium_response(r: requests.Response, key: dict, provider: str) -> dict:
     if r.status_code in (401, 403, 429):
         _exhaust_key(key)
@@ -524,6 +547,36 @@ def _premium_response(r: requests.Response, key: dict, provider: str) -> dict:
     return {"success": True, "data": data}
 
 
+def _premium_response_text(r: requests.Response, key: dict, provider: str) -> dict:
+    """Same as _premium_response but tolerant of non-JSON text bodies
+    (ScrapingBee returns raw target-response text which may or may not be JSON)."""
+    if r.status_code in (401, 403, 429):
+        _exhaust_key(key)
+        return {
+            "success": False,
+            "error":   f"{provider}: http {r.status_code}",
+            "rotate":  True,
+        }
+
+    _mark_key_used(key, credits=1)
+
+    if r.status_code >= 400:
+        return {
+            "success": False,
+            "error":   f"{provider}: http {r.status_code}",
+            "raw":     r.text[:300],
+        }
+
+    text = r.text.strip()
+    try:
+        data = json.loads(text)
+    except Exception:
+        data = text
+
+    return {"success": True, "data": data}
+
+
+# ── Provider call: ScrapingAnt ────────────────────────────────────────────────
 def _call_scrapingant(method: str, url: str, headers: dict, body=None,
                       session=None, key_label=None) -> dict:
     if key_label:
@@ -562,6 +615,7 @@ def _call_scrapingant(method: str, url: str, headers: dict, body=None,
     return _premium_response(r, key, "scrapingant")
 
 
+# ── Provider call: ScraperAPI ─────────────────────────────────────────────────
 def _call_scraperapi(method: str, url: str, headers: dict, body=None,
                      session=None, key_label=None) -> dict:
     if key_label:
@@ -598,6 +652,7 @@ def _call_scraperapi(method: str, url: str, headers: dict, body=None,
     return _premium_response(r, key, "scraperapi")
 
 
+# ── Provider call: ScrapeOps ──────────────────────────────────────────────────
 def _call_scrapeops(method: str, url: str, headers: dict, body=None,
                     session=None, key_label=None) -> dict:
     if key_label:
@@ -634,15 +689,109 @@ def _call_scrapeops(method: str, url: str, headers: dict, body=None,
     return _premium_response(r, key, "scrapeops")
 
 
-_PROVIDER_CALLS = {
-    "scrapingant": _call_scrapingant,
-    "scraperapi":  _call_scraperapi,
-    "scrapeops":   _call_scrapeops,
-}
+# ── Provider call: ScrapingBee ────────────────────────────────────────────────
+# Custom headers forwarded via 'Spb-' prefix + forward_headers=true.
+# POST body sent as the actual HTTP request body (data=, not json=).
+def _call_scrapingbee(method: str, url: str, headers: dict, body=None,
+                      session=None, key_label=None) -> dict:
+    if key_label:
+        key = _get_key_by_label("scrapingbee", key_label)
+    else:
+        key = _pick_premium_key("scrapingbee")
+    if not key:
+        return {"success": False, "error": "scrapingbee: no live keys"}
+
+    sem = _get_key_sem(key)
+    params = {
+        "api_key":         key["key"],
+        "url":             url,
+        "render_js":       "false",
+        "forward_headers": "true",
+    }
+    spb_headers = {f"Spb-{k}": v for k, v in (headers or {}).items()}
+
+    with sem:
+        try:
+            if method.upper() == "GET":
+                r = requests.get(
+                    SCRAPINGBEE_ENDPOINT, params=params,
+                    headers=spb_headers, timeout=PREMIUM_TIMEOUT_S,
+                )
+            else:
+                r = requests.post(
+                    SCRAPINGBEE_ENDPOINT, params=params,
+                    headers=spb_headers,
+                    data=json.dumps(body) if body else None,
+                    timeout=PREMIUM_TIMEOUT_S,
+                )
+        except Exception as e:
+            return {"success": False, "error": f"scrapingbee: {e}"}
+
+    return _premium_response_text(r, key, "scrapingbee")
 
 
-# ─── Provider credit fetchers ─────────────────────────────────────────────────
+# ── Provider call: Scrapfly ───────────────────────────────────────────────────
+# Headers passed as headers[Name]=value; POST body sent as request body.
+# Response is JSON-wrapped: { "result": { "content": "<target-body>" } }
+def _call_scrapfly(method: str, url: str, headers: dict, body=None,
+                   session=None, key_label=None) -> dict:
+    if key_label:
+        key = _get_key_by_label("scrapfly", key_label)
+    else:
+        key = _pick_premium_key("scrapfly")
+    if not key:
+        return {"success": False, "error": "scrapfly: no live keys"}
 
+    sem = _get_key_sem(key)
+    params = [
+        ("key",       key["key"]),
+        ("url",       url),
+        ("asp",       "false"),
+        ("render_js", "false"),
+    ]
+    for k, v in (headers or {}).items():
+        params.append((f"headers[{k}]", str(v)))
+
+    with sem:
+        try:
+            if method.upper() == "GET":
+                r = requests.get(
+                    SCRAPFLY_ENDPOINT, params=params, timeout=PREMIUM_TIMEOUT_S,
+                )
+            else:
+                r = requests.post(
+                    SCRAPFLY_ENDPOINT, params=params,
+                    data=json.dumps(body) if body else None,
+                    headers={"Content-Type": "application/json"},
+                    timeout=PREMIUM_TIMEOUT_S,
+                )
+        except Exception as e:
+            return {"success": False, "error": f"scrapfly: {e}"}
+
+    if r.status_code in (401, 403, 429):
+        _exhaust_key(key)
+        return {"success": False,
+                "error": f"scrapfly: http {r.status_code}", "rotate": True}
+
+    _mark_key_used(key, credits=1)
+
+    if r.status_code >= 400:
+        return {"success": False, "error": f"scrapfly: http {r.status_code}",
+                "raw": r.text[:300]}
+
+    try:
+        outer = r.json()
+        inner = outer.get("result", {}).get("content", "")
+        try:
+            data = json.loads(inner) if isinstance(inner, str) else inner
+        except Exception:
+            data = inner or outer
+        return {"success": True, "data": data}
+    except Exception:
+        return {"success": True, "data": r.text}
+
+
+# ── Provider credit fetchers ──────────────────────────────────────────────────
 def _parse_iso_epoch(s) -> float:
     if not s:
         return 0.0
@@ -710,13 +859,160 @@ def _fetch_scrapeops_credits(api_key: str) -> tuple[int, int, float]:
     return limit, used, reset
 
 
-_USAGE_FETCHERS = {
-    "scrapingant": _fetch_scrapingant_credits,
-    "scraperapi":  _fetch_scraperapi_credits,
-    "scrapeops":   _fetch_scrapeops_credits,
+def _fetch_scrapingbee_credits(api_key: str) -> tuple[int, int, float]:
+    """
+    ScrapingBee usage endpoint.
+    GET https://app.scrapingbee.com/api/v1/usage?api_key=...
+    Response: {
+        "max_api_credit": 100000,
+        "used_api_credit": 24500,
+        "max_concurrency": 10,
+        "current_concurrency": 2,
+        "renewal_subscription_date": "2024-12-01"
+    }
+    """
+    r = requests.get(
+        SCRAPINGBEE_USAGE_URL,
+        params={"api_key": api_key},
+        headers={"Accept": "application/json"},
+        timeout=USAGE_TIMEOUT_S,
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"http {r.status_code}: {r.text[:120]}")
+    j = r.json()
+    limit = int(j.get("max_api_credit") or 0)
+    used  = int(j.get("used_api_credit") or 0)
+    reset = _parse_iso_epoch(j.get("renewal_subscription_date"))
+    return limit, used, reset
+
+
+def _fetch_scrapfly_credits(api_key: str) -> tuple[int, int, float]:
+    """
+    Scrapfly account endpoint.
+    GET https://api.scrapfly.io/account?key=...
+    Response (nested):
+      {
+        "subscription": {
+          "usage": { "scrape": { "current": 1234, "limit": 100000 } },
+          "period": { "end": "2024-12-01T00:00:00Z" }
+        }
+      }
+    """
+    r = requests.get(
+        SCRAPFLY_ACCOUNT_URL,
+        params={"key": api_key},
+        headers={"Accept": "application/json"},
+        timeout=USAGE_TIMEOUT_S,
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"http {r.status_code}: {r.text[:120]}")
+    j = r.json()
+
+    sub    = j.get("subscription") or {}
+    usage  = sub.get("usage") or {}
+    scrape = usage.get("scrape") or {}
+
+    limit = int(scrape.get("limit")   or 0)
+    used  = int(scrape.get("current") or 0)
+    reset = _parse_iso_epoch((sub.get("period") or {}).get("end"))
+
+    return limit, used, reset
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PROVIDER REGISTRY — single source of truth
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tier semantics:
+#   "primary"      → rotated into read/write plans; shuffled among healthy set
+#   "last_resort"  → NEVER rotated in; only fires after every primary fails
+#
+# supports_sticky:
+#   True  → eligible for sticky session pinning
+#   False → excluded from sticky flow entirely
+#
+# usage_fetcher:
+#   callable(api_key) → (limit:int, used:int, reset_at:float)
+#   None → /keys/sync will skip this provider (local credit counting only)
+#
+PROVIDER_SPECS: dict[str, dict] = {
+    "scrapingant": {
+        "call":            _call_scrapingant,
+        "usage_fetcher":   _fetch_scrapingant_credits,
+        "default_limit":   10_000,
+        "concurrency":     1,
+        "supports_sticky": True,
+        "tier":            "primary",
+    },
+    "scraperapi": {
+        "call":            _call_scraperapi,
+        "usage_fetcher":   _fetch_scraperapi_credits,
+        "default_limit":   1_000,
+        "concurrency":     5,
+        "supports_sticky": False,
+        "tier":            "last_resort",
+    },
+    "scrapeops": {
+        "call":            _call_scrapeops,
+        "usage_fetcher":   _fetch_scrapeops_credits,
+        "default_limit":   1_000,
+        "concurrency":     3,
+        "supports_sticky": True,
+        "tier":            "primary",
+    },
+    "scrapingbee": {
+        "call":            _call_scrapingbee,
+        "usage_fetcher":   _fetch_scrapingbee_credits,
+        "default_limit":   1_000,
+        "concurrency":     5,
+        "supports_sticky": False,
+        "tier":            "primary",
+    },
+    "scrapfly": {
+        "call":            _call_scrapfly,
+        "usage_fetcher":   _fetch_scrapfly_credits,
+        "default_limit":   1_000,
+        "concurrency":     5,
+        "supports_sticky": False,
+        "tier":            "primary",
+    },
 }
 
+# ── Derived constants — do NOT hand-maintain; edit PROVIDER_SPECS instead ────
+PROVIDERS              = tuple(PROVIDER_SPECS.keys())
+KEY_CONCURRENCY_LIMITS = {p: s["concurrency"]   for p, s in PROVIDER_SPECS.items()}
+_PROVIDER_CALLS        = {p: s["call"]          for p, s in PROVIDER_SPECS.items()}
+_USAGE_FETCHERS        = {p: s["usage_fetcher"] for p, s in PROVIDER_SPECS.items()}
+DEFAULT_CREDIT_LIMITS  = {p: s["default_limit"] for p, s in PROVIDER_SPECS.items()}
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PROVIDER ROTATION PLANNER
+# ═══════════════════════════════════════════════════════════════════════════════
+def _plan_providers(plan: str) -> list[str]:
+    """Rotation plan:
+      - sticky   → fixed order of sticky-capable providers (no rotation)
+      - read/write → shuffled healthy primaries, then cooled-down primaries,
+                     then last-resort providers (always at the tail).
+    """
+    if plan == "sticky":
+        return [p for p, s in PROVIDER_SPECS.items() if s["supports_sticky"]]
+
+    primaries   = [p for p, s in PROVIDER_SPECS.items() if s["tier"] == "primary"]
+    last_resort = [p for p, s in PROVIDER_SPECS.items() if s["tier"] == "last_resort"]
+
+    now = time.time()
+    with _provider_cooldown_lock:
+        healthy = [p for p in primaries if _provider_cooldown.get(p, 0) <= now]
+        cooling = [p for p in primaries if _provider_cooldown.get(p, 0) > now]
+
+    random.shuffle(healthy)
+    random.shuffle(cooling)
+    return healthy + cooling + last_resort
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CREDIT SYNC
+# ═══════════════════════════════════════════════════════════════════════════════
 def _sync_one_key(key_dict: dict) -> dict:
     provider = key_dict.get("provider", "")
     fn = _USAGE_FETCHERS.get(provider)
@@ -769,22 +1065,9 @@ def _sync_all_keys() -> dict:
     }
 
 
-def _provider_priority(plan: str) -> list[str]:
-    """
-    Provider order by plan:
-    - sticky: ScrapeOps → ScrapingAnt. ScraperAPI excluded (session reliability issues).
-    - write:  ScrapingAnt → ScrapeOps → ScraperAPI (last resort).
-    - read:   ScrapeOps → ScrapingAnt → ScraperAPI (last resort).
-    ScraperAPI is always last or excluded — chronic timeout issues on sticky,
-    and we want to preserve its credits for burst fallback only.
-    """
-    if plan == "sticky":
-        return ["scrapeops", "scrapingant"]  # ScraperAPI excluded from sticky
-    if plan == "write":
-        return ["scrapingant", "scrapeops", "scraperapi"]
-    return ["scrapeops", "scrapingant", "scraperapi"]
-
-
+# ═══════════════════════════════════════════════════════════════════════════════
+# PROVIDER CALL DISPATCH + STICKY
+# ═══════════════════════════════════════════════════════════════════════════════
 def _provider_call_sync(provider: str, method: str, url: str,
                         headers: dict, body, session, key_label=None) -> dict:
     fn = _PROVIDER_CALLS.get(provider)
@@ -811,8 +1094,8 @@ def _sticky_pin(flow_key: int) -> Optional[dict]:
             entry["expires_at"] = now + STICKY_TTL_S
             return entry
 
-    # ScraperAPI intentionally excluded from sticky
-    for provider in ("scrapeops", "scrapingant"):
+    # Iterate sticky-capable providers in registry order.
+    for provider in (p for p, s in PROVIDER_SPECS.items() if s["supports_sticky"]):
         key = _pick_premium_key(provider)
         if key:
             entry = {
@@ -1693,6 +1976,16 @@ def _get_stats() -> dict:
         },
     }
 
+    # Snapshot current provider cooldown state for visibility
+    with _provider_cooldown_lock:
+        now_cd = time.time()
+        cooldowns = {
+            p: round(until - now_cd, 1)
+            for p, until in _provider_cooldown.items()
+            if until > now_cd
+        }
+        fail_streaks = dict(_provider_fail_streak)
+
     return {
         "role": ROLE,
         "counters": {
@@ -1712,7 +2005,9 @@ def _get_stats() -> dict:
             "lantern":    labs["lantern"],
             "deadass":    labs["deadass"],
         },
-        "providers": providers_block,
+        "providers":     providers_block,
+        "provider_cd":   cooldowns,
+        "provider_fail": fail_streaks,
         "peers": {role: url for role, url in PEERS.items()},
     }
 
@@ -2061,7 +2356,7 @@ async def _do_free_single(req: ProxyRequest, loop) -> Response:
 
 async def _premium_forward(req: ProxyRequest, plan: str, loop) -> Response:
     method   = req.method.upper()
-    providers = _provider_priority(plan)
+    providers = _plan_providers(plan)
     sticky_entry = None
 
     if plan == "sticky":
@@ -2085,6 +2380,7 @@ async def _premium_forward(req: ProxyRequest, plan: str, loop) -> Response:
         )
 
         if result.get("success"):
+            _mark_provider_ok(provider)
             data = result.get("data")
             if isinstance(data, (dict, list)):
                 raw = json.dumps(data).encode()
@@ -2096,6 +2392,7 @@ async def _premium_forward(req: ProxyRequest, plan: str, loop) -> Response:
             _log("premium_ok", f"url={req.url} provider={provider} plan={plan}")
             return Response(content=raw, status_code=200, media_type=ct)
 
+        _mark_provider_fail(provider)
         last_err = result.get("error", "unknown")
         _inc(f"premium_fail_{provider}")
         _log("premium_fail", f"url={req.url} provider={provider} err={last_err}")
